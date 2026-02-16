@@ -12,10 +12,6 @@ from multiprocessing import Pool, TimeoutError, cpu_count
 
 # === Универсальные пути внутри пакета ===
 BASE_DIR = os.path.dirname(__file__)
-
-TARGETS_DIR = os.path.join(BASE_DIR, "auto_recon", "target")
-TARGETS_FILE = os.path.join(TARGETS_DIR, "targets.txt")
-
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
 OUTPUT_DIR = os.path.join(LOGS_DIR, "batch_sites")
 REPORT_CSV = os.path.join(LOGS_DIR, "scan_report.csv")
@@ -36,7 +32,12 @@ def ensure_dirs() -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-def load_targets(path: str = TARGETS_FILE) -> List[str]:
+def load_targets(path: str = os.path.join(BASE_DIR, "targets.txt")) -> List[str]:
+    """
+    Загружает цели из файла, применяет фильтры:
+    - только .gov домены (если FILTER_ONLY_GOV=True)
+    - исключает www (если FILTER_EXCLUDE_WWW=True)
+    """
     if not os.path.exists(path):
         raise FileNotFoundError(f"targets.txt не найден: {path}")
 
@@ -183,7 +184,7 @@ def _scan_single_target(url: str) -> Dict[str, Any]:
         }
 
 
-def run_batch(file_path: str = TARGETS_FILE) -> None:
+def run_batch(file_path: str = os.path.join(BASE_DIR, "targets.txt")) -> None:
     """
     Пакетный обход целей (гибрид: multiprocessing + threads внутри краулера):
     - каждый сайт сканируется в отдельном процессе

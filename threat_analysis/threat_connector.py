@@ -121,7 +121,6 @@ class NdjsonBackend(ThreatBackendBase):
 
 class SQLiteBackend(ThreatBackendBase):
     def __init__(self, filename: str = "threat_intel.db"):
-        super().__init__()
         self.db_path = os.path.join(LOGS_DIR, filename)
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self._init_db()
@@ -131,15 +130,6 @@ class SQLiteBackend(ThreatBackendBase):
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         return conn
-
-    def fetch_all(self) -> list[dict]:
-        cur = self.conn.cursor()
-        cur.execute("SELECT module, target, data FROM artifacts")
-        rows = cur.fetchall()
-        return [
-            {"module": r[0], "target": r[1], "data": r[2]}
-            for r in rows
-        ]
 
     def _init_db(self) -> None:
         conn = self._connect()
@@ -266,13 +256,16 @@ class SQLiteBackend(ThreatBackendBase):
 # ============================================================
 
 class ElasticSearchBackend(ThreatBackendBase):
-    def __init__(self, url: str, index: str = "threat_intel", username: Optional[str] = None,
-                 password: Optional[str] = None):
-        super().__init__()
+    def __init__(
+        self,
+        url: str,
+        index: str = "threat_intel",
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+    ):
         self.url = url.rstrip("/")
         self.index = index
         self.auth = (username, password) if username and password else None
-
         self.log = logging.getLogger("ThreatConnector")
 
     def _index_url(self) -> str:
@@ -407,7 +400,12 @@ class ThreatConnector:
     • Batched writes (по умолчанию пачки до 50 элементов)
     """
 
-    def __init__(self, backend: ThreatBackendBase, batch_size: int = 50, flush_interval: float = 1.0):
+    def __init__(
+        self,
+        backend: ThreatBackendBase,
+        batch_size: int = 50,
+        flush_interval: float = 1.0,
+    ):
         self.backend = backend
         self.log = logging.getLogger("ThreatConnector")
         self.log.setLevel(logging.INFO)
@@ -426,7 +424,6 @@ class ThreatConnector:
             daemon=True,
         )
         self._worker_thread.start()
-
 
     # ---------------------------------------------------------
     #  Инициализация кэша хешей
@@ -520,14 +517,10 @@ class ThreatConnector:
     def _flush_batch(self, batch: List[Dict[str, Any]]) -> None:
         try:
             self.backend.add_batch(batch)
-            self.log.info(f"[ThreatIntel] Flushed {len(batch)} artifacts")
             for a in batch:
-                self.log.debug(f"[ThreatIntel] {a.get('module')} → {a.get('target')}")
+                self.log.info(f"[ThreatIntel] {a['module']} → {a['target']}")
         except Exception:
             self.log.error("Failed to flush batch to backend", exc_info=True)
-        finally:
-            # очищаем батч независимо от результата
-            batch.clear()
 
     # ---------------------------------------------------------
     #  Управление жизненным циклом
@@ -544,21 +537,13 @@ class ThreatConnector:
     #  Чтение / фильтры / отчёты
     # ---------------------------------------------------------
     def load_all(self) -> List[Dict[str, Any]]:
+        """
+        Чтение всегда идёт из backend (источник истины).
+        """
         try:
             return self.backend.load_all()
         except Exception:
             self.log.error("Failed to load_all from backend", exc_info=True)
-            return []
-
-    def export_all(self) -> List[Dict[str, Any]]:
-        """
-        Унифицированный экспорт всех артефактов.
-        Используется ThreatIntelConnector.generate_report().
-        """
-        try:
-            return self.load_all()
-        except Exception:
-            self.log.error("Failed to export_all from backend", exc_info=True)
             return []
 
     def filter_by_module(self, module: str) -> List[Dict[str, Any]]:
@@ -581,8 +566,10 @@ class ThreatConnector:
             mod = a.get("module", "unknown")
             by_module[mod] = by_module.get(mod, 0) + 1
 
-        return {"total": len(data), "by_module": by_module}
-
+        return {
+            "total": len(data),
+            "by_module": by_module,
+        }
 
     def generate_report(self) -> Dict[str, Any]:
         data = self.load_all()
@@ -625,14 +612,17 @@ def _build_backend_from_env() -> ThreatBackendBase:
       THREAT_ES_PASS=...
     """
     backend_type = os.environ.get("THREAT_BACKEND", "ndjson").lower()
+
     if backend_type == "sqlite":
         return SQLiteBackend()
+
     if backend_type == "elastic":
         url = os.environ.get("THREAT_ES_URL", "http://localhost:9200")
         index = os.environ.get("THREAT_ES_INDEX", "threat_intel")
         user = os.environ.get("THREAT_ES_USER")
         pwd = os.environ.get("THREAT_ES_PASS")
         return ElasticSearchBackend(url=url, index=index, username=user, password=pwd)
+
     return NdjsonBackend()
 
 

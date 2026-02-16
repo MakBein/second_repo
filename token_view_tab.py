@@ -6,18 +6,19 @@ import json
 import os
 import secrets
 import string
-from typing import List, Dict, Any
+from typing import List, Dict
 
 
 class TokenViewTab(ttk.Frame):
     """
-    TokenViewTab 6.5 (ULTRA)
+    TokenViewTab 5.0
 
-    • Автоматичне визначення типу токена (JWT / API key / opaque)
-    • Автоматичний risk‑scoring, навіть якщо лог його не містить
-    • Потокобезпечне оновлення UI
-    • Швидке завантаження великих логів
-    • Уніфікований формат відображення
+    • Больше не зависит от legacy token_generator
+    • Умеет:
+        - читать токены и их риски из logs/token_risks.json
+        - генерировать тестовые токены (ULTRA‑режим) прямо из GUI
+    • Формат отображения унифицирован:
+        linked_url, value, type, exp, aud, alg, risk_level, risks
     """
 
     def __init__(self, parent):
@@ -61,54 +62,15 @@ class TokenViewTab(ttk.Frame):
         )
 
     # ============================================================
-    #  Helpers
+    #  Вспомогательные методы
     # ============================================================
 
     def clear_tree(self):
         for row in self.tree.get_children():
             self.tree.delete(row)
 
-    def _safe_insert(self, values: tuple, high_risk: bool = False):
-        """Потокобезпечне вставлення рядка."""
-        self.after(0, lambda: self._insert(values, high_risk))
-
-    def _insert(self, values: tuple, high_risk: bool):
-        self.tree.insert(
-            "",
-            tk.END,
-            values=values,
-            tags=("high_risk",) if high_risk else (),
-        )
-        self.tree.tag_configure("high_risk", background="#ffdddd")
-
     # ============================================================
-    #  Token classification
-    # ============================================================
-
-    def classify_token(self, value: str) -> Dict[str, Any]:
-        """Визначає тип токена та базові ризики."""
-        if "." in value and value.count(".") == 2:
-            return {"type": "jwt", "alg": "?", "aud": "?", "exp": "?", "risks": ["possible JWT"]}
-
-        if value.startswith("AKIA") and len(value) > 16:
-            return {"type": "api_key", "alg": "", "aud": "cloud", "exp": "", "risks": ["possible cloud key"]}
-
-        if len(value) > 30:
-            return {"type": "opaque", "alg": "", "aud": "session", "exp": "", "risks": ["opaque token"]}
-
-        return {"type": "unknown", "alg": "", "aud": "", "exp": "", "risks": ["unclassified"]}
-
-    def compute_risk_level(self, risks: List[str]) -> str:
-        if any("admin" in r.lower() for r in risks):
-            return "high"
-        if any("cloud" in r.lower() for r in risks):
-            return "medium"
-        if any("session" in r.lower() for r in risks):
-            return "medium"
-        return "low"
-
-    # ============================================================
-    #  Load tokens from log
+    #  Загрузка токенов из лога (analyzer / engine output)
     # ============================================================
 
     def load_log(self, report_path: str = "logs/token_risks.json"):
@@ -126,41 +88,40 @@ class TokenViewTab(ttk.Frame):
 
             for item in data:
                 value = item.get("value", "")
-                short = value[:80] + "..." if len(value) > 80 else value
+                val_short = value[:80] + "..." if len(value) > 80 else value
 
-                # Автокласифікація, якщо лог не містить типу
-                meta = self.classify_token(value)
-
-                token_type = item.get("type") or meta["type"]
-                alg = item.get("alg") or meta["alg"]
-                aud = item.get("aud") or meta["aud"]
-                exp = item.get("exp") or meta["exp"]
-
-                risks = item.get("risks") or meta["risks"]
-                risk_level = item.get("risk_level") or self.compute_risk_level(risks)
-
-                self._safe_insert(
-                    (
+                self.tree.insert(
+                    "",
+                    tk.END,
+                    values=(
                         item.get("linked_url", ""),
-                        short,
-                        token_type,
-                        exp,
-                        aud,
-                        alg,
-                        risk_level,
-                        "; ".join(risks),
+                        val_short,
+                        item.get("type", ""),
+                        item.get("exp", ""),
+                        item.get("aud", ""),
+                        item.get("alg", ""),
+                        item.get("risk_level", ""),
+                        "; ".join(item.get("risks", [])),
                     ),
-                    high_risk=(risk_level == "high"),
+                    tags=("high_risk",) if item.get("risk_level") == "high" else (),
                 )
+
+            self.tree.tag_configure("high_risk", background="#ffdddd")
 
         except Exception as e:
             messagebox.showerror("Ошибка загрузки", f"Не удалось загрузить лог:\n{e}")
 
     # ============================================================
-    #  Test token generator (ULTRA)
+    #  Генерация тестовых токенов (ULTRA‑режим, без внешних модулей)
     # ============================================================
 
     def _generate_test_tokens(self, count: int = 20) -> List[Dict]:
+        """
+        Генератор тестовых токенов 5.0:
+        • имитирует разные типы токенов (JWT / opaque / API key)
+        • добавляет простой risk‑scoring и источник
+        • используется только для демонстрации в GUI
+        """
         tokens: List[Dict] = []
 
         for _ in range(count):
@@ -175,21 +136,21 @@ class TokenViewTab(ttk.Frame):
                 alg = "HS256"
                 aud = "example.com"
                 exp = "2026-12-31"
-                risks = ["admin role", "weak secret"] if risk_level != "low" else ["generic jwt"]
+                risks = ["admin role", "long-lived", "weak secret"] if risk_level != "low" else ["generic jwt"]
 
             elif token_type == "api_key":
                 value = "AKIA" + "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(16))
                 alg = ""
                 aud = "internal-api"
                 exp = ""
-                risks = ["hardcoded key"] if risk_level != "low" else ["generic api key"]
+                risks = ["hardcoded key", "possible cloud access"] if risk_level != "low" else ["generic api key"]
 
-            else:
+            else:  # opaque
                 value = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(40))
                 alg = ""
                 aud = "session"
                 exp = ""
-                risks = ["session token"] if risk_level != "low" else ["generic session token"]
+                risks = ["session token", "possible hijack"] if risk_level != "low" else ["generic session token"]
 
             tokens.append(
                 {
@@ -201,7 +162,7 @@ class TokenViewTab(ttk.Frame):
                     "alg": alg,
                     "risk_level": risk_level,
                     "risks": risks,
-                    "source": "GUI generator 6.5",
+                    "source": "GUI generator 5.0",
                 }
             )
 
@@ -214,12 +175,14 @@ class TokenViewTab(ttk.Frame):
             tokens = self._generate_test_tokens(count=20)
 
             for token in tokens:
-                short = token["value"][:80] + "..." if len(token["value"]) > 80 else token["value"]
+                val_short = token["value"][:80] + "..." if len(token["value"]) > 80 else token["value"]
 
-                self._safe_insert(
-                    (
+                self.tree.insert(
+                    "",
+                    tk.END,
+                    values=(
                         token.get("linked_url", ""),
-                        short,
+                        val_short,
                         token.get("type", ""),
                         token.get("exp", ""),
                         token.get("aud", ""),
@@ -227,9 +190,10 @@ class TokenViewTab(ttk.Frame):
                         token.get("risk_level", ""),
                         "; ".join(token.get("risks", [])),
                     ),
-                    high_risk=(token.get("risk_level") == "high"),
+                    tags=("high_risk",) if token.get("risk_level") == "high" else (),
                 )
 
+            self.tree.tag_configure("high_risk", background="#ffdddd")
             messagebox.showinfo("Готово", f"Сгенерировано тестовых токенов: {len(tokens)}")
 
         except Exception as e:

@@ -1,87 +1,107 @@
 # xss_security_gui/gui/attack_gui.py
-import csv
+
+import logging
 import os
 import threading
 import json
-import time
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
-from urllib.parse import urlparse
-from queue import Empty
+from typing import Callable, Dict, Any, Optional
 
-from xss_security_gui import DIRS, settings
+
+from xss_security_gui import DIRS
+
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QPushButton, QTextEdit,
+    QProgressBar, QLabel, QHBoxLayout, QFileDialog, QMessageBox, QTabWidget, QTreeWidget, QTreeWidgetItem
+)
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
+
 from xss_security_gui.attack_engine import AttackEngine
 from xss_security_gui.mutator_task_manager import MutatorTaskManager
 from xss_security_gui.gui.mutator_tasks_panel import MutatorTasksPanel
+from xss_security_gui.payload_mutator import mutate_task
 from xss_security_gui.mutation_queue import MUTATION_ATTACK_QUEUE
-from xss_security_gui.auto_modules.dom_and_endpoints import build_headers_list
 
 
-class AttackGUI(tk.Frame):
+class GuiSignals(QObject):
     """
-    Графический интерфейс для запуска автоатак с визуализацией прогресса (Tkinter).
+    Потокобезопасные сигналы для обновления GUI из фонового потока.
+    """
+    log: pyqtSignal = pyqtSignal(str, str)             # msg, level
+    status: pyqtSignal = pyqtSignal(str)               # статусная строка
+    progress_set_max: pyqtSignal = pyqtSignal(int)     # максимум прогресса
+    progress_set_val: pyqtSignal = pyqtSignal(int)     # текущее значение прогресса
+    progress_inc: pyqtSignal = pyqtSignal()            # инкремент прогресса
+
+
+class AttackGUI(QWidget):
+    """
+    Графический интерфейс для запуска автоатак с визуализацией прогресса.
     """
 
-    def __init__(self, parent, domain: str, threat_sender=None):
-        super().__init__(parent)
+    def __init__(self, domain: str,
+                 threat_sender: Optional[Callable[[str, Dict[str, Any]], None]] = None):
+        super().__init__()
 
         self.domain = domain
         self.threat_sender = threat_sender or (lambda *a, **kw: None)
 
-        # === Заголовок и статус ===
-        top_bar = ttk.Frame(self)
-        top_bar.pack(fill="x", pady=5)
+        self.setWindowTitle("AutoRecon 3.0 — Attack GUI")
+        self.setMinimumSize(900, 600)
 
-        self.title = ttk.Label(top_bar, text=f"Цель: {self.domain}")
-        self.title.pack(side="left")
+        # === Виджеты ===
+        self.title = QLabel(f"Цель: {self.domain}")
+        self.title.setAlignment(Qt.AlignLeft)
 
-        self.status_label = ttk.Label(top_bar, text="Статус: ожидание")
-        self.status_label.pack(side="right")
+        self.progress = QProgressBar()
+        self.progress.setMinimum(0)
+        self.progress.setMaximum(5)
+        self.progress.setValue(0)
 
-        # === Прогресс ===
-        self.progress = ttk.Progressbar(self, orient="horizontal", length=400, mode="determinate")
-        self.progress.pack(fill="x", padx=5, pady=5)
+        self.status_label = QLabel("Статус: ожидание")
+        self.status_label.setAlignment(Qt.AlignLeft)
 
-        # === Кнопки управления ===
-        btn_bar = ttk.Frame(self)
-        btn_bar.pack(fill="x", pady=5)
+        self.log_output = QTextEdit()
+        self.log_output.setReadOnly(True)
 
-        self.btn_load_crawl = ttk.Button(btn_bar, text="📂 Загрузить deep_crawl.json", command=self._on_load_crawl)
-        self.btn_load_crawl.pack(side="left", padx=2)
+        self.btn_load_crawl = QPushButton("📂 Загрузить deep_crawl.json")
+        self.btn_run_attack = QPushButton("🧨 Запустить автоатаку")
+        self.btn_stop_attack = QPushButton("⏹️ Остановить атаку")
+        self.btn_export_results = QPushButton("💾 Экспорт результатов")
+        self.btn_send_summary = QPushButton("📤 Отправить сводку в Threat Intel")
 
-        self.btn_run_attack = ttk.Button(btn_bar, text="🧨 Запустить автоатаку", command=self._on_run_attack_threaded)
-        self.btn_run_attack.pack(side="left", padx=2)
-
-        self.btn_stop_attack = ttk.Button(btn_bar, text="⏹️ Остановить атаку", command=self._on_stop_attack)
-        self.btn_stop_attack.pack(side="left", padx=2)
-
-        self.btn_export_results = ttk.Button(btn_bar, text="💾 Экспорт результатов", command=self._on_export_results)
-        self.btn_export_results.pack(side="left", padx=2)
-
-        self.btn_send_summary = ttk.Button(btn_bar, text="📤 Отправить сводку", command=self._on_send_summary)
-        self.btn_send_summary.pack(side="left", padx=2)
-
-        # === Лог вывода ===
-        self.log_output = tk.Text(self, height=15, bg="#111", fg="lime")
-        self.log_output.pack(fill="both", expand=True, padx=5, pady=5)
-
-        # === Tabs (Mutator Tasks + XSS Results) ===
-        self.tabs = ttk.Notebook(self)
-        self.tabs.pack(fill="both", expand=True)
-
+        # === Tabs (включая Mutator Tasks) ===
+        self.tabs = QTabWidget()
         self.mutator_manager = MutatorTaskManager()
-        self.mutator_panel = MutatorTasksPanel(self.tabs, self.mutator_manager)
-        self.tabs.add(self.mutator_panel, text="Mutator Tasks")
+        self.mutator_panel = MutatorTasksPanel(self.mutator_manager)
+        # === Таблица XSS‑результатов ===
+        self.xss_tree = QTreeWidget()
+        self.xss_tree.setColumnCount(5)
+        self.xss_tree.setHeaderLabels(["URL", "Статус", "Reflected", "Length", "Payload"])
+        self.xss_tree.setAlternatingRowColors(True)
+        self.xss_tree.setRootIsDecorated(False)
+        self.tabs.addTab(self.mutator_panel, "Mutator Tasks")
 
-        self.xss_tree = ttk.Treeview(
-            self.tabs,
-            columns=("url", "status", "reflected", "length", "payload"),
-            show="headings"
-        )
-        for col in ("url", "status", "reflected", "length", "payload"):
-            self.xss_tree.heading(col, text=col.capitalize())
-        self.tabs.add(self.xss_tree, text="XSS Results")
+        # === Layout ===
+        top_bar = QHBoxLayout()
+        top_bar.addWidget(self.title)
+        top_bar.addStretch()
+        top_bar.addWidget(self.status_label)
+
+        btn_bar = QHBoxLayout()
+        btn_bar.addWidget(self.btn_load_crawl)
+        btn_bar.addWidget(self.btn_run_attack)
+        btn_bar.addWidget(self.btn_stop_attack)
+        btn_bar.addWidget(self.btn_export_results)
+        btn_bar.addWidget(self.btn_send_summary)
+
+        layout = QVBoxLayout()
+        layout.addLayout(top_bar)
+        layout.addWidget(self.progress)
+        layout.addLayout(btn_bar)
+        layout.addWidget(self.log_output)
+        layout.addWidget(self.tabs)
+        self.setLayout(layout)
 
         # === Состояние ===
         self.engine = AttackEngine(
@@ -91,365 +111,527 @@ class AttackGUI(tk.Frame):
         )
         self._start_mutation_worker()
 
-        self.crawl_json = {}
-        self._attack_thread = None
+        self.crawl_json: Dict[str, Any] = {}
+        self._module_count = 5
+        self._completed_modules = 0
+        self._attack_thread: Optional[threading.Thread] = None
         self._stop_requested = False
         self.mutation_count = 0
         self.mutation_hits = 0
 
-    # === Потокобезопасные вызовы ===
-    def _safe_call(self, fn, *args, **kwargs):
-        if threading.current_thread() is threading.main_thread():
-            fn(*args, **kwargs)
-        else:
-            self.after(0, lambda: fn(*args, **kwargs))
+        # === Сигналы ===
+        self.signals: GuiSignals = GuiSignals()
 
-    # === Лог-прокси ===
+        self.signals.log.connect(self._on_log_signal)
+        self.signals.status.connect(self._on_status_signal)
+        self.signals.progress_set_max.connect(self.progress.setMaximum)
+        self.signals.progress_set_val.connect(self.progress.setValue)
+        self.signals.progress_inc.connect(self._increment_progress)
+
+        self.btn_load_crawl.clicked.connect(self._on_load_crawl)
+        self.btn_run_attack.clicked.connect(self._on_run_attack_threaded)
+        self.btn_stop_attack.clicked.connect(self._on_stop_attack)
+        self.btn_export_results.clicked.connect(self._on_export_results)
+        self.btn_send_summary.clicked.connect(self._on_send_summary)
+
+        # Таймер для отзывчивости GUI
+        self.ui_timer = QTimer(self)
+        self.ui_timer.setInterval(250)
+        self.ui_timer.timeout.connect(lambda: None)
+        self.ui_timer.start()
+
+    # === Потокобезопасный лог-прокси ===
     def _log_proxy(self, msg: str, level: str = "info") -> None:
-        self._safe_call(self.log_output.insert, "end", f"[{level.upper()}] {msg}\n")
-        self._safe_call(self.log_output.see, "end")
+        self.signals.log.emit(msg, level)
+
+        if any(k in msg.lower() for k in ["модуль завершён", "завершён", "завершена"]):
+            self.signals.progress_inc.emit()
 
     # === Threat Intel ===
-    def _send_to_threat_intel(self, module=None, target=None, result=None, **kwargs):
+    def _send_to_threat_intel(self, attack_type: str, data: Dict[str, Any]) -> None:
+        """
+        Унифицированная отправка событий в Threat Intel (ULTRA 6.x)
+        attack_type → module
+        data → result
+        """
         try:
-            if module:
-                self._safe_call(self._log_proxy, f"📡 Threat Intel: модуль={module}", "info")
-            self.threat_sender(module=module, target=target, result=result, **kwargs)
+            self.threat_sender(
+                module=attack_type,
+                target=data.get("target", self.domain),
+                result=data
+            )
         except Exception as e:
-            self._safe_call(self._log_proxy, f"❌ Ошибка Threat Intel: {type(e).__name__}: {e}", "error")
-
-    def _load_secrets(self) -> dict:
-        """
-        Загружает секреты только из безопасных источников (переменные окружения).
-        Не хранит секреты в репозитории.
-        """
-        return {
-            "api_key": os.environ.get("XSS_API_KEY"),
-            "auth_token": os.environ.get("XSS_AUTH_TOKEN"),
-            # добавьте другие ключи по необходимости, но не хардкодьте значения
-        }
+            self.signals.log.emit(
+                f"❌ Ошибка Threat Intel: {type(e).__name__}: {e}",
+                "error"
+            )
 
     def _start_mutation_worker(self):
-        threading.Thread(target=self._mutation_worker, daemon=True).start()
-
-    def _increment_progress(self):
-        self.progress["value"] = min(self.progress["maximum"], self.progress["value"] + 1)
-
-    def _reset_progress(self, count: int):
-        self.progress["maximum"] = count
-        self.progress["value"] = 0
-
-    def _on_load_crawl(self):
-        path = filedialog.askopenfilename(
-            initialdir=DIRS["logs"],
-            title="Выберите deep_crawl.json",
-            filetypes=[("JSON Files", "*.json")]
+        """
+        Запускает отдельный поток, который:
+        • слушает очередь MUTATION_ATTACK_QUEUE
+        • выполняет атаки мутантами
+        • обновляет GUI
+        """
+        t = threading.Thread(
+            target=self._mutation_worker,
+            daemon=True,
+            name="MutationWorkerThread"
         )
+        t.start()
+
+
+    # === Обработчики сигналов ===
+    def _on_log_signal(self, msg: str, level: str = "info") -> None:
+        self.log_output.append(f"[{level.upper()}] {msg}")
+
+    def _on_status_signal(self, text: str) -> None:
+        self.status_label.setText(text)
+
+    def _on_send_summary(self) -> None:
+        """
+        Safe placeholder for sending summary report.
+        """
+        try:
+            QMessageBox.information(
+                self,
+                "Отправка сводки",
+                "Функция отправки сводного отчёта пока не реализована."
+            )
+            logging.info("Пользователь нажал 'Отправить сводку'. Функция не реализована.")
+        except Exception as e:
+            logging.error(f"Ошибка в _on_send_summary: {e}", exc_info=True)
+
+    # === Прогресс ===
+    def _increment_progress(self) -> None:
+        self._completed_modules = min(self._module_count, self._completed_modules + 1)
+        self.progress.setValue(self._completed_modules)
+
+    def _reset_progress(self, count: int) -> None:
+        self._module_count = count
+        self._completed_modules = 0
+        self.signals.progress_set_max.emit(count)
+        self.signals.progress_set_val.emit(0)
+
+    # === Загрузка deep_crawl.json ===
+    def _on_load_crawl(self) -> None:
+        default_dir = DIRS["logs"]
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выберите deep_crawl.json",
+            default_dir,
+            "JSON Files (*.json)"
+        )
+
         if not path:
             return
+
         try:
             with open(path, "r", encoding="utf-8") as f:
                 self.crawl_json = json.load(f)
-            self._safe_call(self._log_proxy, f"📂 Загружен deep_crawl.json: {path}", "info")
+
+            self.signals.log.emit(f"📂 Загружен deep_crawl.json: {path}", "info")
+
         except Exception as e:
-            self._safe_call(self._log_proxy, f"❌ Ошибка загрузки deep_crawl.json: {type(e).__name__}: {e}", "error")
+            self.signals.log.emit(
+                f"❌ Ошибка загрузки deep_crawl.json: {type(e).__name__}: {e}",
+                "error"
+            )
 
     def _mutation_worker(self):
-        while not getattr(self, "_stop_requested", False):
+        """
+        Основной Mutation→Attack pipeline:
+        • получает мутант из очереди
+        • вызывает AutoAttackEngine
+        • логирует
+        • обновляет таблицу XSS‑результатов
+        • безопасен к ошибкам
+        """
+        while True:
             try:
-                priority, task = MUTATION_ATTACK_QUEUE.get(timeout=1)
-            except Empty:
-                continue
+                # (priority, task)
+                priority, task = MUTATION_ATTACK_QUEUE.get()
+
+                category = task["category"]
+                payload = task["payload"]
+                framework = task.get("framework", "generic")
+
+                # URL берём из GUI
+                url = getattr(self, "url_entry", None)
+                if url:
+                    url = url.text().strip()
+                if not url:
+                    url = getattr(self, "default_url", self.domain)
+
+                # Выполняем атаку
+                result = self.engine.attack_payload(url, payload)
+                # === ЭФФЕКТИВНОСТЬ МУТАЦИЙ ===
+                # Инициализация счётчиков, если их ещё нет
+                if not hasattr(self, "mutation_count"):
+                    self.mutation_count = 0
+                if not hasattr(self, "mutation_hits"):
+                    self.mutation_hits = 0
+
+                self.mutation_count += 1
+                if result.get("reflected"):
+                    self.mutation_hits += 1
+
+                # Обновляем статусную строку
+                self.signals.status.emit(
+                    f"Mutations: {self.mutation_count} | Hits: {self.mutation_hits}"
+                )
+
+                # Лог в GUI
+                status = result.get("status")
+                self.signals.log.emit(
+                    f"[Mutator→Attack][prio={priority}] {payload} → {status}",
+                    "info"
+                )
+
+                # Обновление таблицы XSS‑результатов
+                self._add_xss_result(
+                    url=url,
+                    status=status,
+                    reflected=result.get("reflected"),
+                    length=result.get("length"),
+                    payload=payload
+                )
+
             except Exception as e:
-                self._safe_call(self._log_proxy, f"❌ Ошибка очереди мутаций: {type(e).__name__}: {e}", "error")
-                continue
-
-            payload = task["payload"]
-            url = getattr(self, "default_url", self.domain)
-
-            result = self.engine.attack_payload(url, payload)
-
-            self.mutation_count += 1
-            if result.get("reflected"):
-                self.mutation_hits += 1
-
-            self._safe_call(
-                self.status_label.config,
-                text=f"Mutations: {self.mutation_count} | Hits: {self.mutation_hits}"
-            )
-
-            self._safe_call(
-                self._log_proxy,
-                f"[Mutator→Attack][prio={priority}] {payload} → {result.get('status')}", "info"
-            )
-
-            self._safe_call(
-                self._add_xss_result,
-                url, result.get("status"), result.get("reflected"),
-                result.get("length"), payload
-            )
-
-            MUTATION_ATTACK_QUEUE.task_done()
+                self.signals.log.emit(
+                    f"❌ Ошибка в Mutation Worker: {type(e).__name__}: {e}",
+                    "error"
+                )
 
     def _add_xss_result(self, url, status, reflected, length, payload):
         try:
             tag = "reflected" if reflected else "clean"
-            self._safe_call(
-                self.xss_tree.insert,
-                "", "end",
+            self.xss_tree.insert(
+                "",
+                "end",
                 values=(url, status, reflected, length, payload),
                 tags=(tag,)
             )
         except Exception as e:
-            self._safe_call(self._log_proxy, f"❌ Ошибка добавления результата XSS: {e}", "error")
+            self.signals.log.emit(
+                f"❌ Ошибка добавления результата XSS: {e}",
+                "error"
+            )
 
-    def _on_export_results(self):
-        """Export attack results with multiple format options."""
+    def _on_export_results(self) -> None:
+        """
+        Export attack results with multiple format options.
+        """
         try:
             export_dir = DIRS.get("exports", DIRS.get("logs", "."))
             os.makedirs(export_dir, exist_ok=True)
 
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            parsed = urlparse(self.domain)
-            safe_domain = parsed.netloc or self.domain
-            safe_domain = safe_domain.replace(":", "_")
+            base_filename = f"attack_results_{self.domain}_{timestamp}"
 
-            base_filename = f"attack_results_{safe_domain}_{timestamp}"
+            export_formats = {
+                "JSON (*.json)": f"{base_filename}.json",
+                "CSV (*.csv)": f"{base_filename}.csv",
+                "Text (*.txt)": f"{base_filename}.txt"
+            }
 
-            filename = filedialog.asksaveasfilename(
-                initialdir=export_dir,
-                initialfile=base_filename,
-                title="Экспорт результатов атаки",
-                filetypes=[("JSON", "*.json"), ("CSV", "*.csv"), ("Text", "*.txt")]
+            filename, selected_filter = QFileDialog.getSaveFileName(
+                self,
+                "Экспорт результатов атаки",
+                os.path.join(export_dir, base_filename),
+                ";;".join(export_formats.keys())
             )
 
             if not filename:
                 return
 
-            results = self.engine.get_attack_results()
+            export_format = selected_filter.split()[0].lower()
 
-            if filename.endswith(".json"):
+            if export_format == "json":
                 with open(filename, "w", encoding="utf-8") as f:
-                    json.dump(results, f, indent=2, ensure_ascii=False)
+                    json.dump(self.engine.get_attack_results(), f, indent=2, ensure_ascii=False)
 
-            elif filename.endswith(".csv"):
-                if results:
-                    keys = results[0].keys()
-                    with open(filename, "w", newline="", encoding="utf-8") as f:
-                        writer = csv.DictWriter(f, fieldnames=keys)
-                        writer.writeheader()
-                        writer.writerows(results)
+            elif export_format == "csv":
+                results = self.engine.get_attack_results()
+                with open(filename, "w", encoding="utf-8") as f:
+                    f.write("key,value\n")
+                    for item in results:
+                        for k, v in item.items():
+                            f.write(f"{k},{v}\n")
 
-            elif filename.endswith(".txt"):
+            elif export_format == "text":
+                results = self.engine.get_attack_results()
                 with open(filename, "w", encoding="utf-8") as f:
                     for item in results:
-                        line = " | ".join(f"{k}: {v}" for k, v in item.items())
-                        f.write(line + "\n")
-
-            self._safe_call(self._log_proxy, f"✅ Результаты успешно экспортированы: {filename}", "info")
+                        f.write(str(item) + "\n")
 
         except Exception as e:
-            self._safe_call(self._log_proxy, f"❌ Ошибка экспорта результатов: {type(e).__name__}: {e}", "error")
+            logging.error(f"Ошибка экспорта результатов: {e}", exc_info=True)
 
-    def _on_run_attack_threaded(self):
+    # === Запуск атаки ===
+    def _on_run_attack_threaded(self) -> None:
         if self._attack_thread and self._attack_thread.is_alive():
-            messagebox.showwarning("Выполняется", "Атака уже выполняется. Дождитесь завершения.")
+            QMessageBox.warning(self, "Выполняется", "Атака уже выполняется. Дождитесь завершения.")
             return
 
         if not self.crawl_json:
-            self._safe_call(self._log_proxy, "⚠️ deep_crawl.json не загружен. Использую минимальные данные.", "warn")
+            self.signals.log.emit("⚠️ deep_crawl.json не загружен. Использую минимальные данные.", "warn")
             self.crawl_json = {"visited": [self.domain]}
 
         self._stop_requested = False
-
-        modules = [
-            "API Endpoints", "Token Brute Force", "Parameters Discovery", "User IDs Enumeration",
-            "XSS Targets", "GraphQL Endpoints", "JS Sensitive Analysis", "Security Headers Review",
-            "CSP Weakness Scan", "Secrets & Keys", "JWT Tokens", "Forms & Inputs", "Error Pages & Stacktraces"
-        ]
-        self._reset_progress(len(modules))
-
-        self._safe_call(self.status_label.config, text="Статус: выполняется…")
-        self._safe_call(self._log_proxy, "🧨 Запуск автоатаки в фоне…", "info")
+        self._reset_progress(count=5)
+        self.signals.status.emit("Статус: выполняется…")
+        self.signals.log.emit("🧨 Запуск автоатаки в фоне…", "info")
 
         self._attack_thread = threading.Thread(target=self._run_attack_background, daemon=True)
         self._attack_thread.start()
 
-    def _on_stop_attack(self):
+    def _on_stop_attack(self) -> None:
         if self._attack_thread and self._attack_thread.is_alive():
             self._stop_requested = True
-            self._safe_call(self.status_label.config, text="Статус: остановка запрошена…")
-            self._safe_call(self._log_proxy, "⏹️ Остановка атаки…", "warn")
+            self.signals.status.emit("Статус: остановка запрошена…")
+            self.signals.log.emit("⏹️ Остановка атаки…", "warn")
         else:
-            self._safe_call(self._log_proxy, "⚠️ Нет активной атаки для остановки.", "warn")
+            self.signals.log.emit("⚠️ Нет активной атаки для остановки.", "warn")
 
+    # === Фоновая атака ===
     def _run_attack_background(self) -> None:
         try:
-            deep_crawl_path = os.path.join(DIRS.get("logs", "."), "deep_crawl.json")
+            from xss_security_gui import LOGS_DIR
+            from xss_security_gui.threat_analysis.threat_connector import THREAT_CONNECTOR
+            from xss_security_gui.payloads import PAYLOADS
+
+            self.engine.log_func = self._log_proxy
+
+            deep_crawl_path = os.path.join(LOGS_DIR, "deep_crawl.json")
+
             if os.path.exists(deep_crawl_path):
                 try:
                     with open(deep_crawl_path, "r", encoding="utf-8") as f:
                         raw = json.load(f)
+
                     self.crawl_json.update(raw.get("pages", {}))
                     scripts = list(self.crawl_json.get("js_insights", {}).values())
                     self.crawl_json["scripts"] = scripts
-                    self._safe_call(self._log_proxy, f"📌 Загружено JS-скриптов: {len(scripts)}", "info")
+
+                    self.signals.log.emit(
+                        f"📌 Загружено JS-скриптов: {len(scripts)}",
+                        "info"
+                    )
+
                 except Exception as e:
-                    self._safe_call(self._log_proxy, f"❌ Ошибка загрузки deep_crawl.json: {type(e).__name__}: {e}",
-                                    "error")
+                    self.signals.log.emit(
+                        f"⚠️ Ошибка чтения deep_crawl.json: {e}",
+                        "warn"
+                    )
+                    self.crawl_json.setdefault("scripts", [])
             else:
-                self._safe_call(self._log_proxy, f"⚠️ Файл deep_crawl.json не найден: {deep_crawl_path}", "warn")
+                self.signals.log.emit(
+                    f"⚠️ Файл deep_crawl.json не найден по пути: {deep_crawl_path}",
+                    "warn"
+                )
                 self.crawl_json.setdefault("scripts", [])
 
             base_visited = self.crawl_json.get("visited", [self.domain])
-            session = self.engine._load_session_cookies()
-            headers_list = build_headers_list(self.crawl_json.get("tokens", []))
-            tokens = self.engine.generate_tokens()
 
             modules = [
-                "API Endpoints", "Token Brute Force", "Parameters Discovery", "User IDs Enumeration",
-                "XSS Targets", "GraphQL Endpoints", "JS Sensitive Analysis", "Security Headers Review",
-                "CSP Weakness Scan", "Secrets & Keys", "JWT Tokens", "Forms & Inputs", "Error Pages & Stacktraces"
+                ("API Endpoints", {
+                    "visited": base_visited,
+                    "api_endpoints": self.crawl_json.get("api_endpoints", []),
+                }, "api_endpoints"),
+
+                ("Token Brute Force", {
+                    "visited": base_visited,
+                    "tokens": self.crawl_json.get("tokens", []),
+                }, "tokens"),
+
+                ("Parameters Discovery", {
+                    "visited": base_visited,
+                    "parameters": self.crawl_json.get("parameters", []),
+                }, "parameters"),
+
+                ("User IDs Enumeration", {
+                    "visited": base_visited,
+                    "user_ids": self.crawl_json.get("user_ids", []),
+                }, "user_ids"),
+
+                ("XSS Targets", {
+                    "visited": base_visited,
+                    "xss_targets": self.crawl_json.get("xss_targets", []),
+                }, "xss_targets"),
+
+                ("GraphQL Endpoints", {
+                    "visited": base_visited,
+                    "graphql": self.crawl_json.get("graphql", []),
+                }, "graphql"),
+
+                ("JS Sensitive Analysis", {
+                    "visited": base_visited,
+                    "scripts": self.crawl_json.get("scripts", []),
+                }, "js_insights"),
+
+                ("Security Headers Review", {
+                    "visited": base_visited,
+                    "headers": self.crawl_json.get("headers", []),
+                }, "headers"),
+
+                ("CSP Weakness Scan", {
+                    "visited": base_visited,
+                    "csp": self.crawl_json.get("csp_analysis", []),
+                }, "csp_analysis"),
+
+                ("Secrets & Keys", {
+                    "visited": base_visited,
+                    "secrets": self.crawl_json.get("secrets", []),
+                    "api_keys": self.crawl_json.get("api_keys", []),
+                }, "secrets"),
+
+                ("JWT Tokens", {
+                    "visited": base_visited,
+                    "jwt_tokens": self.crawl_json.get("jwt_tokens", []),
+                }, "jwt_tokens"),
+
+                ("Forms & Inputs", {
+                    "visited": base_visited,
+                    "forms": self.crawl_json.get("forms", []),
+                    "input_fields": self.crawl_json.get("input_fields", []),
+                }, "forms"),
+
+                ("Error Pages & Stacktraces", {
+                    "visited": base_visited,
+                    "errors": self.crawl_json.get("errors", []),
+                }, "errors"),
             ]
 
-            self._reset_progress(len(modules))
-            self._safe_call(self.status_label.config, text="Статус: выполняется…")
-            self._safe_call(self._log_proxy, "🧨 Запуск автоатаки (циклический режим)…", "info")
+            total_modules = len(modules)
 
-            allowed_targets = getattr(settings, "ALLOWED_TARGETS", [])
-            allow_real = getattr(settings, "ALLOW_REAL_RUN", True)
-            secrets = self._load_secrets()
+            for idx, (name, payload, artifact_key) in enumerate(modules, start=1):
 
-            while not self._stop_requested:
-                for idx, name in enumerate(modules, start=1):
+                if self._stop_requested:
+                    self.signals.status.emit("Статус: остановлено пользователем")
+                    self.signals.log.emit(f"⏹️ Атака прервана на модуле {name}", "warn")
+                    return
 
-                    if self._stop_requested:
-                        self._safe_call(
-                            self._log_proxy,
-                            "🛑 Атака остановлена пользователем.",
-                            "warn"
-                        )
-                        break
+                self.signals.status.emit(
+                    f"Статус: выполняется {idx}/{total_modules} — {name}"
+                )
+                self.signals.log.emit(f"▶️ Запуск модуля: {name}", "info")
 
-                    self._safe_call(
-                        self._log_proxy,
-                        f"▶️ Запуск модуля {idx}/{len(modules)}: {name}",
-                        "info"
-                    )
+                try:
+                    self.engine.run_modular_auto_attack(payload)
 
-                    handler = self.engine.module_handlers.get(name)
-                    if not handler:
-                        self._safe_call(
-                            self._log_proxy,
-                            f"⚠️ Нет обработчика для модуля: {name}",
-                            "warn"
-                        )
-                        continue
+                    # Автоматическая генерация мутантов для каждого XSS Target
+                    if name == "XSS Targets":
+                        xss_targets = self.crawl_json.get("xss_targets", [])
+                        # ожидаем список структур, где есть payload или raw_payload
+                        for target in xss_targets:
+                            base_payload = None
+                            if isinstance(target, dict):
+                                base_payload = target.get("payload") or target.get("raw_payload")
+                            elif isinstance(target, str):
+                                base_payload = target
 
-                    ctx = {
-                        "session": session,
-                        "base_url": base_visited[0] if base_visited else self.domain,
-                        "headers_list": headers_list,
-                        "crawl": self.crawl_json,
-                        "tokens": tokens,
-                        "secrets": secrets,
-                        "settings": {"allow_real_run": allow_real},
-                    }
+                            if not base_payload:
+                                continue
 
-                    try:
-                        if allow_real and (
-                                self.domain in allowed_targets or urlparse(self.domain).netloc in allowed_targets
-                        ):
-                            result = handler(ctx)
-                        else:
-                            try:
-                                result = handler(ctx)
-                            except Exception as e:
-                                result = {
-                                    "status": "skipped",
-                                    "reason": "real-run-not-allowed",
-                                    "error": str(e)
-                                }
-
-                    except Exception as e:
-                        result = {"status": "error", "error": str(e)}
-                        self._safe_call(
-                            self._log_proxy,
-                            f"❌ Ошибка в модуле {name}: {type(e).__name__}: {e}",
-                            "error"
-                        )
-
-                    if isinstance(result, dict):
-                        try:
-                            self.engine._record_result(name, result)
-                        except Exception as e:
-                            self._safe_call(
-                                self._log_proxy,
-                                f"❌ Ошибка записи результата модуля {name}: {e}",
-                                "error"
+                            self.mutator_manager.submit(
+                                mutate_task,
+                                "Reflected",
+                                base_payload,
+                                "generic"
                             )
-                    else:
-                        self._safe_call(
-                            self._log_proxy,
-                            f"⚠️ Модуль {name} вернул неожиданный результат.",
-                            "warn"
+
+                    artifacts = []
+                    data = self.crawl_json.get(artifact_key, [])
+
+                    if isinstance(data, dict):
+                        for target, items in data.items():
+                            artifacts.append({
+                                "severity": "info",
+                                "category": artifact_key,
+                                "source": name,
+                                "items": items,
+                            })
+                            THREAT_CONNECTOR.bulk(
+                                module=name,
+                                target=target,
+                                results=[artifacts[-1]],
+                            )
+                    elif isinstance(data, list):
+                        artifacts.append({
+                            "severity": "info",
+                            "category": artifact_key,
+                            "source": name,
+                            "items": data,
+                        })
+                        THREAT_CONNECTOR.emit(
+                            module=name,
+                            target=self.domain,
+                            result=artifacts[-1],
                         )
 
-                    self._safe_call(
-                        self._log_proxy,
-                        f"✅ Завершён модуль {idx}/{len(modules)}: {name}",
-                        "info"
+                    self.signals.log.emit(f"✔️ Модуль {name} завершён", "info")
+                    self.signals.progress_inc.emit()
+
+                except Exception as mod_err:
+                    self.signals.log.emit(
+                        f"❌ Ошибка в модуле {name}: {mod_err}",
+                        "error"
                     )
+                    THREAT_CONNECTOR.emit(
+                        module=f"{name} (error)",
+                        target=self.domain,
+                        result={
+                            "severity": "error",
+                            "category": "auto_attack",
+                            "source": "GUI",
+                            "message": str(mod_err),
+                        },
+                    )
+                    continue
 
-                    time.sleep(0.2)
+            try:
+                self.engine.export_results()
+                self.engine.send_summary_to_threat_intel()
+                PAYLOADS.export_stats_to_threat_intel()
+            except Exception as export_err:
+                self.signals.log.emit(
+                    f"⚠️ Ошибка экспорта/Threat Intel: {export_err}",
+                    "warn"
+                )
+                THREAT_CONNECTOR.emit(
+                    module="Export/ThreatIntel",
+                    target=self.domain,
+                    result={
+                        "severity": "warn",
+                        "category": "export",
+                        "source": "GUI",
+                        "message": str(export_err),
+                    },
+                )
 
-                time.sleep(0.3)
-
-            export_dir = DIRS.get("exports", DIRS.get("logs", "."))
-            os.makedirs(export_dir, exist_ok=True)
-            safe_domain = self.engine._sanitize_domain(self.domain)
-            filename = os.path.join(
-                export_dir,
-                f"attack_results_{safe_domain}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-            )
-
-            with open(filename, "w", encoding="utf-8") as f:
-                json.dump(self.engine.get_attack_results(), f, indent=2, ensure_ascii=False)
-
-            self._safe_call(self._log_proxy, f"✅ Все результаты сохранены: {filename}", "info")
-            self._safe_call(self.status_label.config, text="Статус: завершено")
-        except Exception as e:
-            self._safe_call(self._log_proxy, f"❌ Ошибка фоновой атаки: {type(e).__name__}: {e}", "error")
-            self._safe_call(self.status_label.config, text="Статус: ошибка")
-
-    def _on_send_summary(self):
-        messagebox.showinfo("Отправка сводки", "Сводка формируется в фоне...")
-        threading.Thread(target=self._send_summary_worker, daemon=True).start()
-
-    def _send_summary_worker(self):
-        """Фоновая логика формирования и сохранения сводного отчёта."""
-        try:
-            # Получаем результаты атаки
-            results = self.engine.get_attack_results()
-
-            # Формируем путь для сохранения
-            export_dir = DIRS.get("exports", DIRS.get("logs", "."))
-            os.makedirs(export_dir, exist_ok=True)
-
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            safe_domain = self.engine._sanitize_domain(self.domain)
-
-            filename = os.path.join(
-                export_dir,
-                f"attack_summary_{safe_domain}_{timestamp}.json"
-            )
-
-            # Сохраняем в JSON
-            with open(filename, "w", encoding="utf-8") as f:
-                json.dump(results, f, indent=2, ensure_ascii=False)
-
-            # Логируем короткий статус
-            self._safe_call(self._log_proxy, f"📋 Сводка успешно сохранена: {filename}", "info")
+            self.signals.status.emit("Статус: завершено")
+            self.signals.log.emit("✔️ Автоатака завершена полностью.", "info")
+            self.signals.progress_set_val.emit(self._module_count)
 
         except Exception as e:
-            self._safe_call(self._log_proxy, f"❌ Ошибка формирования сводки: {type(e).__name__}: {e}", "error")
+            self.signals.status.emit("Статус: ошибка")
+            self.signals.log.emit(
+                f"❌ Ошибка автоатаки: {type(e).__name__}: {e}",
+                "error"
+            )
+            try:
+                from xss_security_gui.threat_analysis.threat_connector import THREAT_CONNECTOR
+                THREAT_CONNECTOR.emit(
+                    module="AutoAttackEngine",
+                    target=self.domain,
+                    result={
+                        "severity": "error",
+                        "category": "engine",
+                        "source": "GUI",
+                        "message": f"{type(e).__name__}: {e}",
+                    },
+                )
+            except Exception:
+                pass

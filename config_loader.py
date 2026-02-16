@@ -10,8 +10,9 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List
 
-# Импортируем универсальные пути
-from xss_security_gui.settings import SETTINGS_JSON_PATH, crawler_results_path
+BASE_DIR = Path(__file__).parent
+SETTINGS_PATH = BASE_DIR / "settings.json"
+CRAWLER_RESULTS_PATH = BASE_DIR / "logs" / "crawler_results.json"
 
 
 def _safe_load_json(path: Path, default: Any) -> Any:
@@ -29,9 +30,9 @@ def _safe_load_json(path: Path, default: Any) -> Any:
 
 def load_settings() -> Dict[str, Any]:
     """Загружает настройки из settings.json."""
-    return _safe_load_json(SETTINGS_JSON_PATH, default={})
+    return _safe_load_json(SETTINGS_PATH, default={})
 
 
 def load_crawler_results() -> List[Dict[str, Any]]:
     """Загружает результаты краулера из crawler_results.json."""
-    return _safe_load_json(crawler_results_path(), default=[])
+    return _safe_load_json(CRAWLER_RESULTS_PATH, default=[])

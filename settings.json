@@ -1,0 +1,25 @@
+{
+  "gui": {
+    "max_report_line_length": 110
+  },
+  "honeypot": {
+    "enable_auto_traps": true,
+    "trap_type": "html",
+    "poll_interval": 4,
+    "max_log_size_mb": 10,
+    "log_path": "logs/honeypot.log",
+    "hits_log_path": "logs/honeypot_hits.log"
+  },
+  "fuzzer": {
+    "param_fuzz_log_path": "logs/param_fuzz_hits.log"
+  },
+  "logging": {
+    "success_path": "logs/success.log",
+  "enable_cloudflare_bypass": true,
+  "enable_js_rendering": true,
+  "enable_browser_emulation": true
+  },
+  "ENABLE_AUTO_TRAPS": true,
+  "DEFAULT_TRAP_TYPE": "js",
+  "HONEYPOT_POLL_INTERVAL": 4
+}

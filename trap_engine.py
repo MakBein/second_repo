@@ -1,6 +1,4 @@
-# xss_security_gui/trap_engine.py
-from xss_security_gui.settings import TRAP_WEBHOOK_URL
-
+from settings import TRAP_WEBHOOK_URL
 import requests
 from datetime import datetime
 

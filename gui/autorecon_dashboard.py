@@ -1,83 +1,88 @@
 # xss_security_gui/gui/autorecon_dashboard.py
 
 from typing import Dict, Any, List, Optional
-from collections import Counter
-from xss_security_gui.threat_analysis.threat_connector import THREAT_CONNECTOR
+
+from xss_security_gui.threat_analysis.threat_connector import ThreatConnector
 
 
 class AutoReconDashboard:
     """
-    AutoRecon Dashboard (ULTRA‑6.5)
-    --------------------------------
-    • Читает глобальный ThreatConnector
-    • Строит сводку по модулям, severity и target
-    • Возвращает payload для GUI через callback
+    Логічна вкладка "AutoRecon Dashboard":
+    • читає ThreatConnector 2.0 NDJSON-лог
+    • показує зведення по модулях
+    • дає деталі по вибраному модулю / target / severity
+    • готова до інтеграції з будь-яким GUI (через callback)
     """
 
-    def __init__(self, gui_callback: Optional[callable] = None, log_file: str = "logs/threat_intel.ndjson"):
+    def __init__(self, gui_callback=None, log_file: str = "logs/threat_intel.ndjson"):
         self.gui_callback = gui_callback
-        self.connector = THREAT_CONNECTOR  # единый глобальный объект
-        self.log_file = log_file
+        self.connector = ThreatConnector(log_file=log_file)
 
-    # ---------------------------------------------------------
-    # Вспомогательный метод для безопасного вызова callback
-    # ---------------------------------------------------------
-    def _emit(self, key: str, payload: Any) -> None:
-        if self.gui_callback:
-            try:
-                self.gui_callback({key: payload})
-            except Exception as e:
-                # Логируем, но не ломаем пайплайн
-                print(f"[AutoReconDashboard] Ошибка gui_callback: {e}")
-
-    # ---------------------------------------------------------
-    # Базовые данные
-    # ---------------------------------------------------------
+    # -----------------------------
+    # Базові дані
+    # -----------------------------
     def load_summary(self) -> Dict[str, Any]:
         summary = self.connector.summary()
-        self._emit("autorecon_summary", summary)
+        if self.gui_callback:
+            self.gui_callback({"autorecon_summary": summary})
         return summary
 
     def load_all(self) -> List[Dict[str, Any]]:
         return self.connector.load_all()
 
-    # ---------------------------------------------------------
-    # Детали по модулю
-    # ---------------------------------------------------------
+    # -----------------------------
+    # Деталі по модулю
+    # -----------------------------
     def get_by_module(self, module: str) -> List[Dict[str, Any]]:
         items = self.connector.filter_by_module(module)
-        self._emit("autorecon_module_details", {"module": module, "items": items})
+        if self.gui_callback:
+            self.gui_callback({
+                "autorecon_module_details": {
+                    "module": module,
+                    "items": items
+                }
+            })
         return items
 
-    # ---------------------------------------------------------
-    # Детали по severity
-    # ---------------------------------------------------------
+    # -----------------------------
+    # Деталі по severity
+    # -----------------------------
     def get_by_severity(self, severity: str) -> List[Dict[str, Any]]:
         items = self.connector.filter_by_severity(severity)
-        self._emit("autorecon_severity_details", {"severity": severity, "items": items})
+        if self.gui_callback:
+            self.gui_callback({
+                "autorecon_severity_details": {
+                    "severity": severity,
+                    "items": items
+                }
+            })
         return items
 
-    # ---------------------------------------------------------
-    # Детали по target
-    # ---------------------------------------------------------
+    # -----------------------------
+    # Деталі по target
+    # -----------------------------
     def get_by_target(self, target: str) -> List[Dict[str, Any]]:
         items = self.connector.filter_by_target(target)
-        self._emit("autorecon_target_details", {"target": target, "items": items})
+        if self.gui_callback:
+            self.gui_callback({
+                "autorecon_target_details": {
+                    "target": target,
+                    "items": items
+                }
+            })
         return items
 
-    # ---------------------------------------------------------
-    # Комплексный payload для GUI
-    # ---------------------------------------------------------
+    # -----------------------------
+    # Комплексний payload для GUI
+    # -----------------------------
     def build_dashboard_payload(self) -> Dict[str, Any]:
         summary = self.connector.summary()
         all_items = self.connector.load_all()
 
-        # Группировка по severity через Counter
-        severities = [
-            a.get("result", {}).get("severity", "unknown")
-            for a in all_items
-        ]
-        by_severity = dict(Counter(severities))
+        by_severity: Dict[str, int] = {}
+        for a in all_items:
+            sev = a.get("result", {}).get("severity", "unknown")
+            by_severity[sev] = by_severity.get(sev, 0) + 1
 
         payload = {
             "summary": summary,
@@ -85,5 +90,7 @@ class AutoReconDashboard:
             "total_artifacts": len(all_items),
         }
 
-        self._emit("autorecon_dashboard", payload)
+        if self.gui_callback:
+            self.gui_callback({"autorecon_dashboard": payload})
+
         return payload

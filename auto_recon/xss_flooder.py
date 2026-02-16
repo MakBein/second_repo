@@ -1,8 +1,8 @@
 # xss_security_gui/auto_recon/xss_flooder.py
-
 """
-XSS Flooder ULTRA 6.1 — многопоточный движок
+XSS Flooder ULTRA 6.0 — многопоточный движок
 --------------------------------------------
+
 Особенности:
 - Worker-потоки (постоянные)
 - Очередь задач (Queue)
@@ -11,6 +11,8 @@ XSS Flooder ULTRA 6.1 — многопоточный движок
 - Логи в logs/xss_flood_log.txt
 - Интеграция с settings.py и ThreatConnector
 """
+
+from __future__ import annotations
 
 import time
 import queue
@@ -24,24 +26,24 @@ from xss_security_gui.settings import LOG_DIR, BASE_DIR, settings
 from xss_security_gui.threat_analysis.threat_connector import THREAT_CONNECTOR
 
 # 📂 Путь к файлу целей
-TARGETS_FILE: Path = BASE_DIR / "auto_recon" / "target" / "targets.txt"
+TARGETS_FILE: Path = BASE_DIR / "xss_security_gui" / "auto_recon" / "configs" / "targets.txt"
 
 # 📁 Подготовка лог-файла
 LOG_PATH: Path = LOG_DIR / "xss_flood_log.txt"
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 # Тип callback
-FloodCallback = Callable[[str, str, str], None]
+FloodCallback = Callable[[str, int | str, str], None]
+
+# 💣 Список целей (загружается из файла)
+payload_urls: list[str] = []
 
 
-# 📝 Логирование ответа
-def log_response(url: str, status: str, snippet: str) -> None:
+# 📝 Логирование ответа (локальный файл)
+def log_response(url: str, status: int | str, content: str) -> None:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        with LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(f"[{timestamp}] [{status}] {url}\nSnippet: {snippet[:200]}\n\n")
-    except Exception as e:
-        print(f"[XSSFlooder] Ошибка записи лога: {e}")
+    with open(LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(f"[{timestamp}] [{status}] {url}\n")
 
 
 # 📂 Загрузка целей из файла
@@ -50,35 +52,31 @@ def load_targets_from_file(path: Path) -> list[str]:
     if not path.exists():
         print(f"[XSSFlooder] Файл {path} не найден.")
         return []
-    try:
-        with path.open(encoding="utf-8") as f:
-            return [
-                line.strip()
-                for line in f
-                if line.strip() and not line.strip().startswith("#")
-            ]
-    except Exception as e:
-        print(f"[XSSFlooder] Ошибка чтения файла {path}: {e}")
-        return []
+    with open(path, encoding="utf-8") as f:
+        return [
+            line.strip()
+            for line in f
+            if line.strip() and not line.strip().startswith("#")
+        ]
 
 
-# 💣 Список целей
-payload_urls: list[str] = load_targets_from_file(TARGETS_FILE)
+# Инициализация списка целей
+payload_urls = load_targets_from_file(TARGETS_FILE)
 
 
-# 🚀 Отправка одного payload
+# 🚀 Отправка одного пейлоада (с повтором)
 def send_payload(
     url: str,
     callback: Optional[FloodCallback],
-    timeout: int,
-    repeat: int,
-    delay: float,
+    timeout: int = 1,        # ⏱ таймаут 1 сек
+    repeat: int = 20,        # 🔁 20 запросов подряд
+    delay: float = 0.0,
 ) -> None:
     """Отправляет несколько запросов подряд на один URL."""
     for _ in range(repeat):
         try:
             response = requests.get(url, timeout=timeout)
-            status = str(response.status_code) if response.ok else f"FAIL-{response.status_code}"
+            status = response.status_code if response.ok else f"FAIL-{response.status_code}"
             snippet = response.text[:200]
         except Exception as e:
             status = "ERROR"
@@ -92,7 +90,7 @@ def send_payload(
                 "status": status,
                 "snippet": snippet,
                 "error": snippet if status == "ERROR" else None,
-            },
+            }
         )
 
         # Callback для GUI
@@ -112,48 +110,37 @@ def worker_thread(task_queue: queue.Queue[tuple[str, int, float]], callback: Opt
         try:
             url, repeat, delay = task_queue.get(timeout=1)
             if url is None:
-                task_queue.task_done()
-                print("[XSSFlooder] Worker завершён.")
                 break  # сигнал завершения
             send_payload(url, callback, timeout, repeat=repeat, delay=delay)
-            task_queue.task_done()
         except queue.Empty:
-            time.sleep(0.1)  # предотвращаем busy-loop
-        except Exception as e:
-            print(f"[XSSFlooder] Ошибка в worker: {e}")
+            continue
+        finally:
+            task_queue.task_done()
 
 
 # 🚀 Запуск многопоточного флудера
 def start_flood(
     target_urls: Iterable[str] = None,
-    flood_interval: float = None,
-    flood_count: int = None,
+    flood_interval: float = 1.0,
+    flood_count: int = 1,
     max_workers: Optional[int] = None,
     callback: Optional[FloodCallback] = None,
-    timeout: int = None,
-    repeat_each: int = None,
-    delay_each: float = None,
+    timeout: int = 1,             # ⏱ таймаут 1 сек
+    repeat_each: int = 20,        # 🔁 20 запросов на каждый URL
+    delay_each: float = 0.0,
 ) -> None:
-
     urls = list(target_urls or payload_urls)
     if not urls:
         print(f"[XSSFlooder] Нет целевых URL. Проверь файл {TARGETS_FILE}")
         return
 
-    flood_interval = flood_interval or settings.get("flood.interval", 1.0)
-    flood_count = flood_count or settings.get("flood.cycles", 1)
-    max_workers = max_workers or settings.get("attack_engine.threads", 6)
-    timeout = timeout or settings.get("flood.timeout", 2)
-    repeat_each = repeat_each or settings.get("flood.repeat_each", 10)
-    delay_each = delay_each or settings.get("flood.delay_each", 0.0)
+    if max_workers is None:
+        max_workers = settings.get("attack_engine.threads", 6)
 
     total_requests = len(urls) * repeat_each * flood_count
-    print(
-        f"[XSSFlooder] Starting flood: {len(urls)} URLs, cycles={flood_count}, "
-        f"workers={max_workers}, total_requests={total_requests}"
-    )
+    print(f"[XSSFlooder] Starting flood: {len(urls)} URLs, cycles={flood_count}, workers={max_workers}, total_requests={total_requests}")
 
-    task_queue: queue.Queue[tuple[Optional[str], int, float]] = queue.Queue()
+    task_queue: queue.Queue[tuple[str, int, float]] = queue.Queue()
 
     # Создаём worker-потоки
     workers = []
@@ -168,14 +155,12 @@ def start_flood(
         for url in urls:
             task_queue.put((url, repeat_each, delay_each))
         task_queue.join()
-
         if cycle < flood_count - 1:
             time.sleep(flood_interval)
 
     # Завершаем worker-потоки
     for _ in workers:
-        task_queue.put((None, 0, 0.0))
-
+        task_queue.put((None, 0, 0))
     for t in workers:
         t.join()
 

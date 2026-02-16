@@ -3,46 +3,39 @@ import datetime
 import traceback
 import os
 import urllib.parse
-from hashlib import sha1, sha256, md5
+from hashlib import sha1
 
 
-# ============================================================
-#  URL Utilities
-# ============================================================
 def normalize_url(url: str) -> str:
-    """Приводит URL к стандартному виду (по умолчанию HTTPS)."""
+    """Приводит URL к стандартному виду."""
     url = url.strip()
     if not url.startswith(("http://", "https://")):
-        url = "https://" + url
+        url = "https://" + url  # HTTPS предпочтительнее
     return url
 
 
-def hash_url(url: str, algo: str = "sha1") -> str:
-    """Хеширует канонизированный URL (без query/fragment)."""
+def hash_url(url: str) -> str:
+    """SHA1-хеш канонизированного URL (без query/fragment)."""
     parsed = urllib.parse.urlparse(url)._replace(query="", fragment="")
-    canonical = parsed.geturl().encode()
-
-    if algo == "sha256":
-        return sha256(canonical).hexdigest()
-    elif algo == "md5":
-        return md5(canonical).hexdigest()
-    return sha1(canonical).hexdigest()
+    return sha1(parsed.geturl().encode()).hexdigest()
 
 
-def url_fingerprint(url: str, keep_query_keys=None, algo: str = "sha1") -> str:
+def url_fingerprint(url, keep_query_keys=None):
     """Создаёт хеш URL с сохранением ключевых query-параметров."""
     parsed = urllib.parse.urlparse(url)
     query = parsed.query
 
     if keep_query_keys:
         query_dict = urllib.parse.parse_qs(query)
-        filtered_query = {k: query_dict[k] for k in keep_query_keys if k in query_dict}
+        filtered_query = {
+            k: query_dict[k] for k in keep_query_keys if k in query_dict
+        }
         query_str = urllib.parse.urlencode(filtered_query, doseq=True)
     else:
         query_str = ""
 
     canonical = parsed._replace(query=query_str, fragment="")
-    return hash_url(canonical.geturl(), algo=algo)
+    return sha1(canonical.geturl().encode()).hexdigest()
 
 
 def is_valid_url(url: str) -> bool:
@@ -54,10 +47,7 @@ def is_valid_url(url: str) -> bool:
         return False
 
 
-# ============================================================
-#  Crawling & Networking
-# ============================================================
-def safe_crawl_site(domain: str, retries: int = 3, timeout: int = 5):
+def safe_crawl_site(domain, retries=3):
     """
     Безопасный краулер с повторами и логированием.
     Делает запрос на реальный URL, а не на SHA1-хеш.
@@ -73,7 +63,7 @@ def safe_crawl_site(domain: str, retries: int = 3, timeout: int = 5):
             if not is_valid_url(domain):
                 raise ValueError(f"Invalid URL: {domain}")
 
-            response = requests.get(domain, timeout=timeout)
+            response = requests.get(domain, timeout=5)
 
             if response.ok:
                 return {"status": "success", "content": response.text}
@@ -81,7 +71,7 @@ def safe_crawl_site(domain: str, retries: int = 3, timeout: int = 5):
                 return {
                     "status": "error",
                     "code": response.status_code,
-                    "reason": response.reason,
+                    "reason": response.reason
                 }
 
         except Exception as e:
@@ -91,24 +81,21 @@ def safe_crawl_site(domain: str, retries: int = 3, timeout: int = 5):
     return {
         "status": "failure",
         "reason": "Max retries exceeded",
-        "target": domain,
+        "target": domain
     }
 
 
-# ============================================================
-#  Logging
-# ============================================================
-def log_xss_flood(url: str, status: str):
-    """Логирует XSS flood-атаки."""
+def log_xss_flood(url, status):
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     os.makedirs("logs", exist_ok=True)
     with open("logs/xss_flood_log.txt", "a", encoding="utf-8") as f:
         f.write(f"[{timestamp}] [{status}] {url}\n")
 
 
-def log_error(domain: str, error: Exception):
+def log_error(domain, error):
     """Лог ошибок с автосозданием директории."""
     os.makedirs("xss_security_gui", exist_ok=True)
+
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     path = "xss_security_gui/error_log.txt"
 
@@ -117,11 +104,7 @@ def log_error(domain: str, error: Exception):
         f.write(traceback.format_exc() + "\n")
 
 
-# ============================================================
-#  Data Analysis
-# ============================================================
-def contains_sensitive(data, keys) -> bool:
-    """Проверяет, содержит ли структура чувствительные ключи."""
+def contains_sensitive(data, keys):
     keys = {k.lower() for k in keys}
     if isinstance(data, dict):
         for k, v in data.items():
@@ -134,26 +117,3 @@ def contains_sensitive(data, keys) -> bool:
             if contains_sensitive(item, keys):
                 return True
     return False
-
-
-def flatten_dict(d: dict, parent_key: str = "", sep: str = ".") -> dict:
-    """Разворачивает вложенные словари в плоский вид."""
-    items = {}
-    for k, v in d.items():
-        new_key = f"{parent_key}{sep}{k}" if parent_key else k
-        if isinstance(v, dict):
-            items.update(flatten_dict(v, new_key, sep=sep))
-        else:
-            items[new_key] = v
-    return items
-
-
-def safe_get(d: dict, path: str, default=None):
-    """Безопасно извлекает значение по пути 'a.b.c' из словаря."""
-    keys = path.split(".")
-    for k in keys:
-        if isinstance(d, dict) and k in d:
-            d = d[k]
-        else:
-            return default
-    return d

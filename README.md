@@ -8,8 +8,7 @@
 
 ## 📌 Описание
 
-**XSS Security GUI** — это очень мощный инструмент: GUI‑обёртка над XSStrike + собственный краулер + DOM‑анализатор + 
-авто-атаки с графическим интерфейсом для анализа потенциальных XSS-уязвимостей,
+**XSS Security GUI** — это инструмент с графическим интерфейсом для анализа потенциальных XSS-уязвимостей,
 мониторинга ловушек (honeypots), управления полезными нагрузками и экспорта результатов. 
 Подходит для специалистов по безопасности, исследователей и тестировщиков.
 
@@ -210,19 +209,8 @@ source .venv/bin/activate   # Linux/Mac
 pip install -r requirements.txt
 python main.py
 
-Пример запуска only GUI:
-python -m xss_security_gui.main
-
-Пример запуска краулера CLI&GUI:
-python -m xss_security_gui.main crawl <url>
-
-Пример запуска краулера в режиме only CLI:
-python -m xss_security_gui.cli crawl <url>
-python -m xss_security_gui.main_cli js file.js
-python -m xss_security_gui.main_cli recon <url>
-
-
-
+Пример запуска краулера:
+python -m xss_security_gui.main crawl https://gazprombank.ru
 
 📂 4. Выходные артефакты
 | Файл | Назначение | 
