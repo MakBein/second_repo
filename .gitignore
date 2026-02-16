@@ -1,0 +1,33 @@
+# xss_security_gui/.gitignore
+# === Python стандартное ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# === Виртуальное окружение ===
+.venv/
+env/
+venv/
+
+# === Сборка и артефакты ===
+dist/
+build/
+*.egg-info/
+*.spec
+
+# === IDE и редакторы ===
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === Логи проекта ===
+logs/
+*.log
+
+# === Конфигурации и секреты ===
+.env
+
+# === Сгенерированные отчёты ===
+*.md~

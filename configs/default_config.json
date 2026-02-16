@@ -1,0 +1,47 @@
+{
+  "app_name": "XSS Security GUI",
+  "version": "1.2.5",
+
+  "network": {
+    "default_timeout": 8,
+    "max_rps": 10,
+    "retry_total": 7,
+    "retry_backoff": 0.5,
+    "proxies": {}
+  },
+
+  "logging": {
+    "level": "INFO",
+    "file": "logs/app.log",
+    "init_file": "logs/init.log",
+    "format": "%(asctime)s [%(levelname)s] %(message)s"
+  },
+
+  "scanner": {
+    "payload_category_default": "basic",
+    "payload_sources": [
+      "manual_json",
+      "category",
+      "resources/payloads.json"
+    ],
+    "save_full_responses": true,
+    "response_dir": "logs/responses",
+    "summary_dir": "logs"
+  },
+
+  "gui": {
+    "theme": "default",
+    "language": "ru",
+    "autosave": true,
+    "show_progress_bar": true
+  },
+
+  "dependencies": {
+    "ngrok_required": false,
+    "check_libraries": [
+      "requests",
+      "tkinter",
+      "urllib3"
+    ]
+  }
+}

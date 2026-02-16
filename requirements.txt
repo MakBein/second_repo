@@ -1,0 +1,10 @@
+fpdf
+requests
+torch
+transformers
+datasets
+scikit-learn
+beautifulsoup4
+requests
+cloudscraper
+graphviz

