@@ -1,55 +1,113 @@
 # xss_security_gui/xss_tab.py
+
 import os
-import tkinter as tk
 import json
-from threat_analysis.xss_module import XSSTester
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+
+from xss_security_gui.settings import settings
+from xss_security_gui.threat_analysis.xss_module import XSSTester
 
 
-class XSSTab(tk.Frame):
-    def __init__(self, parent, url, payload_file=None):
+class XSSTab(ttk.Frame):
+    def __init__(self, parent, url: str, payload_file: str | None = None):
         super().__init__(parent)
+
         self.url = url
-        if payload_file is None:
-            # ищем рядом с самим файлом xss_tab.py
-            self.payload_file = os.path.join(os.path.dirname(__file__), "xss.json")
-        else:
-            self.payload_file = payload_file
+        self.payload_file = payload_file or os.path.join(
+            os.path.dirname(__file__), settings.XSS_PAYLOAD_FILE
+        )
 
-        with open(self.payload_file, "r", encoding="utf-8") as f:
-            self.payloads = json.load(f)
+        self.payloads = self._load_payloads()
+        self._build_ui()
 
-        tk.Label(self, text="Параметр:").pack()
-        self.param_entry = tk.Entry(self)
+    # ---------------------------------------------------------
+    # Payload loader
+    # ---------------------------------------------------------
+    def _load_payloads(self) -> dict:
+        try:
+            with open(self.payload_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            if not isinstance(data, dict):
+                raise ValueError("Файл payload-ів повинен містити JSON-об'єкт з категоріями")
+
+            return data
+
+        except Exception as e:
+            messagebox.showerror("Помилка", f"Не вдалося завантажити XSS payload-и:\n{e}")
+            return {}
+
+    # ---------------------------------------------------------
+    # UI builder
+    # ---------------------------------------------------------
+    def _build_ui(self):
+        top = ttk.Frame(self)
+        top.pack(fill="x", pady=5)
+
+        # URL (read-only)
+        ttk.Label(top, text="Цільовий URL:").grid(row=0, column=0, sticky="w", padx=5)
+        self.url_var = tk.StringVar(value=self.url)
+        ttk.Entry(top, textvariable=self.url_var, width=70, state="readonly").grid(
+            row=0, column=1, columnspan=3, sticky="we", padx=5
+        )
+
+        # Параметр
+        ttk.Label(top, text="Параметр:").grid(row=1, column=0, sticky="w", padx=5)
+        self.param_entry = ttk.Entry(top, width=20)
         self.param_entry.insert(0, "q")
-        self.param_entry.pack()
+        self.param_entry.grid(row=1, column=1, sticky="w", padx=5)
 
-        tk.Label(self, text="Значення:").pack()
-        self.value_entry = tk.Entry(self)
+        # Значення
+        ttk.Label(top, text="Базове значення:").grid(row=1, column=2, sticky="e", padx=5)
+        self.value_entry = ttk.Entry(top, width=20)
         self.value_entry.insert(0, "")
-        self.value_entry.pack()
+        self.value_entry.grid(row=1, column=3, sticky="w", padx=5)
 
-        tk.Label(self, text="Категорія payload-ів:").pack()
+        # Категорія payload-ів
+        ttk.Label(top, text="Категорія payload-ів:").grid(row=2, column=0, sticky="w", padx=5)
         self.category_var = tk.StringVar(self)
+        categories = ["Всі категорії"] + sorted(self.payloads.keys())
         self.category_var.set("Всі категорії")
-        categories = ["Всі категорії"] + list(self.payloads.keys())
-        tk.OptionMenu(self, self.category_var, *categories).pack()
+        self.category_combo = ttk.Combobox(
+            top, textvariable=self.category_var, values=categories, state="readonly"
+        )
+        self.category_combo.grid(row=2, column=1, sticky="w", padx=5)
 
-        tk.Button(self, text="💉 Запустити", command=self.run_tests).pack()
-        tk.Button(self, text="🧹 Очистити вивід", command=lambda: self.output.delete("1.0", "end")).pack()
-        tk.Button(self, text="🗑 Очистити лог артефактів", command=self.clear_artifact_log).pack()
+        # Buttons
+        btn_frame = ttk.Frame(top)
+        btn_frame.grid(row=2, column=2, columnspan=2, sticky="e", padx=5)
 
-        self.output = tk.Text(self, height=20)
-        self.output.pack(fill="both", expand=True)
+        ttk.Button(btn_frame, text="💉 Запустити", command=self.run_tests).pack(side="left", padx=3)
+        ttk.Button(btn_frame, text="🧹 Очистити вивід", command=self.clear_output).pack(side="left", padx=3)
+        ttk.Button(btn_frame, text="📂 Вибрати payload-файл", command=self.choose_payload_file).pack(side="left", padx=3)
+        ttk.Button(btn_frame, text="🗑 Очистити лог артефактів", command=self.clear_artifact_log).pack(side="left", padx=3)
 
+        # Output
+        self.output = tk.Text(self, height=20, wrap="none", bg="black", fg="lime", insertbackground="white")
+        self.output.pack(fill="both", expand=True, padx=5, pady=5)
+
+    # ---------------------------------------------------------
+    # Actions
+    # ---------------------------------------------------------
     def run_tests(self):
-        param = self.param_entry.get()
-        base_value = self.value_entry.get()
+        if not self.payloads:
+            messagebox.showerror("Помилка", "Payload-и не завантажені")
+            return
+
+        param = self.param_entry.get().strip()
+        base_value = self.value_entry.get().strip()
         category = self.category_var.get()
 
+        if not param:
+            self.output.insert("end", "⚠️ Введіть параметр перед запуском\n")
+            return
+
+        # Вибір payload-ів
         if category == "Всі категорії":
             selected_payloads = self.payloads
         else:
-            selected_payloads = {category: self.payloads[category]}
+            selected_payloads = {category: self.payloads.get(category, [])}
 
         tester = XSSTester(
             base_url=self.url,
@@ -60,15 +118,46 @@ class XSSTab(tk.Frame):
         )
         tester.start()
 
-    def display_result(self, result):
-        line = f"[{result['category']}] {result['payload']} → {result['status']} (len={result['response_length']})\n"
+        self.output.insert("end", f"🚀 Запущено XSS-тестування для {self.url} (param={param})\n")
+        self.output.see("end")
+
+    def display_result(self, result: dict):
+        status = result.get("status", "unknown")
+        length = result.get("response_length", 0)
+        category = result.get("category", "?")
+        payload = result.get("payload", "?")
+
+        line = f"[{category}] {payload} → {status} (len={length})\n"
         self.output.insert("end", line)
         self.output.see("end")
 
+    def clear_output(self):
+        self.output.delete("1.0", "end")
+
+    def choose_payload_file(self):
+        path = filedialog.askopenfilename(
+            title="Вибрати файл XSS payload-ів",
+            filetypes=[("JSON файли", "*.json"), ("Всі файли", "*.*")]
+        )
+        if not path:
+            return
+
+        self.payload_file = path
+        self.payloads = self._load_payloads()
+
+        categories = ["Всі категорії"] + sorted(self.payloads.keys())
+        self.category_combo["values"] = categories
+        self.category_var.set("Всі категорії")
+
+        self.output.insert("end", f"✅ Payload-и завантажено з: {path}\n")
+        self.output.see("end")
+
     def clear_artifact_log(self):
+        artifact_path = settings.THREAT_INTEL_ARTIFACT_PATH
         try:
-            with open("threat_intel_artifact.json", "w", encoding="utf-8") as f:
+            with open(artifact_path, "w", encoding="utf-8") as f:
                 json.dump([], f)
-            self.output.insert("end", "✅ Лог артефактів очищено\n")
+            self.output.insert("end", f"✅ Лог артефактів очищено: {artifact_path}\n")
         except Exception as e:
             self.output.insert("end", f"❌ Помилка очищення: {e}\n")
+        self.output.see("end")

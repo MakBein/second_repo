@@ -1,68 +1,28 @@
 {
-  "app_name": "XSS Security GUI",
-  "version": "6.5.0",
-
-  "network": {
-    "default_timeout": 8,
-    "max_rps": 10,
-    "retry_total": 7,
-    "retry_backoff": 0.5,
-    "proxies": {}
-  },
-
-  "logging": {
-    "level": "INFO",
-    "file": "logs/app.log",
-    "init_file": "logs/init.log",
-    "format": "%(asctime)s [%(levelname)s] %(message)s"
-  },
-
-  "scanner": {
-    "payload_category_default": "basic",
-    "payload_sources": [
-      "manual_json",
-      "category",
-      "resources/payloads.json"
-    ],
-    "save_full_responses": true,
-    "response_dir": "logs/responses",
-    "summary_dir": "logs"
-  },
-
   "gui": {
-    "theme": "default",
-    "language": "ru",
-    "autosave": true,
-    "show_progress_bar": true
-  },
-
-  "dependencies": {
-    "ngrok_required": false,
-    "check_libraries": [
-      "requests",
-      "tkinter",
-      "urllib3"
-    ]
+    "max_report_line_length": 110
   },
 
   "honeypot": {
     "enable": true,
-    "poll_interval": 4,
+    "trap_type": "html",
+    "poll_interval": 5,
+    "max_log_size_mb": 50,
     "log_path": "logs/honeypot.log",
     "hits_log_path": "logs/honeypot_hits.log"
   },
 
   "http": {
-    "request_timeout": 7,
-    "default_user_agent": "XSS-Security-GUI/6.5"
+    "request_timeout": 5,
+    "default_user_agent": "Mozilla/5.0 (Pentest-Mode)"
   },
 
   "idor": {
-    "delay": 0.5
+    "delay": 0.3
   },
 
   "lfi": {
-    "delay": 0.5,
+    "delay": 0.3,
     "payloads": [
       "../../etc/passwd",
       "../../../etc/passwd",
@@ -114,10 +74,6 @@
   "threat": {
     "artifact_path": "logs/threat_intel_artifact.json",
     "log_path": "logs/threat_intel.log",
-    "max_size_mb": 20
-  },
-
-  "export": {
-    "max_line_length": 110
+    "max_size_mb": 50
   }
 }

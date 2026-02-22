@@ -2,7 +2,7 @@ import json
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-SETTINGS_FILE = "settings.json"
+SETTINGS_FILE = "configs/settings.json"
 
 def load_settings():
     try:

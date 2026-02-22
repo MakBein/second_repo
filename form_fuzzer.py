@@ -1,5 +1,3 @@
-# xss_security_gui/form_fuzzer.py
-
 import os
 import logging
 from datetime import datetime
@@ -13,7 +11,6 @@ from xss_security_gui.xss_detector import XSSDetector
 from xss_security_gui.utils.core_utils import normalize_url
 from xss_security_gui.http_headers import build_aggressive_headers
 
-
 logger = logging.getLogger(__name__)
 
 # Константы
@@ -23,7 +20,19 @@ SNIPPET_MAX_LENGTH = 300
 SNIPPET_CONTEXT_WINDOW = 40
 MAX_RESPONSE_SIZE = 10000
 
-# Агрессивные payload'ы для дополнительного тестирования
+# Разрешённые HTTP-методы
+ALLOWED_METHODS = {
+    "GET",
+    "POST",
+    "PUT",
+    "DELETE",
+    "PATCH",
+    "HEAD",
+    "OPTIONS",
+    "TRACE",
+}
+
+# Агрессивные payload'ы
 AGGRESSIVE_PAYLOADS = [
     "<img src=x onerror=alert(1)>",
     "<svg/onload=alert(1)>",
@@ -34,12 +43,11 @@ AGGRESSIVE_PAYLOADS = [
     "<details open ontoggle=alert(1)>",
     "<marquee onstart=alert(1)>",
     "<object data=javascript:alert(1)>",
-    "<embed src=javascript:alert(1)>"
+    "<embed src=javascript:alert(1)>",
 ]
 
 
-# ✅ Чтение базовых пейлоадов из файла, если он есть
-def load_payloads(path="payloads/xss.txt"):
+def load_payloads(path: str = "payloads/xss.txt") -> List[str]:
     default = ["<script>alert(1)</script>"]
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
@@ -47,11 +55,10 @@ def load_payloads(path="payloads/xss.txt"):
     return default
 
 
-def report_threatintel(data: Dict[str, Any], gui_callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> None:
-    """
-    Безопасная передача отчёта в Threat Intel.
-    Передаём только метаданные: url, метод, payload, статус, категория, сниппет.
-    """
+def report_threatintel(
+    data: Dict[str, Any],
+    gui_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> None:
     if not gui_callback:
         return
 
@@ -70,7 +77,6 @@ def report_threatintel(data: Dict[str, Any], gui_callback: Optional[Callable[[Di
 
 
 def create_aggressive_headers(payload: str) -> Dict[str, str]:
-    """Создаёт агрессивные заголовки с payload'ами для тестирования"""
     return {
         "User-Agent": payload,
         "Referer": payload,
@@ -91,8 +97,9 @@ def create_aggressive_headers(payload: str) -> Dict[str, str]:
         "X-Test": payload,
         "Authorization": f"Bearer {payload}",
         "Cookie": f"session={payload}; token={payload}",
-        "X-XSS-Vector": payload
+        "X-XSS-Vector": payload,
     }
+
 
 def _truncate_response(text: str) -> str:
     if len(text) <= MAX_RESPONSE_SIZE:
@@ -120,6 +127,47 @@ def _build_error_result(
         "snippet": "",
     }
 
+
+def _send_request(
+    url: str,
+    method: str,
+    data: Dict[str, Any],
+    headers: Dict[str, str],
+    timeout: float,
+) -> requests.Response:
+    """
+    Универсальная отправка HTTP-запроса для любого метода.
+    Для методов без тела (HEAD, OPTIONS, TRACE) данные передаются как params.
+    """
+    method_upper = method.upper()
+
+    if method_upper not in ALLOWED_METHODS:
+        raise ValueError(f"HTTP метод {method_upper} не поддерживается")
+
+    # Методы, которые обычно используют тело запроса
+    methods_with_body = {"POST", "PUT", "PATCH", "DELETE"}
+
+    if method_upper in methods_with_body:
+        return requests.request(
+            method=method_upper,
+            url=url,
+            data=data,
+            headers=headers,
+            timeout=timeout,
+            allow_redirects=True,
+        )
+    else:
+        # GET, HEAD, OPTIONS, TRACE — параметры в query string
+        return requests.request(
+            method=method_upper,
+            url=url,
+            params=data,
+            headers=headers,
+            timeout=timeout,
+            allow_redirects=True,
+        )
+
+
 def fuzz_payload(
     action_url: str,
     method: str,
@@ -128,7 +176,6 @@ def fuzz_payload(
     gui_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> Dict[str, Any]:
-
     if not inputs:
         logger.warning(f"[FormFuzz] Пустой список inputs для {action_url}")
         result = _build_error_result(
@@ -142,16 +189,13 @@ def fuzz_payload(
         report_threatintel(result, gui_callback)
         return result
 
-    # ----------------------------
-    # Подготовка данных
-    # ----------------------------
-    data = {key: payload for key in inputs}
-    headers = build_aggressive_headers(payload)
     method_upper = method.upper()
 
-    # ----------------------------
+    # Подготовка данных
+    data = {key: payload for key in inputs}
+    headers = build_aggressive_headers(payload)
+
     # Нормализация URL
-    # ----------------------------
     try:
         normalized_url = normalize_url(action_url)
     except Exception as e:
@@ -166,32 +210,21 @@ def fuzz_payload(
         report_threatintel(result, gui_callback)
         return result
 
-    # ----------------------------
     # Отправка запроса
-    # ----------------------------
     try:
-        if method_upper == "POST":
-            r = requests.post(
-                normalized_url,
-                data=data,
-                headers=headers,
-                timeout=timeout,
-                allow_redirects=True,
-            )
-        else:
-            r = requests.get(
-                normalized_url,
-                params=data,
-                headers=headers,
-                timeout=timeout,
-                allow_redirects=True,
-            )
+        r = _send_request(
+            url=normalized_url,
+            method=method_upper,
+            data=data,
+            headers=headers,
+            timeout=timeout,
+        )
 
         status = r.status_code
         response_text = _truncate_response(r.text)
         reflected = payload in response_text
 
-        result = {
+        result: Dict[str, Any] = {
             "url": normalized_url,
             "method": method_upper,
             "inputs": inputs,
@@ -201,11 +234,9 @@ def fuzz_payload(
             "category": None,
             "snippet": "",
             "response": response_text,
+            "error": None,
         }
 
-        # ----------------------------
-        # Анализ отражения
-        # ----------------------------
         if reflected:
             detector = XSSDetector()
             ctx = detector.detect_xss_context(response_text, payload)
@@ -224,7 +255,6 @@ def fuzz_payload(
             result["category"] = category
             result["snippet"] = snippet.strip()[:SNIPPET_MAX_LENGTH]
 
-            # Логирование
             os.makedirs("logs", exist_ok=True)
             with open("logs/form_fuzz_hits.log", "a", encoding="utf-8") as f:
                 f.write(f"[{datetime.now()}] {category} XSS in {method_upper} → {normalized_url}\n")
@@ -232,16 +262,12 @@ def fuzz_payload(
                 f.write(f"Snippet: {result['snippet']}\n\n")
 
             logger.warning(f"[Fuzz] {method_upper} {normalized_url} → ⚠️ {category} XSS [{status}]")
-
         else:
             logger.debug(f"[Fuzz] {method_upper} {normalized_url} → ✓ [{status}]")
 
         report_threatintel(result, gui_callback)
         return result
 
-    # ----------------------------
-    # Обработка ошибок
-    # ----------------------------
     except requests.Timeout as e:
         result = _build_error_result(
             url=action_url,
@@ -287,49 +313,28 @@ def fuzz_form(
     max_workers: int = DEFAULT_MAX_WORKERS,
     gui_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     timeout: float = DEFAULT_TIMEOUT,
-    allowlist: Optional[List[str]] = None
+    allowlist: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Запуск многопоточного фуззинга формы.
-
-    Args:
-        action_url: URL формы для тестирования
-        method: HTTP метод (GET/POST)
-        inputs: Список имён полей формы
-        base_payloads: Базовые payload'ы (если None, загружаются из файла)
-        max_workers: Максимальное количество потоков
-        gui_callback: Опциональный callback для GUI
-        timeout: Таймаут запросов в секундах
-        allowlist: Список разрешённых префиксов URL (если None, проверка пропускается)
-
-    Returns:
-        Список результатов тестирования
-
-    Raises:
-        ValueError: Если URL не в allowlist или inputs пустой
-    """
-    # Валидация входных данных
     if not inputs:
         raise ValueError("inputs не может быть пустым")
 
     if not action_url:
         raise ValueError("action_url не может быть пустым")
 
-    # Проверка allowlist
-    if allowlist:
-        if not any(action_url.startswith(prefix) for prefix in allowlist):
-            raise ValueError(f"URL {action_url} не находится в allowlist")
+    method_upper = method.upper()
+    if method_upper not in ALLOWED_METHODS:
+        raise ValueError(f"HTTP метод {method_upper} не поддерживается")
 
-    # Нормализация URL
+    if allowlist and not any(action_url.startswith(prefix) for prefix in allowlist):
+        raise ValueError(f"URL {action_url} не находится в allowlist")
+
     action_url = normalize_url(action_url)
 
     base_payloads = base_payloads or load_payloads()
-    results = []
+    results: List[Dict[str, Any]] = []
 
-    # Расширяем мутации и добавляем агрессивные варианты
-    # Используем list для сохранения порядка, но убираем дубликаты
-    mutated_variants = []
-    seen = set()
+    mutated_variants: List[str] = []
+    seen: set[str] = set()
 
     for base in base_payloads:
         for variant in mutate_payload(base):
@@ -337,36 +342,45 @@ def fuzz_form(
                 seen.add(variant)
                 mutated_variants.append(variant)
 
-        # Добавляем агрессивные payload'ы
-        for agg_payload in AGGRESSIVE_PAYLOADS:
-            if agg_payload not in seen:
-                seen.add(agg_payload)
-                mutated_variants.append(agg_payload)
+    for agg_payload in AGGRESSIVE_PAYLOADS:
+        if agg_payload not in seen:
+            seen.add(agg_payload)
+            mutated_variants.append(agg_payload)
 
-    logger.info(f"[FormFuzz] Запуск фуззинга {action_url} с {len(mutated_variants)} payload'ами")
+    logger.info(f"[FormFuzz] Запуск фуззинга {action_url} с {len(mutated_variants)} payload'ами ({method_upper})")
 
-    # Многопоточный запуск с обработкой исключений
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
-            executor.submit(fuzz_payload, action_url, method, inputs, p, gui_callback, timeout)
+            executor.submit(
+                fuzz_payload,
+                action_url,
+                method_upper,
+                inputs,
+                p,
+                gui_callback,
+                timeout,
+            )
             for p in mutated_variants
         ]
+
         for future in as_completed(futures):
             try:
                 results.append(future.result())
             except Exception as e:
                 logger.error(f"[FormFuzz] Ошибка в потоке: {e}")
-                results.append({
-                    "url": action_url,
-                    "method": method,
-                    "inputs": inputs,
-                    "payload": "unknown",
-                    "status": None,
-                    "vulnerable": False,
-                    "error": f"ThreadError: {str(e)}",
-                    "category": "Error",
-                    "snippet": ""
-                })
+                results.append(
+                    {
+                        "url": action_url,
+                        "method": method_upper,
+                        "inputs": inputs,
+                        "payload": "unknown",
+                        "status": None,
+                        "vulnerable": False,
+                        "error": f"ThreadError: {str(e)}",
+                        "category": "Error",
+                        "snippet": "",
+                    }
+                )
 
-    logger.info(f"[FormFuzz] Фуззинг завершён: {len(results)} результатов")
+    logger.info(f"[FormFuzz] Фуззинг завершён: {len(results)} результатов для {method_upper} {action_url}")
     return results

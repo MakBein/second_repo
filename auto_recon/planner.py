@@ -1,33 +1,54 @@
 # xss_security_gui/auto_recon/planner.py
 
-import requests
-import time
+"""
+AttackPlanner — синхронный и параллельный планировщики атак.
+Поддержка:
+• GET/POST запросов
+• NDJSON логирования
+• ThreatConnector интеграции
+• Параллельного выполнения (threading)
+"""
+
 import json
 import os
+import time
 import threading
 from queue import Queue
 from typing import List, Dict, Any, Optional
+
+import requests
 
 from xss_security_gui.threat_analysis.threat_connector import ThreatConnector
 from xss_security_gui import DIRS
 
 
-# ---------------------------------------------------------
-# Базовый планировщик (синхронный)
-# ---------------------------------------------------------
+# ============================================================
+#  Синхронный планировщик
+# ============================================================
+
 class AttackPlanner:
     """
     Синхронный планировщик атак.
+    Выполняет запросы последовательно.
     """
 
-    def __init__(self, payloads, headers=None, delay=0.1, timeout=5):
+    def __init__(
+        self,
+        payloads: List[Dict[str, Any]],
+        headers: Optional[Dict[str, str]] = None,
+        delay: float = 0.1,
+        timeout: int = 5,
+    ):
         self.payloads = payloads
         self.headers = headers or {"User-Agent": "AutoReconAgent"}
         self.delay = delay
         self.timeout = timeout
-        self.responses = []
+        self.responses: List[Dict[str, Any]] = []
 
-    def execute(self):
+    # --------------------------------------------------------
+
+    def execute(self) -> List[Dict[str, Any]]:
+        """Последовательно выполняет все запросы."""
         for item in self.payloads:
             time.sleep(self.delay)
 
@@ -49,7 +70,7 @@ class AttackPlanner:
                     "status": r.status_code,
                     "text": r.text,
                     "headers": dict(r.headers),
-                    "source": item.get("source", "")
+                    "source": item.get("source", ""),
                 })
 
             except Exception as e:
@@ -58,21 +79,23 @@ class AttackPlanner:
                     "method": method,
                     "status": "ERR",
                     "error": str(e),
-                    "source": item.get("source", "")
+                    "source": item.get("source", ""),
                 })
 
         return self.responses
 
 
-# ---------------------------------------------------------
-# AttackPlannerV2 — параллельный, с NDJSON и ThreatConnector
-# ---------------------------------------------------------
+# ============================================================
+#  Параллельный планировщик (AttackPlannerV2)
+# ============================================================
+
 class AttackPlannerV2:
     """
-    AttackPlannerV2
-    ----------------
+    AttackPlannerV2 — параллельный планировщик атак.
+
+    Возможности:
     • Параллельное выполнение запросов (threading)
-    • Логирование результатов в NDJSON
+    • NDJSON логирование
     • Интеграция с ThreatConnector
     """
 
@@ -95,13 +118,14 @@ class AttackPlannerV2:
         os.makedirs(logs_dir, exist_ok=True)
         self.ndjson_path = os.path.join(logs_dir, ndjson_log)
 
-        self._queue: "Queue[Dict[str, Any]]" = Queue()
+        self._queue: Queue[Dict[str, Any]] = Queue()
         self._results: List[Dict[str, Any]] = []
         self._lock = threading.Lock()
 
-    # -----------------------------
+    # --------------------------------------------------------
     # Внутренний метод: выполнение одного запроса
-    # -----------------------------
+    # --------------------------------------------------------
+
     def _do_request(self, item: Dict[str, Any]) -> Dict[str, Any]:
         method = item.get("method", "GET").upper()
         url = item.get("url")
@@ -135,9 +159,10 @@ class AttackPlannerV2:
                 "ts": time.time(),
             }
 
-    # -----------------------------
-    # Внутренний метод: worker-поток
-    # -----------------------------
+    # --------------------------------------------------------
+    # Worker-поток
+    # --------------------------------------------------------
+
     def _worker(self):
         while True:
             try:
@@ -147,22 +172,20 @@ class AttackPlannerV2:
 
             result = self._do_request(item)
 
-            # Локально сохраняем результат
             with self._lock:
                 self._results.append(result)
 
-            # Логируем в NDJSON
             self._append_ndjson(result)
 
-            # Отправляем в ThreatConnector (если есть)
             if self.threat_connector:
                 self._push_to_threat_connector(result)
 
             self._queue.task_done()
 
-    # -----------------------------
-    # Логирование в NDJSON
-    # -----------------------------
+    # --------------------------------------------------------
+    # NDJSON логирование
+    # --------------------------------------------------------
+
     def _append_ndjson(self, entry: Dict[str, Any]):
         try:
             with open(self.ndjson_path, "a", encoding="utf-8") as f:
@@ -170,15 +193,16 @@ class AttackPlannerV2:
         except Exception as e:
             print(f"[AttackPlannerV2] Ошибка записи NDJSON: {e}")
 
-    # -----------------------------
-    # Интеграция с ThreatConnector
-    # -----------------------------
+    # --------------------------------------------------------
+    # ThreatConnector интеграция
+    # --------------------------------------------------------
+
     def _push_to_threat_connector(self, result: Dict[str, Any]):
         """
-        Простейшая интеграция:
-        • Если статус ERR — артефакт ERROR
-        • Если статус 500+ — артефакт SERVER_ERROR
-        • Если найдено слово 'error' в тексте — артефакт SUSPICIOUS
+        Простая логика:
+        • ERR → ERROR
+        • 500+ → SERVER_ERROR
+        • 'error' в тексте → SUSPICIOUS_TEXT
         """
         if not self.threat_connector:
             return
@@ -186,6 +210,7 @@ class AttackPlannerV2:
         url = result.get("url", "")
         status = result.get("status")
         text = result.get("text", "") or ""
+
         artifacts = []
 
         if status == "ERR":
@@ -198,34 +223,35 @@ class AttackPlannerV2:
         if artifacts:
             self.threat_connector.add_artifact("ATTACK", url, artifacts)
 
-    # -----------------------------
+    # --------------------------------------------------------
     # Публичный метод: запуск
-    # -----------------------------
+    # --------------------------------------------------------
+
     def execute(self) -> List[Dict[str, Any]]:
-        # Заполняем очередь
+        """Запускает параллельное выполнение запросов."""
         for item in self.payloads:
             self._queue.put(item)
 
-        # Стартуем воркеры
         threads = []
         for _ in range(self.max_workers):
             t = threading.Thread(target=self._worker, daemon=True)
             t.start()
             threads.append(t)
 
-        # Ждём завершения
         self._queue.join()
 
         return self._results
 
 
-# ---------------------------------------------------------
-# Генерация и сохранение плана атаки
-# ---------------------------------------------------------
-def build_attack_plan(endpoints: List[Dict[str, Any]], payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Создаёт план атаки на основе endpoints и payloads.
-    """
+# ============================================================
+#  Генерация и сохранение плана атаки
+# ============================================================
+
+def build_attack_plan(
+    endpoints: List[Dict[str, Any]],
+    payloads: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Создаёт план атаки на основе endpoints и payloads."""
     return {
         "endpoints": endpoints,
         "payloads": payloads,
@@ -237,9 +263,7 @@ def build_attack_plan(endpoints: List[Dict[str, Any]], payloads: List[Dict[str, 
 
 
 def save_attack_plan(plan: Dict[str, Any], path: str = "attack_plan.json") -> bool:
-    """
-    Сохраняет план атаки в JSON.
-    """
+    """Сохраняет план атаки в JSON."""
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(plan, f, indent=2, ensure_ascii=False)
@@ -247,3 +271,15 @@ def save_attack_plan(plan: Dict[str, Any], path: str = "attack_plan.json") -> bo
     except Exception as e:
         print(f"[AttackPlanner] Ошибка сохранения плана: {e}")
         return False
+
+
+# ============================================================
+#  Публичный API
+# ============================================================
+
+__all__ = [
+    "AttackPlanner",
+    "AttackPlannerV2",
+    "build_attack_plan",
+    "save_attack_plan",
+]

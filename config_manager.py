@@ -8,6 +8,7 @@ import os
 import json
 from pathlib import Path
 from dotenv import load_dotenv
+from xss_security_gui.settings import LOG_DIR
 
 
 # ================================
@@ -30,11 +31,12 @@ for d in (LOGS_DIR, CONFIGS_DIR, PAYLOADS_DIR, EXPORTS_DIR):
 # 📄 ПУТИ К ФАЙЛАМ
 # ================================
 
-SETTINGS_JSON_PATH = BASE_DIR / "settings.json"
+SETTINGS_JSON_PATH = CONFIGS_DIR / "settings.json"
 DEFAULT_CONFIG_PATH = CONFIGS_DIR / "default_config.json"
 USER_CONFIG_PATH = CONFIGS_DIR / "user_config.json"
 
-CRAWLER_RESULTS_PATH = LOGS_DIR / "crawler_results.json"
+CRAWLER_RESULTS_PATH = LOG_DIR / "crawler_results.json"
+DEEP_CRAWL_JSON_PATH = LOG_DIR / "deep_crawl.json"
 CRAWLER_STRUCTURE_PATH = LOGS_DIR / "crawler_structure.log"
 CRAWLER_GRAPH_DOT_PATH = LOGS_DIR / "crawl_graph.dot"
 CRAWLER_GRAPH_SVG_PATH = LOGS_DIR / "crawl_graph"  # Graphviz добавит .svg
@@ -51,6 +53,10 @@ JSON_EXPORT_PATH = EXPORTS_DIR / "json"
 
 PDF_EXPORT_PATH.mkdir(parents=True, exist_ok=True)
 JSON_EXPORT_PATH.mkdir(parents=True, exist_ok=True)
+# === Новые алиасы для OverviewTab и других модулей ===
+THREAT_LOG_PATH = LOGS_DIR / "threat_intel.log"
+LOG_HONEYPOT_HITS = LOGS_DIR / "honeypot_hits.log"
+PARAM_FUZZ_LOG_PATH = LOGS_DIR / "form_fuzz_hits.log"
 
 
 # ================================

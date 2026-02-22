@@ -19,8 +19,8 @@ from pathlib import Path
 from datetime import datetime
 import re
 
-from deep_crawler import deep_crawl
-from utils.threat_sender import ThreatSenderMixin
+from xss_security_gui.deep_crawler import deep_crawl
+from xss_security_gui.utils.threat_sender import ThreatSenderMixin
 
 
 class GraphView(tk.Frame):

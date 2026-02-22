@@ -1,55 +1,26 @@
 {
-  "app_name": "XSS Security GUI",
-  "version": "6.5.0",
-
-  "network": {
-    "default_timeout": 8,
-    "max_rps": 10,
-    "retry_total": 7,
-    "retry_backoff": 0.5,
-    "proxies": {}
-  },
-
-  "logging": {
-    "level": "INFO",
-    "file": "logs/app.log",
-    "init_file": "logs/init.log",
-    "format": "%(asctime)s [%(levelname)s] %(message)s"
-  },
-
-  "scanner": {
-    "payload_category_default": "basic",
-    "payload_sources": [
-      "manual_json",
-      "category",
-      "resources/payloads.json"
-    ],
-    "save_full_responses": true,
-    "response_dir": "logs/responses",
-    "summary_dir": "logs"
-  },
-
   "gui": {
-    "theme": "default",
-    "language": "ru",
-    "autosave": true,
-    "show_progress_bar": true
-  },
-
-  "dependencies": {
-    "ngrok_required": false,
-    "check_libraries": [
-      "requests",
-      "tkinter",
-      "urllib3"
-    ]
+    "max_report_line_length": 110
   },
 
   "honeypot": {
     "enable": true,
+    "trap_type": "html",
     "poll_interval": 4,
-    "log_path": "logs/honeypot.log",
-    "hits_log_path": "logs/honeypot_hits.log"
+    "max_log_size_mb": 10,
+    "log_path": "LOG_DIR/honeypot.log",
+    "hits_log_path": "LOG_DIR/honeypot_hits.log"
+  },
+
+  "fuzzer": {
+    "param_fuzz_log_path": "LOG_DIR/param_fuzz_hits.log"
+  },
+
+  "logging": {
+    "success_path": "LOG_DIR/success.log",
+    "enable_cloudflare_bypass": true,
+    "enable_js_rendering": true,
+    "enable_browser_emulation": true
   },
 
   "http": {
@@ -106,18 +77,15 @@
   },
 
   "payloads": {
-    "sqli_file": "payloads/sqli.json",
-    "xss_file": "payloads/xss.json",
-    "ssrf_file": "payloads/ssrf.json"
+    "sqli_file": "PAYLOADS_DIR/sqli.json",
+    "xss_file": "PAYLOADS_DIR/xss.json",
+    "csrf_file": "PAYLOADS_DIR/csrf.json",
+    "ssrf_file": "PAYLOADS_DIR/ssrf.json"
   },
 
   "threat": {
-    "artifact_path": "logs/threat_intel_artifact.json",
-    "log_path": "logs/threat_intel.log",
+    "artifact_path": "LOG_DIR/threat_intel_artifact.json",
+    "log_path": "LOG_DIR/threat_intel.log",
     "max_size_mb": 20
-  },
-
-  "export": {
-    "max_line_length": 110
   }
 }

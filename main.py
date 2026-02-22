@@ -1,14 +1,7 @@
 # xss_security_gui/main.py
+
 # ============================================================
-#  XSS Security Suite — main.py 5.0 (Ultimate Edition)
-#  Полностью переписанная версия с поддержкой:
-#  • Tkinter GUI
-#  • PyQt AttackGUI
-#  • Deep Crawler 5.0
-#  • Threat Intel
-#  • AutoRecon
-#  • Honeypot ULTRA
-#  • ULTRA Hybrid Settings
+#  XSS Security Suite — 5.0 (Ultimate Edition)
 # ============================================================
 
 import os
@@ -19,8 +12,9 @@ import datetime
 import json
 import tkinter as tk
 from tkinter import ttk
-from PyQt5.QtWidgets import QApplication
-
+from xss_security_gui.config import PRIMARY_SETTINGS
+from XSStrike.core.fuzzer import fuzzer
+from XSStrike.core.config import xsschecker
 # ============================================================
 #  Централизованная конфигурация (ULTRA Hybrid)
 # ============================================================
@@ -28,13 +22,13 @@ from xss_security_gui.settings import (
     settings,
     BASE_DIR,
     LOG_DIR,
-    JSON_CRAWL_EXPORT_PATH,
+    crawler_results_path,   # snake_case функция
     LOG_SUCCESS_PATH,
-    ENABLE_AUTO_TRAPS,
+    ENABLE_AUTO_TRAPS, PAYLOADS_DIR,
 )
 
 GUI_STATE_FILE = LOG_DIR / "gui_state.json"
-CRAWLER_RESULTS_PATH = JSON_CRAWL_EXPORT_PATH
+CRAWLER_RESULTS_PATH = crawler_results_path()
 
 # ============================================================
 #  Загрузка результатов предыдущего краулинга
@@ -45,18 +39,19 @@ else:
     print(f"⚠️ crawler_results.json не найден: {CRAWLER_RESULTS_PATH}")
     crawler_results = {}
 
+
 # ============================================================
 #  Импорты функциональных модулей
 # ============================================================
-from xss_security_gui.crawler import crawl_site, save_outputs, build_final_dict, nodes_json
-from xss_security_gui.js_inspector import extract_js_insights
+from xss_security_gui.crawler import save_outputs, build_final_dict
 from xss_security_gui.analyzer import XSSAnalyzerApp
 from xss_security_gui.honeypot_monitor import monitor_log_thread
 from xss_security_gui.honeypot_server import start_honeypot_server
 from xss_security_gui.xss_detector import XSSDetector
 from xss_security_gui.env_check import run_env_check
 from xss_security_gui.visualizer import render_dot_to_svg
-from xss_security_gui.payload_mutator import mutate_async
+from xss_security_gui.threat_analysis.threat_connector import THREAT_CONNECTOR
+from xss_security_gui.js_inspector import analyze_js_file
 from xss_security_gui.utils.disable_ssl_warnings import disable_ssl_warnings
 disable_ssl_warnings()
 
@@ -86,6 +81,9 @@ from xss_security_gui.xss_tab import XSSTab
 from xss_security_gui.sqli_tab import SQLiTab
 from xss_security_gui.csrf_tab import CSRFTab
 from xss_security_gui.ssrf_tab import SSRFTab
+from xss_security_gui.gui.environment_tab import EnvironmentTab
+from xss_security_gui.gui.security_dashboard_panel import SecurityDashboardPanel
+
 
 # ============================================================
 #  AutoRecon
@@ -93,7 +91,6 @@ from xss_security_gui.ssrf_tab import SSRFTab
 from xss_security_gui.auto_recon.scanner import EndpointScanner
 from xss_security_gui.auto_recon.payloads import PayloadGenerator
 from xss_security_gui.auto_recon.planner import AttackPlanner
-from xss_security_gui.auto_recon.analyzer import ThreatConnector
 from xss_security_gui.threat_tab_connector import ThreatIntelConnector
 
 # ============================================================
@@ -111,16 +108,6 @@ from xss_security_gui.gui.attack_gui import AttackGUI
 # ============================================================
 from xss_security_gui.deep_crawler import (
     deep_crawl_site,
-    detect_login_url,
-    detect_logout_url,
-    detect_backend_framework,
-    detect_server,
-    extract_opengraph,
-    extract_json_ld,
-    extract_meta_tags,
-    calculate_page_risk,
-    save_session,
-    load_session,
 )
 
 
@@ -148,6 +135,11 @@ class XSSSecurityGUI(tk.Tk):
 
         # Построение интерфейса
         self.build_tabs()
+
+        # Security Dashboard
+        dashboard_panel = SecurityDashboardPanel(self.tab_control)
+        self.tab_control.add(dashboard_panel, text="🛡️ Security Dashboard")
+
         self.add_url_entry()
         self.load_dynamic_tabs()
 
@@ -256,6 +248,11 @@ class XSSSecurityGUI(tk.Tk):
         settings_tab.pack(fill="both", expand=True)
         self.tab_control.add(settings_tab, text="⚙️ Настройки")
 
+        # Environment Viewer (ULTRA 6.5)
+        env_tab = EnvironmentTab(self.tab_control, env_path=BASE_DIR / ".env")
+        env_tab.pack(fill="both", expand=True)
+        self.tab_control.add(env_tab, text="🌍 Environment")
+
         # AutoRecon Dashboard
         dashboard_tab = AutoReconDashboardTab(self.tab_control)
         dashboard_tab.pack(fill="both", expand=True)
@@ -301,8 +298,8 @@ class XSSSecurityGUI(tk.Tk):
         btn.pack()
 
     def run_mutator(self):
-        threading.Thread(target=lambda: mutate_async(), daemon=True).start()
-        self.log("🧬 Mutator запущен…")
+        # просто делегируем в analyzer
+        self.analyzer.run_mutator()
 
 
     # ============================================================
@@ -335,9 +332,7 @@ class XSSSecurityGUI(tk.Tk):
         )
         btn.pack(side="left", padx=5)
 
-    # ============================================================
-    #  Кнопка Attack GUI (PyQt)
-    # ============================================================
+
     def add_attack_gui_button(self):
         btn = ttk.Button(
             self.url_frame,
@@ -347,18 +342,22 @@ class XSSSecurityGUI(tk.Tk):
         btn.pack(side="left", padx=5)
 
     def launch_attack_gui(self):
+        """Запускает AttackGUI для указанного URL в отдельном окне Tkinter."""
         url = self.url_var.get().strip()
         if not url:
             self.log("⚠️ Введіть цільовий URL перед запуском Attack GUI.")
             return
 
-        def _run_qt():
-            app = QApplication(sys.argv)
-            gui = AttackGUI(target_url=url)
-            gui.show()
-            app.exec_()
+        self.log(f"[🎛️] Запуск AttackGUI для: {url}")
 
-        threading.Thread(target=_run_qt, daemon=True).start()
+        # создаём отдельное окно под AttackGUI
+        win = tk.Toplevel(self)
+        win.title(f"AttackGUI — {url}")
+
+        # ВАЖЛИВО: AttackGUI — это tk.Frame и ожидает parent первым аргументом
+        attack_frame = AttackGUI(win, domain=url)
+        attack_frame.pack(fill="both", expand=True)
+
 
     # ============================================================
     #  Динамическая загрузка вкладок (XSS/SQLi/CSRF/SSRF)
@@ -371,29 +370,29 @@ class XSSSecurityGUI(tk.Tk):
 
         existing = [self.tab_control.tab(i, "text") for i in range(self.tab_control.index("end"))]
 
-        xss_payload_path = BASE_DIR / "xss.json"
-        sqli_payload_path = BASE_DIR / "sqli.json"
-        csrf_payload_path = BASE_DIR / "csrf.json"
-        ssrf_payload_path = BASE_DIR / "ssrf.json"
+        xss_payload_path = PAYLOADS_DIR / "xss.json"
+        sqli_payload_path = PAYLOADS_DIR / "sqli.json"
+        csrf_payload_path = PAYLOADS_DIR / "csrf.json"
+        ssrf_payload_path = PAYLOADS_DIR / "ssrf.json"
 
         if "🛡️ SQLi" not in existing:
             self.tab_control.add(
-                SQLiTab(self.tab_control, url, payload_file=sqli_payload_path),
+                SQLiTab(self.tab_control, url, payload_file=str(sqli_payload_path)),
                 text="🛡️ SQLi",
             )
         if "🛡️ XSS" not in existing:
             self.tab_control.add(
-                XSSTab(self.tab_control, url, payload_file=xss_payload_path),
+                XSSTab(self.tab_control, url, payload_file=str(xss_payload_path)),
                 text="🛡️ XSS",
             )
         if "🛡️ CSRF" not in existing:
             self.tab_control.add(
-                CSRFTab(self.tab_control, url, payload_file=csrf_payload_path),
+                CSRFTab(self.tab_control, url, payload_file=str(csrf_payload_path)),
                 text="🛡️ CSRF",
             )
         if "🛡️ SSRF" not in existing:
             self.tab_control.add(
-                SSRFTab(self.tab_control, url, payload_file=ssrf_payload_path),
+                SSRFTab(self.tab_control, url, payload_file=str(ssrf_payload_path)),
                 text="🛡️ SSRF",
             )
 
@@ -404,7 +403,7 @@ class XSSSecurityGUI(tk.Tk):
 
         def callback(success, message):
             # Обновляем GUI через after()
-            self.after(0, lambda: self._on_graph_render_done(success, message))
+            self.after(0, self._on_graph_render_done, success, message)
 
         from xss_security_gui.visualizer import render_dot_to_svg
         render_dot_to_svg(dot_path, svg_path, callback=callback)
@@ -570,10 +569,11 @@ class XSSSecurityGUI(tk.Tk):
 #  Проверка зависимостей
 # ============================================================
 def check_dependencies():
-    settings_json = BASE_DIR / "settings.json"
-    if not settings_json.exists():
-        print(f"[⚠️] settings.json не найден: {settings_json}")
+    # Проверяем settings.json
+    if not PRIMARY_SETTINGS.exists():
+        print(f"[⚠️] settings.json не найден: {PRIMARY_SETTINGS}")
 
+    # Проверяем ngrok
     if not shutil.which("ngrok"):
         print("[⚠️] Ngrok не найден. Туннель будет недоступен.")
 
@@ -585,13 +585,13 @@ def show_usage():
     print(
         """
 🔧 Использование:
-  python main.py gui                 # Запуск графического интерфейса (PyQt)
-  python main.py tk                  # Запуск Tkinter GUI
-  python main.py crawl <url>         # Краулинг сайта
-  python main.py js <path.js>        # Анализ JS-файла
-  python main.py recon <url>         # Автоматическая разведка
-  python main.py --version           # Показать версию
-  python main.py --help              # Показать справку
+  python -m xss_security_gui.main gui [domain]   # Запуск AttackGUI (Tkinter)
+  python -m xss_security_gui.main tk             # Запуск XSSSecurityGUI
+  python -m xss_security_gui.main crawl <url>    # Краулинг сайта
+  python -m xss_security_gui.main js <path.js>   # Анализ JS-файла
+  python -m xss_security_gui.main recon <url>    # Авторазведка
+  python -m xss_security_gui.main --version      # Показать версию
+  python -m xss_security_gui.main --help         # Показать справку
 """
     )
 
@@ -601,121 +601,142 @@ def show_usage():
 # ============================================================
 if __name__ == "__main__":
     check_dependencies()
+
     args = sys.argv
     cmd = args[1].lower() if len(args) > 1 else "gui"
 
-    # Honeypot всегда запускается в отдельном потоке
+    # Honeypot всегда запускается
     try:
         threading.Thread(target=start_honeypot_server, daemon=True).start()
     except Exception as e:
         print(f"[⚠️] Honeypot не запущен: {e}")
 
-    # --------------------------------------------------------
-    # GUI режимы
-    # --------------------------------------------------------
+    # ========================================================
+    # AttackGUI (Tkinter)
+    # ========================================================
     if cmd == "gui":
         print(f"[🛡️ AttackGUI] Запуск: {datetime.datetime.now().isoformat()}")
-        app = QApplication(sys.argv)
-        gui = AttackGUI(domain="https://gazprombank.ru")
-        gui.show()
-        sys.exit(app.exec_())
 
+        domain = args[2] if len(args) >= 3 else "https://gazprombank.ru"
+
+        root = tk.Tk()
+        root.title("AttackGUI")
+
+        gui = AttackGUI(root, domain=domain)
+        gui.pack(fill="both", expand=True)
+
+        root.mainloop()
+
+    # ========================================================
+    # XSSSecurityGUI (Tkinter)
+    # ========================================================
     elif cmd == "tk":
         print(f"[🛡️ XSSSecurityGUI] Запуск: {datetime.datetime.now().isoformat()}")
         app = XSSSecurityGUI()
         app.mainloop()
 
-    # --------------------------------------------------------
-    # CLI режимы
-    # --------------------------------------------------------
-    elif cmd in ("crawl", "js", "recon"):
+    # ========================================================
+    # CLI режимы: crawl / js / recon / fuzz
+    # ========================================================
+    elif cmd in ("crawl", "js", "recon", "fuzz"):
         app = XSSSecurityGUI()
-
-        try:
-            app.after(500, app.activate_logs_tab)
-        except Exception:
-            pass
-
-        env_status = run_env_check()
-        print(env_status)
-        app.log(env_status)
 
         def run_cli():
             try:
-                # === CRAWL ===
+                # ----------------- CRAWL -----------------
                 if cmd == "crawl" and len(args) == 3:
                     url = args[2]
                     app.log(f"🕸️ Краулинг: {url}")
 
-                    raw, pages = crawl_site(url)
+                    pages, summary, raw = deep_crawl_site(url)
 
-                    LOG_DIR.mkdir(parents=True, exist_ok=True)
-                    save_json(LOG_DIR / "deep_crawl.json", {"pages": raw})
+                    save_json(LOG_DIR / "deep_crawl.json", {
+                        "pages": pages,
+                        "summary": summary,
+                        "raw": raw
+                    })
+
                     save_json(LOG_DIR / "deep_pages.json", pages)
 
-                    final = build_final_dict(nodes_json)
+                    final = build_final_dict(pages)
                     save_outputs(final)
+
                     app.log("✔️ Краулинг завершён. Данные сохранены.")
-                    app.threat_tab.send_to_threat_intel("crawler", final)
 
-                # === JS ANALYSIS ===
+                    THREAT_CONNECTOR.emit("crawler", url, final)
+
+                # ----------------- JS ANALYSIS -----------------
                 elif cmd == "js" and len(args) == 3:
-                    path = args[2]
-                    app.log(f"🔍 Анализ JS-файла: {path}")
-                    insights = extract_js_insights(path)
-                    for key, items in insights.items():
-                        app.log(f"→ {key}: {items}")
-                    app.threat_tab.send_to_threat_intel("js_inspector", insights)
+                    js_path = args[2]
+                    app.log(f"📜 Анализ JS-файла: {js_path}")
 
-                # === AUTO RECON ===
+                    report = analyze_js_file(js_path)
+                    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    filename = f"js_analysis_{ts}.json"
+                    save_json(LOG_DIR / filename, report)
+                    app.log(f"📁 Отчёт по JS сохранён: logs/{filename}")
+
+                    THREAT_CONNECTOR.emit("js_inspector", js_path, report)
+
+                # ----------------- AUTORECON -----------------
                 elif cmd == "recon" and len(args) == 3:
                     url = args[2]
                     app.log(f"🔁 Авторазведка: {url}")
 
-                    # 1. Сканирование
                     endpoints = EndpointScanner(url).scan()
                     payloads = PayloadGenerator(endpoints).generate()
                     responses = AttackPlanner(payloads).execute()
 
-                    # 2. Генерация отчёта AutoRecon
-                    report = ThreatConnector(responses).generate_report()
+                    THREAT_CONNECTOR.bulk("auto_recon", url, responses)
 
-                    # 3. Сохранение отчёта
+                    report = THREAT_CONNECTOR.generate_report()
+
                     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                     filename = f"auto_recon_{ts}.json"
                     save_json(LOG_DIR / filename, report)
-
                     app.log(f"📁 Отчёт сохранён: logs/{filename}")
 
-                    # 4. Threat Intel Pipeline 6.0
-                    tic = ThreatIntelConnector()
-                    tic.report_autorecon(report)
                     app.log("📡 AutoRecon → Threat Intel отправлено")
 
-                    # 5. GUI Threat Tab
-                    try:
-                        app.threat_tab.send_to_threat_intel("auto_recon", report)
-                    except Exception as e:
-                        app.log(f"⚠️ Не удалось отправить в ThreatTab: {e}")
+                # ----------------- FUZZER -----------------
+                elif cmd == "fuzz" and len(args) == 3:
+                    url = args[2]
+                    app.log(f"🧪 Fuzzing: {url}")
+
+                    # Пример параметров — подставь реальные при необходимости
+                    params = {"q": xsschecker}
+                    headers = {}
+                    GET = True
+                    delay = 1
+                    timeout = 10
+                    WAF = False
+                    encoding = None
+
+                    threading.Thread(
+                        target=lambda: fuzzer(
+                            url, params, headers, GET, delay, timeout, WAF, encoding,
+                            gui_callback=lambda text: app.after(0, lambda: app.log(text))
+                        ),
+                        daemon=True
+                    ).start()
 
                 else:
-                    app.log("⚠️ Неверные аргументы. Используйте: crawl <url> | js <path.js> | recon <url>")
+                    app.log("⚠️ Неверные аргументы. Используйте: crawl <url> | js <path.js> | recon <url> | fuzz <url>")
 
             except Exception as e:
                 app.log(f"❌ Ошибка CLI режима ({cmd}): {type(e).__name__}: {e}")
 
-        # Запуск CLI в отдельном потоке + основной GUI‑цикл
         threading.Thread(target=run_cli, daemon=True).start()
         app.mainloop()
 
-    # --------------------------------------------------------
-    # Справка и версия
-    # --------------------------------------------------------
+    # ========================================================
+    # Справка / версия
+    # ========================================================
     elif cmd in ("--help", "help"):
         show_usage()
 
     elif cmd in ("--version", "version"):
-        print("XSS Security Suite v3.0")
+        print("XSS Security Suite 5.0")
 
     else:
         show_usage()

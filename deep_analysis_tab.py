@@ -12,16 +12,18 @@ from tkinter import ttk, messagebox, filedialog
 
 import requests
 
-from deep_crawler import deep_crawl_site
-from utils.threat_sender import ThreatSenderMixin
+from xss_security_gui.deep_crawler import deep_crawl_site
+from xss_security_gui.utils.threat_sender import ThreatSenderMixin
 from xss_security_gui import settings
 from xss_security_gui.network_checker import NetworkChecker
+from xss_security_gui.settings import JSON_CRAWL_EXPORT_PATH
+
 
 class DeepAnalysisTab(ttk.Frame, ThreatSenderMixin):
     def __init__(self, parent, json_path=None, threat_tab=None):
         super().__init__(parent)
         # Централизованный путь
-        self.json_path = json_path or str(settings.JSON_CRAWL_EXPORT_PATH)
+        self.json_path = json_path or str(JSON_CRAWL_EXPORT_PATH)
         self.analysis_results = []
         self.full_data = []          # список страниц из results["details"]
         self.threat_tab = threat_tab

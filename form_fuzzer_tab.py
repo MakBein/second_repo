@@ -27,7 +27,7 @@ class FormFuzzerTab(ttk.Frame, ThreatSenderMixin):
     Enterprise 6.0 FormFuzzerTab
     ----------------------------
     • Агрессивный фуззер форм с многопоточностью
-    • Интеграция с ThreatConnector
+    • Интеграция с ThreatConnector (ULTRA‑6.5 emit API)
     • Расширенные настройки и безопасное завершение потоков
     """
 
@@ -40,34 +40,25 @@ class FormFuzzerTab(ttk.Frame, ThreatSenderMixin):
         timeout: float = 6.0,
         aggressive_mode: bool = True,
     ):
-        """
-        Инициализация вкладки FormFuzzerTab.
-        • parent: родительский контейнер (tk.Frame или ttk.Notebook)
-        • json_path: путь к JSON с результатами краулинга
-        • threat_tab: ссылка на вкладку Threat Intel (если есть)
-        • max_workers: количество потоков по умолчанию
-        • timeout: таймаут запросов
-        • aggressive_mode: режим агрессивного фуззинга
-        """
         super().__init__(parent)
 
-        # Настройки
+        # Основные параметры
         self.json_path = json_path
         self.forms: List[Dict[str, Any]] = []
         self.threat_tab = threat_tab
+
+        # Состояние фуззинга
         self.is_fuzzing = False
         self.fuzzing_thread: Optional[threading.Thread] = None
         self.executor: Optional[ThreadPoolExecutor] = None
 
+        # Настройки фуззинга
         self.max_workers = max_workers
         self.timeout = timeout
         self.aggressive_mode = aggressive_mode
 
-        # Проверка пути к JSON
+        # Гарантируем существование директории JSON
         os.makedirs(os.path.dirname(self.json_path), exist_ok=True)
-
-        # Интеграция с ThreatConnector
-        THREAT_CONNECTOR.register_module("FormFuzzer")
 
         # Логирование
         log.info(
@@ -378,7 +369,16 @@ class FormFuzzerTab(ttk.Frame, ThreatSenderMixin):
                 self.forms.append(form_entry)
                 forms_count += 1
 
-                THREAT_CONNECTOR.add_artifact("FormLoader", url, [form_entry])
+                # --- ULTRA‑6.5 ThreatConnector ---
+                THREAT_CONNECTOR.emit(
+                    module="FormLoader",
+                    target=url,
+                    result={
+                        "severity": "info",
+                        "category": "form_loaded",
+                        "form": form_entry,
+                    }
+                )
 
         self.log("=" * 60, "info")
         self.log(f"✅ Загружено форм: {forms_count}", "success")
@@ -470,21 +470,43 @@ class FormFuzzerTab(ttk.Frame, ThreatSenderMixin):
             for future in as_completed(futures):
                 if not self.is_fuzzing:
                     break
+
                 form = futures[future]
+
                 try:
                     hits = future.result()
+
                     if hits:
                         all_hits.extend(hits)
+
                         for hit in hits:
+                            # Локальный лог
                             self._log_to_file(form, hit)
-                            THREAT_CONNECTOR.add_artifact(
-                                "FormFuzzer", form.get("url", ""), [hit]
+
+                            # --- ThreatConnector ULTRA‑6.5 ---
+                            THREAT_CONNECTOR.emit(
+                                module="FormFuzzer",
+                                target=form.get("url", ""),
+                                result={
+                                    "severity": "high",
+                                    "category": "xss_hit",
+                                    "payload": hit.get("payload"),
+                                    "status": hit.get("status"),
+                                    "vulnerable": True,
+                                    "snippet": hit.get("snippet"),
+                                    "inputs": form.get("inputs", []),
+                                    "method": form.get("method", "GET"),
+                                    "action": form.get("action", ""),
+                                    "timestamp": hit.get("timestamp"),
+                                }
                             )
+
                     processed += 1
                     self.progress["value"] = processed
                     self.update_status(
                         f"Обработано: {processed}/{total_forms} | Найдено XSS: {len(all_hits)}"
                     )
+
                 except Exception as e:
                     errors += 1
                     self.log(
@@ -640,6 +662,7 @@ class FormFuzzerTab(ttk.Frame, ThreatSenderMixin):
                 "error": result.get("error"),
             }
 
+            # Текстовый лог
             with open(text_log, "a", encoding="utf-8") as f:
                 f.write(f"\n{'=' * 80}\n")
                 f.write(f"[{artifact['timestamp']}] {artifact['module']} RESULT\n")
@@ -648,11 +671,15 @@ class FormFuzzerTab(ttk.Frame, ThreatSenderMixin):
                     f.write(f"{key}: {val}\n")
                 f.write(f"{'=' * 80}\n\n")
 
+            # NDJSON лог
             with open(ndjson_log, "a", encoding="utf-8") as f:
                 f.write(json.dumps(artifact, ensure_ascii=False) + "\n")
 
-            THREAT_CONNECTOR.add_artifact(
-                "FormFuzzer", artifact["target"], [artifact]
+            # ThreatConnector ULTRA‑6.5
+            THREAT_CONNECTOR.emit(
+                module="FormFuzzer",
+                target=artifact["target"],
+                result=artifact,
             )
 
             log.info(
@@ -685,6 +712,7 @@ class FormFuzzerTab(ttk.Frame, ThreatSenderMixin):
             return
 
         try:
+            # ThreatConnector ULTRA‑6.5: артефакты в формате {module, target, result}
             artifacts = THREAT_CONNECTOR.filter_by_module("FormFuzzer")
 
             export_data = {
@@ -693,11 +721,12 @@ class FormFuzzerTab(ttk.Frame, ThreatSenderMixin):
                 "total_artifacts": len(artifacts),
                 "stats": {
                     "xss_found": sum(
-                        1 for a in artifacts if a["result"].get("vulnerable")
+                        1 for a in artifacts
+                        if a.get("result", {}).get("vulnerable")
                     ),
                     "errors": sum(
                         1 for a in artifacts
-                        if a["result"].get("status") == "error"
+                        if a.get("result", {}).get("status") == "error"
                     ),
                 },
                 "forms": self.forms,

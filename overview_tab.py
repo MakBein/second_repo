@@ -11,7 +11,7 @@
 # ============================================================
 
 from __future__ import annotations
-
+from pathlib import Path
 import datetime
 import json
 import os
@@ -19,14 +19,21 @@ import threading
 from collections import Counter
 from typing import Any, Callable, Dict, Optional, List
 
+
 import matplotlib.pyplot as plt
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-
 from xss_security_gui.report_merger import ReportMerger
 from xss_security_gui.crawler import crawl_site
 from xss_security_gui.api_parser import extract_api_data
+from xss_security_gui.config_manager import (
+    CRAWLER_RESULTS_PATH,
+    DEEP_CRAWL_JSON_PATH,
+    THREAT_LOG_PATH,
+    LOG_HONEYPOT_HITS,
+    PARAM_FUZZ_LOG_PATH,
+)
 
 
 class OverviewTab(ttk.Frame):
@@ -45,10 +52,10 @@ class OverviewTab(ttk.Frame):
         self.app = app
         self.threat_tab = threat_tab
 
-        # Пути к основным артефактам
-        self.crawler_path = os.path.join("logs", "crawler_results.json")
-        self.deep_crawl_path = os.path.join("logs", "deep_crawl.json")
-        self.threat_log_path = os.path.join("logs", "threat_intel.log")
+        # Пути к основным артефактам (универсальные)
+        self.crawler_path: Path = CRAWLER_RESULTS_PATH
+        self.deep_crawl_path: Path = DEEP_CRAWL_JSON_PATH
+        self.threat_log_path: Path = THREAT_LOG_PATH
 
         # Последние результаты API‑парсера (для графика)
         self.last_api_results: Dict[str, Any] = {}
@@ -64,7 +71,6 @@ class OverviewTab(ttk.Frame):
     # ========================================================
 
     def build_ui(self) -> None:
-        # Верхняя панель: URL + кнопки
         url_frame = ttk.Frame(self)
         url_frame.pack(pady=5, anchor="w", fill="x")
 
@@ -75,48 +81,18 @@ class OverviewTab(ttk.Frame):
         btn_frame = ttk.Frame(self)
         btn_frame.pack(pady=5, anchor="w", fill="x")
 
-        ttk.Button(btn_frame, text="🧬 Парсить сайт", command=self.parse_site).pack(
-            side="left", padx=4
-        )
-        ttk.Button(
-            btn_frame, text="📈 CSP‑риски", command=self.show_csp_risk_chart
-        ).pack(side="left", padx=4)
-        ttk.Button(
-            btn_frame, text="🧬 Парсить стандартный лог", command=self.run_api_parser
-        ).pack(side="left", padx=4)
-        ttk.Button(
-            btn_frame, text="📂 Выбрать лог и парсить", command=self.run_api_parser_file
-        ).pack(side="left", padx=4)
-        ttk.Button(
-            btn_frame, text="📊 API‑индикаторы", command=self.show_api_chart
-        ).pack(side="left", padx=4)
-        ttk.Button(
-            btn_frame, text="📊 Threat‑модули", command=self.show_threat_module_chart
-        ).pack(side="left", padx=4)
-        ttk.Button(
-            btn_frame, text="📊 Threat‑severity", command=self.show_threat_severity_chart
-        ).pack(side="left", padx=4)
-        ttk.Button(
-            btn_frame,
-            text="📊 Построить граф сайта",
-            command=lambda: self.app.render_graph("graph.dot", "graph.svg"),
-        ).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="🧬 Парсить сайт", command=self.parse_site).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="📈 CSP‑риски", command=self.show_csp_risk_chart).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="🧬 Парсить стандартный лог", command=self.run_api_parser).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="📂 Выбрать лог и парсить", command=self.run_api_parser_file).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="📊 API‑индикаторы", command=self.show_api_chart).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="📊 Threat‑модули", command=self.show_threat_module_chart).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="📊 Threat‑severity", command=self.show_threat_severity_chart).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="📊 Построить граф сайта",
+                   command=lambda: self.app.render_graph("graph.dot", "graph.svg")).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="🧷 Сводный Threat‑отчёт", command=self.run_report_merger_async).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="🔄 Обновить метрики", command=self.refresh_stats).pack(side="left", padx=4)
 
-        # Кнопка сводного Threat‑отчёта (ReportMerger → ThreatAnalysisTab)
-        ttk.Button(
-            btn_frame,
-            text="🧷 Сводный Threat‑отчёт",
-            command=self.run_report_merger_async,
-        ).pack(side="left", padx=4)
-
-        # Кнопка обновления метрик
-        ttk.Button(
-            btn_frame,
-            text="🔄 Обновить метрики",
-            command=self.refresh_stats,
-        ).pack(side="left", padx=4)
-
-        # Блок метрик
         stats_frame = ttk.LabelFrame(self, text="📊 Обзор метрик")
         stats_frame.pack(fill="both", expand=True, padx=5, pady=5)
 
@@ -127,7 +103,7 @@ class OverviewTab(ttk.Frame):
             "📤 Threat Intel отчётов": self.count_threat_reports,
             "🧠 Threat типов атак": self.count_threat_types,
             "🕒 Последний Threat‑отчёт": self.last_threat_timestamp,
-            "📡 Honeypot‑триггеров": lambda: self.count_lines("logs/honeypot_hits.log"),
+            "📡 Honeypot‑триггеров": lambda: self.count_lines(LOG_HONEYPOT_HITS),
             "✅ CSP включён на": self.count_csp_enabled,
             "🛡️ CSP: strong": lambda: self.count_csp_risks().get("strong", 0),
             "⚠️ CSP: moderate": lambda: self.count_csp_risks().get("moderate", 0),
@@ -148,33 +124,21 @@ class OverviewTab(ttk.Frame):
     # ========================================================
 
     def run_report_merger_async(self):
-        """Запускает ReportMerger в отдельном потоке и отправляет результат в ThreatAnalysisTab."""
         if not hasattr(self.app, "threat_tab") or self.app.threat_tab is None:
             messagebox.showwarning("Threat Intel", "ThreatAnalysisTab недоступен.")
             return
 
         def callback(report: Dict[str, Any], error: Optional[Exception]):
             if error:
-                self.after(
-                    0,
-                    lambda: messagebox.showerror(
-                        "Threat Report Merger", f"Ошибка объединения отчётов:\n{error}"
-                    ),
-                )
+                self.after(0, lambda: messagebox.showerror("Threat Report Merger", f"Ошибка объединения отчётов:\n{error}"))
                 return
 
             def send():
                 try:
                     self.app.threat_tab.send_to_threat_intel("report_merger", report)
-                    messagebox.showinfo(
-                        "Threat Report Merger",
-                        "Сводный Threat‑отчёт отправлен в Threat Intel.",
-                    )
+                    messagebox.showinfo("Threat Report Merger", "Сводный Threat‑отчёт отправлен в Threat Intel.")
                 except Exception as e:
-                    messagebox.showerror(
-                        "Threat Report Merger",
-                        f"Ошибка отправки в Threat Intel:\n{e}",
-                    )
+                    messagebox.showerror("Threat Report Merger", f"Ошибка отправки в Threat Intel:\n{e}")
 
             self.after(0, send)
 
@@ -200,27 +164,18 @@ class OverviewTab(ttk.Frame):
             try:
                 crawl_site(url, gui_callback=gui_callback, parallel=True)
             except Exception as e:
-                self.after(
-                    0,
-                    lambda: messagebox.showerror(
-                        "Ошибка краулера", f"Не удалось выполнить краулинг:\n{e}"
-                    ),
-                )
+                self.after(0, lambda: messagebox.showerror("Ошибка краулера", f"Не удалось выполнить краулинг:\n{e}"))
 
         threading.Thread(target=worker, daemon=True, name="OverviewCrawler").start()
-        messagebox.showinfo(
-            "Запущено",
-            "Краулер работает.\nРезультаты смотри во вкладке «Анализатор».",
-        )
+        messagebox.showinfo("Запущено", "Краулер работает.\nРезультаты смотри во вкладке «Анализатор».")
 
     # ========================================================
     #  API‑парсер
     # ========================================================
 
     def run_api_parser(self) -> None:
-        """Запуск API‑парсера по стандартному логу form_fuzzer."""
-        log_path = "logs/form_fuzz_hits.log"
-        if not os.path.exists(log_path):
+        log_path = PARAM_FUZZ_LOG_PATH
+        if not log_path.exists():
             messagebox.showwarning("Файл не найден", f"{log_path} отсутствует.")
             return
 
@@ -229,18 +184,10 @@ class OverviewTab(ttk.Frame):
                 results = extract_api_data(log_path, threat_tab=self.threat_tab)
                 self.last_api_results = results
                 total = sum(len(v) for v in results.values())
-                self.after(
-                    0,
-                    lambda: messagebox.showinfo(
-                        "✅ Парсинг завершён",
-                        f"Найдено {total} индикаторов.\nРезультаты отправлены в Threat Intel.",
-                    ),
-                )
+                self.after(0, lambda: messagebox.showinfo("✅ Парсинг завершён",
+                                                         f"Найдено {total} индикаторов.\nРезультаты отправлены в Threat Intel."))
             except Exception as e:
-                self.after(
-                    0,
-                    lambda: messagebox.showerror("❌ Ошибка парсинга", str(e)),
-                )
+                self.after(0, lambda: messagebox.showerror("❌ Ошибка парсинга", str(e)))
 
         threading.Thread(target=worker, daemon=True, name="OverviewAPIParser").start()
 

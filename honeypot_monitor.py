@@ -13,12 +13,12 @@ HoneypotMonitor ULTRA 6.0
 • Обновляет GUI (если передан GUI-объект), иначе пишет в консоль
 """
 
-import os
 import re
 import time
 import json
 import threading
 from datetime import datetime
+from pathlib import Path
 from typing import List, Dict, Any, Tuple
 
 from xss_security_gui.settings import (
@@ -41,7 +41,7 @@ ENABLE_INSTANT_ATTACK = settings.get("honeypot.instant_attack", True)
 INSTANT_ATTACK_MAX_MUTANTS = settings.get("honeypot.instant_attack_max_mutants", 10)
 
 processed_payloads = set()
-HONEYPOT_JSON_LOG = LOG_DIR / "honeypot_events.jsonl"
+HONEYPOT_JSON_LOG: Path = LOG_DIR / "honeypot_events.jsonl"
 
 
 # ============================================================
@@ -49,10 +49,10 @@ HONEYPOT_JSON_LOG = LOG_DIR / "honeypot_events.jsonl"
 # ============================================================
 
 def _load_crawler_results() -> Dict[str, Any]:
-    if not os.path.exists(JSON_CRAWL_EXPORT_PATH):
+    if not JSON_CRAWL_EXPORT_PATH.exists():
         return {}
     try:
-        with open(JSON_CRAWL_EXPORT_PATH, encoding="utf-8") as f:
+        with JSON_CRAWL_EXPORT_PATH.open(encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
@@ -85,7 +85,7 @@ def _extract_payloads(log_text: str) -> List[str]:
 
 def _append_json_log(event: Dict[str, Any]) -> None:
     try:
-        with open(HONEYPOT_JSON_LOG, "a", encoding="utf-8") as f:
+        with HONEYPOT_JSON_LOG.open("a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
     except Exception as e:
         print(f"[HoneypotULTRA] Ошибка записи JSON-лога: {e}")
@@ -114,24 +114,24 @@ def start_monitor_thread(gui_or_text) -> None:
 
 def monitor_log_thread(gui_or_text) -> None:
     last_size = 0
-    os.makedirs(os.path.dirname(LOG_HONEYPOT_PATH), exist_ok=True)
+    LOG_HONEYPOT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     while True:
         try:
-            if not os.path.exists(LOG_HONEYPOT_PATH):
+            if not LOG_HONEYPOT_PATH.exists():
                 _insert(gui_or_text, "🕵️ Honeypot лог не найден — ожидание...\n")
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            size = os.path.getsize(LOG_HONEYPOT_PATH)
+            size = LOG_HONEYPOT_PATH.stat().st_size
             if size > MAX_LOG_SIZE_MB * 1024 * 1024:
                 _insert(gui_or_text, f"🧹 Лог > {MAX_LOG_SIZE_MB}MB — очищаю...\n")
-                open(LOG_HONEYPOT_PATH, "w", encoding="utf-8").close()
+                LOG_HONEYPOT_PATH.write_text("", encoding="utf-8")
                 last_size = 0
                 continue
 
             if size > last_size:
-                with open(LOG_HONEYPOT_PATH, "r", encoding="utf-8") as f:
+                with LOG_HONEYPOT_PATH.open("r", encoding="utf-8") as f:
                     f.seek(last_size)
                     new_data = f.read()
                     last_size = f.tell()
@@ -153,7 +153,6 @@ def monitor_log_thread(gui_or_text) -> None:
 def _handle_captured_payload(gui_or_text, payload: str) -> None:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Единая классификация и риск
     family = classify_payload(payload)
     risk_score = estimate_risk(payload, family)
     level = risk_level(risk_score)
@@ -164,14 +163,12 @@ def _handle_captured_payload(gui_or_text, payload: str) -> None:
         f"(risk={risk_score}, level={level}, family={family}):\n{payload}\n"
     )
 
-    # Запись в hits-лог
     try:
-        with open(LOG_HONEYPOT_HITS, "a", encoding="utf-8") as out_log:
+        with LOG_HONEYPOT_HITS.open("a", encoding="utf-8") as out_log:
             out_log.write(f"[{timestamp}] [{level}] {payload}\n")
     except Exception as e:
         print(f"[HoneypotULTRA] Ошибка записи hits-лога: {e}")
 
-    # JSON-лог
     event = {
         "timestamp": timestamp,
         "payload": payload,
@@ -182,7 +179,6 @@ def _handle_captured_payload(gui_or_text, payload: str) -> None:
     }
     _append_json_log(event)
 
-    # ThreatConnector
     try:
         THREAT_CONNECTOR.emit(
             module="HoneypotULTRA",
@@ -199,7 +195,6 @@ def _handle_captured_payload(gui_or_text, payload: str) -> None:
     except Exception as e:
         print(f"[HoneypotULTRA] Ошибка ThreatConnector.emit: {e}")
 
-    # Авто-подстановка в GUI
     try:
         if hasattr(gui_or_text, "input_entry") and hasattr(gui_or_text, "scan"):
             gui_or_text.input_entry.delete(0, "end")
@@ -208,28 +203,52 @@ def _handle_captured_payload(gui_or_text, payload: str) -> None:
     except Exception as e:
         print(f"[HoneypotULTRA] Ошибка GUI-автосканирования: {e}")
 
-    # Mutator ULTRA
     if ENABLE_MUTATION:
         try:
             mutate_async("honeypot", payload)
         except Exception as e:
             print(f"[HoneypotULTRA] Ошибка mutate_async: {e}")
 
-    # Instant-Attack ULTRA
     if ENABLE_INSTANT_ATTACK:
         _run_instant_attack(gui_or_text, payload, family, risk_score)
 
 
 def _run_instant_attack(gui_or_text, payload: str, family: str, risk_score: int) -> None:
     domain = _get_target_domain()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     if not domain:
-        _insert(gui_or_text, "⚠️ Instant-Attack: домен не найден в crawler_results.json — пропуск.\n")
+        msg = "⚠️ Instant-Attack: домен не найден в crawler_results.json — пропуск.\n"
+        _insert(gui_or_text, msg)
+        _append_json_log({
+            "timestamp": timestamp,
+            "payload": payload,
+            "family": family,
+            "risk_score": risk_score,
+            "risk_level": risk_level(risk_score),
+            "source": "honeypot",
+            "action": "instant_attack",
+            "status": "skipped",
+            "reason": "no_domain"
+        })
         return
 
     try:
         engine = AttackEngine(domain)
     except Exception as e:
-        _insert(gui_or_text, f"⚠️ Instant-Attack: не удалось инициализировать AttackEngine: {e}\n")
+        msg = f"⚠️ Instant-Attack: не удалось инициализировать AttackEngine: {e}\n"
+        _insert(gui_or_text, msg)
+        _append_json_log({
+            "timestamp": timestamp,
+            "payload": payload,
+            "family": family,
+            "risk_score": risk_score,
+            "risk_level": risk_level(risk_score),
+            "source": "honeypot",
+            "action": "instant_attack",
+            "status": "failed",
+            "reason": str(e)
+        })
         return
 
     _insert(gui_or_text, f"🚀 Instant-Attack: запуск атаки на {domain} с honeypot payload.\n")
@@ -238,6 +257,18 @@ def _run_instant_attack(gui_or_text, payload: str, family: str, risk_score: int)
     try:
         if hasattr(engine, "run_single_payload_attack"):
             engine.run_single_payload_attack(payload)
+            _append_json_log({
+                "timestamp": timestamp,
+                "payload": payload,
+                "family": family,
+                "risk_score": risk_score,
+                "risk_level": risk_level(risk_score),
+                "source": "honeypot",
+                "action": "instant_attack",
+                "status": "success",
+                "target": domain,
+                "type": "original"
+            })
         else:
             _insert(gui_or_text, "⚠️ Instant-Attack: run_single_payload_attack не найден.\n")
     except Exception as e:
@@ -246,13 +277,11 @@ def _run_instant_attack(gui_or_text, payload: str, family: str, risk_score: int)
     # 2) Атака мутантов с высоким риском
     try:
         mutants = mutate_payload(payload, framework="generic")
-
-        high_risk_mutants: List[Tuple[str, int]] = []
-        for m in mutants:
-            fam = classify_payload(m)
-            r = estimate_risk(m, fam)
-            if r >= 7:
-                high_risk_mutants.append((m, r))
+        high_risk_mutants: List[Tuple[str, int]] = [
+            (m, estimate_risk(m, classify_payload(m)))
+            for m in mutants
+            if estimate_risk(m, classify_payload(m)) >= 7
+        ]
 
         high_risk_mutants.sort(key=lambda x: x[1], reverse=True)
         high_risk_mutants = high_risk_mutants[:INSTANT_ATTACK_MAX_MUTANTS]
@@ -261,26 +290,43 @@ def _run_instant_attack(gui_or_text, payload: str, family: str, risk_score: int)
             _insert(gui_or_text, "ℹ️ Instant-Attack: высокорисковых мутантов не найдено.\n")
             return
 
-        _insert(
-            gui_or_text,
-            f"🔥 Instant-Attack: запуск атак по {len(high_risk_mutants)} мутантам с высоким риском.\n",
-        )
+        _insert(gui_or_text, f"🔥 Instant-Attack: запуск атак по {len(high_risk_mutants)} мутантам с высоким риском.\n")
 
         for mutant_payload, risk_value in high_risk_mutants:
             try:
                 if hasattr(engine, "run_single_payload_attack"):
                     engine.run_single_payload_attack(mutant_payload)
+                    _append_json_log({
+                        "timestamp": timestamp,
+                        "payload": mutant_payload,
+                        "family": classify_payload(mutant_payload),
+                        "risk_score": risk_value,
+                        "risk_level": risk_level(risk_value),
+                        "source": "honeypot",
+                        "action": "instant_attack",
+                        "status": "success",
+                        "target": domain,
+                        "type": "mutant"
+                    })
                 else:
                     _insert(gui_or_text, "⚠️ Instant-Attack: метод run_single_payload_attack отсутствует.\n")
                     break
             except Exception as e:
-                _insert(
-                    gui_or_text,
-                    f"⚠️ Instant-Attack: ошибка при атаке мутанта (risk={risk_value}): {e}\n"
-                )
-
+                _insert(gui_or_text, f"⚠️ Instant-Attack: ошибка при атаке мутанта (risk={risk_value}): {e}\n")
     except Exception as e:
         _insert(gui_or_text, f"⚠️ Instant-Attack: ошибка при подготовке мутантов: {e}\n")
+
+# ============================================================
+# Асинхронная обёртка для Instant-Attack
+# ============================================================
+
+def run_instant_attack_async(gui_or_text, payload: str, family: str, risk_score: int) -> threading.Thread:
+    thread = threading.Thread(
+        target=lambda: _run_instant_attack(gui_or_text, payload, family, risk_score),
+        daemon=True
+    )
+    thread.start()
+    return thread
 
 
 # ============================================================

