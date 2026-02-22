@@ -1,13 +1,14 @@
 # xss_security_gui/auto_recon/scanner.py
+
 # === Стандартная библиотека ===
-import os
-import re
-import json
-import threading
+from pathlib import Path
 import datetime
+import json
 import logging
-from urllib.parse import urljoin
+import re
+import threading
 from typing import Optional, List, Dict, Any
+from urllib.parse import urljoin
 
 # === Внешние библиотеки ===
 import requests
@@ -17,15 +18,17 @@ from bs4 import BeautifulSoup
 
 # === Локальные утилиты ===
 from xss_security_gui.utils.core_utils import normalize_url
+from xss_security_gui.config_manager import LOGS_DIR
 
 # === Локальные модули ===
 from xss_security_gui.xss_detector import XSSDetector
 from xss_security_gui.threat_analysis.threat_connector import THREAT_CONNECTOR
 
 
-# =======================
-# Устойчивый HTTP-сессия
-# =======================
+# ============================================================
+#  Устойчивый HTTP-сессия
+# ============================================================
+
 def create_retry_session(
     total: int = 3,
     backoff_factor: float = 0.5,
@@ -33,9 +36,11 @@ def create_retry_session(
 ) -> requests.Session:
     """
     Создаёт HTTP-сессию с автоматическим повтором запросов.
-    • total: количество попыток
-    • backoff_factor: задержка между попытками
-    • status_forcelist: список кодов для повторных попыток
+
+    Args:
+        total: общее количество попыток.
+        backoff_factor: задержка между попытками.
+        status_forcelist: коды ответов, при которых выполняется повтор.
     """
     retry = Retry(
         total=total,
@@ -58,34 +63,50 @@ def create_retry_session(
     return session
 
 
-# =======================
-# Основной сканер
-# =======================
+# ============================================================
+#  Основной сканер эндпоинтов
+# ============================================================
+
 class EndpointScanner:
     """
-    AutoRecon Enterprise 2.0 EndpointScanner
+    AutoRecon EndpointScanner 2.0
+
     • Сканирует страницы, формы, JS и XHR
     • Интегрируется с ThreatConnector
     • Поддерживает XSS-сканирование
     """
 
-    def __init__(self, target_url: str, gui_callback=None):
+    def __init__(self, target_url: str, gui_callback: Optional[callable] = None):
         self.session = create_retry_session()
         self.target = target_url.rstrip("/")
         self.headers = {"User-Agent": "AutoReconScanner/2.0"}
-        self.endpoints: list[dict] = []
+        self.endpoints: List[Dict[str, Any]] = []
         self.gui_callback = gui_callback
         self.detector = XSSDetector()
 
-    # -----------------------
+    # --------------------------------------------------------
+    # Вспомогательный метод: отправка событий в GUI
+    # --------------------------------------------------------
+
+    def _report_gui(self, message: Dict[str, Any]):
+        if self.gui_callback:
+            try:
+                self.gui_callback(message)
+            except Exception as e:
+                logging.error(f"[EndpointScanner] GUI callback error: {e}", exc_info=True)
+
+    # --------------------------------------------------------
     # Основной сбор эндпоинтов
-    # -----------------------
-    def scan(self) -> list[dict]:
+    # --------------------------------------------------------
+
+    def scan(self) -> List[Dict[str, Any]]:
+        """Сканирует целевую страницу и извлекает формы, JS и XHR."""
         try:
             response = self.session.get(self.target, headers=self.headers, timeout=10)
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
             self._report_gui({"error": f"Failed to fetch target: {e}"})
+            logging.error(f"[EndpointScanner] Failed to fetch target {self.target}: {e}")
             return []
 
         soup = BeautifulSoup(response.text, "html.parser")
@@ -94,7 +115,7 @@ class EndpointScanner:
         js_links = self.extract_js_links(soup)
         apis = self.extract_xhr(js_links)
 
-        root_entry = {
+        root_entry: Dict[str, Any] = {
             "url": self.target,
             "method": "GET",
             "params": {},
@@ -102,23 +123,29 @@ class EndpointScanner:
             "status": response.status_code,
             "headers": dict(response.request.headers),
             "response_headers": dict(response.headers),
-            "full_response": response.text[:2000],  # ограничиваем для читаемости
-            "timestamp": datetime.datetime.utcnow().isoformat()
+            "full_response": response.text[:2000],
+            "timestamp": datetime.datetime.utcnow().isoformat(),
         }
 
         self.endpoints = [root_entry] + forms + apis
         self._report_gui({"info": f"Discovered {len(self.endpoints)} endpoints"})
 
         # Отправляем артефакты в ThreatConnector
-        THREAT_CONNECTOR.add_artifact("EndpointScanner", self.target, self.endpoints)
+        try:
+            THREAT_CONNECTOR.add_artifact("EndpointScanner", self.target, self.endpoints)
+        except Exception as e:
+            logging.error(f"[EndpointScanner] ThreatConnector error: {e}", exc_info=True)
 
         return self.endpoints
 
-    # -----------------------
+    # --------------------------------------------------------
     # Формы
-    # -----------------------
-    def extract_forms(self, soup: BeautifulSoup) -> list[dict]:
-        result = []
+    # --------------------------------------------------------
+
+    def extract_forms(self, soup: BeautifulSoup) -> List[Dict[str, Any]]:
+        """Извлекает HTML-формы и превращает их в эндпоинты."""
+        result: List[Dict[str, Any]] = []
+
         for form in soup.find_all("form"):
             action = urljoin(self.target, form.get("action", ""))
             method = form.get("method", "GET").upper()
@@ -137,24 +164,34 @@ class EndpointScanner:
                 "status": None,
                 "headers": dict(self.headers),
                 "response_headers": {},
-                "timestamp": datetime.datetime.utcnow().isoformat()
+                "timestamp": datetime.datetime.utcnow().isoformat(),
             })
+
         return result
 
-    # -----------------------
+    # --------------------------------------------------------
     # JS-файлы
-    # -----------------------
-    def extract_js_links(self, soup: BeautifulSoup) -> list[str]:
-        return [urljoin(self.target, s["src"]) for s in soup.find_all("script", src=True)]
+    # --------------------------------------------------------
 
-    # -----------------------
+    def extract_js_links(self, soup: BeautifulSoup) -> List[str]:
+        """Возвращает список абсолютных ссылок на JS-файлы."""
+        return [
+            urljoin(self.target, s["src"])
+            for s in soup.find_all("script", src=True)
+        ]
+
+    # --------------------------------------------------------
     # XHR / fetch / ajax
-    # -----------------------
-    def extract_xhr(self, js_links: list[str]) -> list[dict]:
-        api_patterns = []
+    # --------------------------------------------------------
+
+    def extract_xhr(self, js_links: List[str]) -> List[Dict[str, Any]]:
+        """
+        Ищет в JS-файлах вызовы fetch/xhr/ajax и строит эндпоинты.
+        """
+        api_patterns: List[Dict[str, Any]] = []
         xhr_regex = re.compile(
             r"(fetch|xhr|ajax)\s*\(\s*['\"]([^'\"]+)['\"]",
-            re.IGNORECASE
+            re.IGNORECASE,
         )
 
         for js_url in js_links:
@@ -173,21 +210,30 @@ class EndpointScanner:
                         "status": resp.status_code,
                         "headers": dict(resp.request.headers),
                         "response_headers": dict(resp.headers),
-                        "timestamp": datetime.datetime.utcnow().isoformat()
+                        "timestamp": datetime.datetime.utcnow().isoformat(),
                     })
+
             except requests.exceptions.RequestException as e:
                 self._report_gui({"warning": f"Failed to fetch JS {js_url}: {e}"})
-                continue
+                logging.warning(f"[EndpointScanner] Failed to fetch JS {js_url}: {e}")
 
         return api_patterns
 
-    # -----------------------
+    # --------------------------------------------------------
     # XSS-сканирование эндпоинтов
-    # -----------------------
-    def scan_xss_on_endpoints(self, payload: str = '<img src=x onerror=alert(1)>') -> list[dict]:
-        results = []
+    # --------------------------------------------------------
+
+    def scan_xss_on_endpoints(
+        self,
+        payload: str = "<img src=x onerror=alert(1)>",
+    ) -> List[Dict[str, Any]]:
+        """
+        Выполняет простое XSS-сканирование по всем GET-эндпоинтам.
+        """
+        results: List[Dict[str, Any]] = []
+
         for ep in self.endpoints:
-            if ep["method"] != "GET":
+            if ep.get("method", "GET").upper() != "GET":
                 continue
 
             try:
@@ -196,7 +242,7 @@ class EndpointScanner:
                     full_url,
                     params=ep.get("params", {}),
                     headers=self.headers,
-                    timeout=10
+                    timeout=10,
                 )
                 html = response.text
                 reflected = payload in html
@@ -207,7 +253,7 @@ class EndpointScanner:
                 else:
                     context, js_hits = "❌ Not reflected", []
 
-                result = {
+                result: Dict[str, Any] = {
                     "url": response.url,
                     "request_url": response.url,
                     "status": response.status_code,
@@ -221,70 +267,99 @@ class EndpointScanner:
                     "headers": dict(response.request.headers),
                     "response_headers": dict(response.headers),
                     "timestamp": datetime.datetime.utcnow().isoformat(),
-                    "vulnerable": reflected
+                    "vulnerable": reflected,
                 }
 
                 results.append(result)
                 self._report_gui(result)
-                THREAT_CONNECTOR.add_artifact("XSSScanner", response.url, [result])
+
+                try:
+                    THREAT_CONNECTOR.add_artifact("XSSScanner", response.url, [result])
+                except Exception as e:
+                    logging.error(f"[EndpointScanner] ThreatConnector XSS error: {e}", exc_info=True)
 
             except requests.exceptions.RequestException as e:
                 error_result = {
-                    "url": ep["url"],
+                    "url": ep.get("url"),
                     "error": str(e),
                     "source": ep.get("source", "unknown"),
-                    "timestamp": datetime.datetime.utcnow().isoformat()
+                    "timestamp": datetime.datetime.utcnow().isoformat(),
                 }
                 results.append(error_result)
                 self._report_gui(error_result)
+                logging.error(f"[EndpointScanner] XSS scan error for {ep.get('url')}: {e}")
 
         return results
 
-    # -----------------------
-    # XSS fuzzing параметров
-    # -----------------------
-    def fuzz_xss_parameters(self, base_params=None, method="GET"):
+    def fuzz_xss_parameters(self, base_params: Optional[Dict[str, Any]] = None, method: str = "GET") -> List[Dict[str, Any]]:
         """
-        Фуззинг параметров для XSS.
-        • base_params: словарь базовых параметров
-        • method: HTTP метод (GET/POST)
-        """
-        results = []
-        generated = self.detector.fuzz_xss_parameters(self.target, base_params or {}, method)
+        Выполняет XSS‑fuzzing параметров.
 
-        for payload_entry in generated:
+        Args:
+            base_params: словарь базовых параметров
+            method: HTTP‑метод (GET/POST)
+
+        Returns:
+            Список результатов fuzzing в формате, совместимом с AutoReconAnalyzerV2.
+        """
+        results: List[Dict[str, Any]] = []
+        base_params = base_params or {}
+
+        # Генерация payload‑ов через XSSDetector
+        generated = self.detector.fuzz_xss_parameters(
+            self.target,
+            base_params,
+            method,
+        )
+
+        for entry in generated:
             try:
-                if method.upper() == "GET" and isinstance(payload_entry, str):
-                    full_url = normalize_url(self.target, payload_entry)
-                    response = self.session.get(full_url, headers=self.headers, timeout=10)
+                # ------------------------------------------------------------
+                # 1. Определяем тип запроса
+                # ------------------------------------------------------------
+                if method.upper() == "GET" and isinstance(entry, str):
+                    full_url = normalize_url(self.target, entry)
+                    response = self.session.get(
+                        full_url,
+                        headers=self.headers,
+                        timeout=10,
+                    )
+                    payload_str = entry
 
-                elif isinstance(payload_entry, dict):
-                    url = normalize_url(self.target, payload_entry.get("url", self.target))
+                elif isinstance(entry, dict):
+                    url = normalize_url(self.target, entry.get("url", self.target))
                     response = self.session.post(
                         url,
-                        json=payload_entry.get("json", {}),
+                        json=entry.get("json", {}),
                         headers=self.headers,
-                        timeout=10
+                        timeout=10,
                     )
+                    payload_str = json.dumps(entry.get("json", {}), ensure_ascii=False)
+
                 else:
                     continue
 
                 html = response.text
-                payload_str = payload_entry if isinstance(payload_entry, str) else str(payload_entry.get("json", {}))
                 reflected = payload_str in html
 
+                # ------------------------------------------------------------
+                # 2. Анализ отражения
+                # ------------------------------------------------------------
                 if reflected:
                     context = self.detector.detect_xss_context(html, payload_str)
                     js_hits = self.detector.scan_inline_js_for_payload(html, payload_str)
                 else:
                     context, js_hits = "❌ Not reflected", []
 
+                # ------------------------------------------------------------
+                # 3. Формирование результата
+                # ------------------------------------------------------------
                 result = {
                     "module": "XSSFuzzer",
-                    "url": getattr(response, "url", payload_entry),
-                    "request_url": getattr(response, "url", payload_entry),
+                    "url": response.url,
+                    "request_url": response.url,
                     "status": response.status_code,
-                    "method": method,
+                    "method": method.upper(),
                     "payload": payload_str,
                     "context": context or "❓ Unknown",
                     "category": context if reflected else "none",
@@ -296,41 +371,55 @@ class EndpointScanner:
                     "response_length": len(html),
                     "timestamp": datetime.datetime.utcnow().isoformat(),
                     "vulnerable": reflected,
-                    "severity": "high" if reflected else "info"
+                    "severity": "high" if reflected else "info",
                 }
 
                 results.append(result)
                 self._report_gui(result)
-                THREAT_CONNECTOR.add_artifact("XSSFuzzer", result["url"], [result])
+
+                try:
+                    THREAT_CONNECTOR.add_artifact("XSSFuzzer", result["url"], [result])
+                except Exception as e:
+                    logging.error(f"[XSSFuzzer] ThreatConnector error: {e}", exc_info=True)
 
             except requests.exceptions.RequestException as e:
+                # ------------------------------------------------------------
+                # Ошибка запроса
+                # ------------------------------------------------------------
                 error_result = {
                     "module": "XSSFuzzer",
-                    "url": payload_entry if isinstance(payload_entry, str) else payload_entry.get("url", self.target),
+                    "url": entry if isinstance(entry, str) else entry.get("url", self.target),
                     "error": str(e),
                     "source": "xss_fuzzer",
                     "timestamp": datetime.datetime.utcnow().isoformat(),
                     "severity": "error",
-                    "vulnerable": False
+                    "vulnerable": False,
                 }
+
                 results.append(error_result)
                 self._report_gui(error_result)
-                THREAT_CONNECTOR.add_artifact("XSSFuzzer", error_result["url"], [error_result])
+
+                try:
+                    THREAT_CONNECTOR.add_artifact("XSSFuzzer", error_result["url"], [error_result])
+                except Exception as e2:
+                    logging.error(f"[XSSFuzzer] ThreatConnector error: {e2}", exc_info=True)
 
         return results
 
-    # -----------------------
-    # GUI callback
-    # -----------------------
-    def _report_gui(self, data: dict):
+    # ============================================================
+    #  GUI callback
+    # ============================================================
+    def _report_gui(self, data: Dict[str, Any]):
         """
-        Отправка данных в GUI с безопасной обработкой.
-        • data: словарь результата или ошибки
+        Безопасная отправка данных в GUI.
+
+        Args:
+            data: словарь результата или ошибки
         """
         data.setdefault("timestamp", datetime.datetime.utcnow().isoformat())
         wrapped = {"scanner": data}
 
-        # Логируем
+        # Логирование
         if "error" in data:
             logging.error(f"[GUI] {data.get('error')}")
         elif data.get("vulnerable"):
@@ -344,19 +433,12 @@ class EndpointScanner:
             except Exception as e:
                 logging.warning(f"[GUI] Ошибка при вызове callback: {e}")
 
-
-# =======================
-# Вспомогательные функции
-# =======================
+# ============================================================
+#  Вспомогательные функции
+# ============================================================
 
 def extract_context(payload: str, html: str, context: int = 50) -> Optional[tuple[str, int]]:
-    """
-    Извлекает контекст вокруг отражённого payload в HTML.
-    • payload: строка, которую ищем
-    • html: HTML-код ответа
-    • context: количество символов вокруг payload
-    Возвращает (фрагмент, индекс) или None.
-    """
+    """Возвращает фрагмент HTML вокруг payload."""
     if not payload or not html:
         return None
 
@@ -366,18 +448,11 @@ def extract_context(payload: str, html: str, context: int = 50) -> Optional[tupl
 
     start = max(0, index - context)
     end = min(len(html), index + len(payload) + context)
-
-    snippet = html[start:end]
-    return snippet, index
+    return html[start:end], index
 
 
 def categorize_reflection(payload: str, html: str) -> str:
-    """
-    Определяет категорию отражения payload в HTML.
-    • payload: строка, которую ищем
-    • html: HTML-код ответа
-    Возвращает категорию: HTML, JS, Attribute Injection, raw или unknown.
-    """
+    """Определяет категорию отражения payload."""
     snippet, _ = extract_context(payload, html, context=100) or (None, None)
     if not snippet:
         return "unknown"
@@ -395,36 +470,28 @@ def categorize_reflection(payload: str, html: str) -> str:
 
 
 def suggest_payload_by_category(category: str) -> str:
-    """
-    Предлагает подходящий payload для выбранной категории отражения.
-    • category: строка категории
-    Возвращает строку payload.
-    """
+    """Возвращает подходящий payload для категории отражения."""
     mapping = {
         "🔤 Reflected HTML": "<script>alert(1)</script>",
         "🧬 Attribute Injection": '" onerror="alert(1)',
         "📜 Reflected JS": '";alert(1)//',
-        "raw": "<img src=x onerror=alert(1)>"
+        "raw": "<img src=x onerror=alert(1)>",
     }
     return mapping.get(category, "<img src=x onerror=alert(1)>")
 
 
-def scan_url(url: str) -> dict:
-    """
-    Минимальный сканер одного URL.
-    Возвращает структуру, совместимую с AutoReconAnalyzerV2.
-    """
+def scan_url(url: str) -> Dict[str, Any]:
+    """Минимальный сканер одного URL."""
     try:
-        import requests
         r = requests.get(url, timeout=5)
         return {
             "module": "URLScanner",
             "url": url,
-            "text": r.text[:2000],  # ограничиваем для читаемости
+            "text": r.text[:2000],
             "headers": dict(r.headers),
             "status": r.status_code,
             "source": "scan_url",
-            "timestamp": datetime.datetime.utcnow().isoformat()
+            "timestamp": datetime.datetime.utcnow().isoformat(),
         }
     except Exception as e:
         return {
@@ -435,69 +502,59 @@ def scan_url(url: str) -> dict:
             "status": "error",
             "error": str(e),
             "source": "scan_url",
-            "timestamp": datetime.datetime.utcnow().isoformat()
+            "timestamp": datetime.datetime.utcnow().isoformat(),
         }
 
 
-def scan_multiple(urls: list[str]) -> list[dict]:
-    """
-    Сканирует список URL и возвращает список responses.
-    • urls: список URL
-    Возвращает список структур.
-    """
-    results = []
-    for u in urls:
-        result = scan_url(u)
-        results.append(result)
-    return results
+def scan_multiple(urls: List[str]) -> List[Dict[str, Any]]:
+    """Сканирует список URL и возвращает список структур."""
+    return [scan_url(u) for u in urls]
 
+# ============================================================
+#  NDJSON логирование XSS
+# ============================================================
 
-# =======================
-# NDJSON логирование XSS
-# =======================
+LOG_DIR: Path = LOGS_DIR / "xss"
+LOG_FILE: Path = LOG_DIR / "reflected_responses.json"
 
-LOG_DIR = "logs/xss"
-LOG_FILE = os.path.join(LOG_DIR, "reflected_responses.json")
-
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 _write_lock = threading.Lock()
 
 
-def rotate_if_big(path: str, max_mb: int = 20) -> None:
-    """
-    Ротация логов, если файл слишком большой.
-    • path: путь к файлу
-    • max_mb: максимальный размер в мегабайтах
-    """
+def rotate_if_big(path: Path, max_mb: int = 20) -> None:
+    """Ротирует файл, если он превышает max_mb мегабайт."""
     try:
-        if os.path.exists(path) and os.path.getsize(path) > max_mb * 1024 * 1024:
-            ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-            backup = f"{path}.{ts}.bak"
-            os.rename(path, backup)
-            logging.info(f"[NDJSON] Лог {path} ротирован → {backup}")
+        if not path.exists():
+            return
+
+        size = path.stat().st_size
+        if size <= max_mb * 1024 * 1024:
+            return
+
+        ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        backup = path.with_suffix(path.suffix + f".{ts}.bak")
+        path.rename(backup)
+
+        logging.info(f"[NDJSON] Лог ротирован: {path} → {backup}")
     except Exception as e:
-        logging.error(f"[NDJSON] Ошибка ротации: {e}")
+        logging.error(f"[NDJSON] Ошибка ротации файла {path}: {e}", exc_info=True)
 
 
 def validate_result(result: Dict[str, Any]) -> bool:
-    """
-    Минимальная валидация структуры артефакта.
-    • result: словарь результата
-    """
+    """Минимальная валидация структуры XSS-артефакта."""
     required = {"url", "category", "context"}
     missing = required - result.keys()
+
     if missing:
-        logging.warning(f"[NDJSON] Пропущены поля: {missing}")
+        logging.warning(f"[NDJSON] Пропущены обязательные поля: {missing}")
         return False
     return True
 
 
 def save_reflected_response(result: Dict[str, Any]) -> None:
-    """
-    Сохраняет XSS-отражение в NDJSON формате.
-    • result: словарь результата
-    """
+    """Сохраняет XSS-отражение в NDJSON-файл."""
     try:
-        os.makedirs(LOG_DIR, exist_ok=True)
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
         result.setdefault("_ts", datetime.datetime.utcnow().isoformat())
 
         if not validate_result(result):
@@ -506,27 +563,24 @@ def save_reflected_response(result: Dict[str, Any]) -> None:
         rotate_if_big(LOG_FILE)
 
         with _write_lock:
-            with open(LOG_FILE, "a", encoding="utf-8") as f:
+            with LOG_FILE.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(result, ensure_ascii=False) + "\n")
 
-        logging.info(f"[NDJSON] Артефакт сохранён: {result.get('url')} [{result.get('category')}]")
-
+        logging.info(f"[NDJSON] Сохранён артефакт: {result.get('url')} [{result.get('category')}]")
     except Exception as e:
-        logging.error(f"[NDJSON] Ошибка записи: {e}")
+        logging.error(f"[NDJSON] Ошибка записи артефакта: {e}", exc_info=True)
 
 
-def load_reflected_responses(path: str = LOG_FILE) -> List[Dict[str, Any]]:
-    """
-    Загружает NDJSON файл и возвращает список словарей.
-    • path: путь к файлу
-    """
+def load_reflected_responses(path: Path = LOG_FILE) -> List[Dict[str, Any]]:
+    """Загружает NDJSON-файл и возвращает список артефактов."""
     results: List[Dict[str, Any]] = []
-    if not os.path.exists(path):
-        logging.warning(f"[NDJSON] Файл {path} не найден.")
+
+    if not path.exists():
+        logging.warning(f"[NDJSON] Файл не найден: {path}")
         return results
 
     try:
-        with open(path, encoding="utf-8") as f:
+        with path.open(encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -534,12 +588,13 @@ def load_reflected_responses(path: str = LOG_FILE) -> List[Dict[str, Any]]:
                 try:
                     results.append(json.loads(line))
                 except json.JSONDecodeError as e:
-                    logging.warning(f"[NDJSON] Ошибка декодирования строки: {e}")
+                    logging.warning(f"[NDJSON] Ошибка JSON в строке: {e}")
     except Exception as e:
-        logging.error(f"[NDJSON] Ошибка чтения файла {path}: {e}")
+        logging.error(f"[NDJSON] Ошибка чтения файла {path}: {e}", exc_info=True)
 
     logging.info(f"[NDJSON] Загружено {len(results)} артефактов из {path}")
     return results
+
 
 
 if __name__ == "__main__":
@@ -548,11 +603,14 @@ if __name__ == "__main__":
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[
             logging.FileHandler("logs/xss_ndjson.log", encoding="utf-8"),
-            logging.StreamHandler()
-        ]
+            logging.StreamHandler(),
+        ],
     )
 
     responses = load_reflected_responses()
     print(f"Загружено {len(responses)} результатов")
+
     for r in responses[:3]:
         print(r.get("url"), r.get("category"), r.get("context"))
+
+

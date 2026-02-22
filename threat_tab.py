@@ -1,4 +1,5 @@
 # xss_security_gui/threat_tab.py
+
 import threading
 import json
 import tkinter as tk
@@ -9,22 +10,23 @@ from xss_security_gui.threat_analysis.threat_connector import THREAT_CONNECTOR
 
 class ThreatAnalysisTab(ttk.Frame):
     """
-    Threat Intel Viewer ULTRA 5.0
+    Threat Intel Viewer ULTRA 7.0
 
-    - Двухпанельный интерфейс (summary + дерево)
-    - Фильтры по модулям
-    - Поиск по ключам и значениям
-    - Экспорт JSON
-    - Автообновление (потокобезопасно)
-    - Цветовые теги для уровней угроз (готово к расширению)
-    - Приём данных от других модулей (send_to_threat_intel)
+    - Потокобезопасное обновление
+    - Кэширование summary
+    - Универсальный рендерер дерева
+    - Фильтры, поиск, экспорт
+    - Защита от ошибок Tkinter при закрытии окна
     """
 
     def __init__(self, parent):
         super().__init__(parent)
 
+        self._last_summary: dict | None = None
+        self._reload_lock = threading.Lock()
+
         # ============================================================
-        # Верхняя панель управления
+        # Верхняя панель
         # ============================================================
         top = ttk.Frame(self)
         top.pack(fill="x", pady=3)
@@ -82,8 +84,6 @@ class ThreatAnalysisTab(ttk.Frame):
         self.tree.bind("<Button-3>", self._show_context_menu)
 
         # ============================================================
-        # Статусная строка
-        # ============================================================
         self.status_var = tk.StringVar(value="Готово")
         status = ttk.Label(self, textvariable=self.status_var, anchor="w")
         status.pack(side="bottom", fill="x")
@@ -91,83 +91,121 @@ class ThreatAnalysisTab(ttk.Frame):
         # Автообновление при старте
         self.reload_summary()
 
+    def _show_error(self, error: Exception):
+        """Безопасный вывод ошибки в GUI."""
+        if not self.winfo_exists():
+            return
+
+        self.text_widget.delete("1.0", "end")
+        self.text_widget.insert(
+            "1.0",
+            f"❌ Ошибка загрузки Threat Intel:\n{error}"
+        )
+
+        self.status_var.set("Ошибка Threat Intel")
+
+    def _render_empty(self, message: str):
+        """Показывает пустой результат или ошибку."""
+        if not self.winfo_exists():
+            return
+
+        self.tree.delete(*self.tree.get_children())
+        root = self.tree.insert("", "end", text="Пусто", open=True)
+        self.tree.insert(root, "end", text="→", values=(message,))
+
+        self.text_widget.delete("1.0", "end")
+        self.text_widget.insert("1.0", message)
+
+        self.status_var.set(message)
+
     # ============================================================
-    # Основные функции
+    # Основные методы
     # ============================================================
 
     def clear(self):
         """Полная очистка дерева и summary."""
-        try:
-            self.tree.delete(*self.tree.get_children())
-        except Exception:
-            pass
+        self.tree.delete(*self.tree.get_children())
         self.text_widget.delete("1.0", "end")
         self.status_var.set("Очищено")
 
     def reload_summary(self):
-        """Запускает обновление Threat Intel в отдельном потоке, не блокируя GUI."""
+        """Запускает обновление Threat Intel в отдельном потоке."""
+        if self._reload_lock.locked():
+            return  # не запускаем повторно
+
         self.status_var.set("Загрузка Threat Intel…")
         threading.Thread(target=self._reload_worker, daemon=True).start()
 
     def _reload_worker(self):
-        """Фоновая загрузка summary из ThreatConnector 6.0."""
-        try:
-            summary = THREAT_CONNECTOR.summary()
-        except Exception as e:
-            self.after(0, lambda: self._show_error(e))
-            return
-        self.after(0, lambda: self._apply_summary(summary))
+        """Фоновая загрузка summary."""
+        with self._reload_lock:
+            try:
+                summary = THREAT_CONNECTOR.summary()
+            except Exception as e:
+                # Передаём ошибку в главный поток
+                self.after(0, self._show_error, e)
+                return
+
+            self._last_summary = summary
+
+            # Передаём обновление GUI в главный поток
+            self.master.after(0, lambda: self._apply_summary(summary))
 
     def _apply_summary(self, summary: dict):
         """Обновляет GUI после фоновой загрузки."""
-        try:
-            self.text_widget.delete("1.0", "end")
-            self.text_widget.insert("1.0", json.dumps(summary, indent=2, ensure_ascii=False))
+        if not self.winfo_exists():
+            return
 
-            modules = list(summary.get("by_module", {}).keys())
-            self.filter_box["values"] = ["Все"] + modules
-            if modules:
-                self.filter_box.set("Все")
-            else:
-                self.filter_box.set("")
+        self.text_widget.delete("1.0", "end")
+        self.text_widget.insert("1.0", json.dumps(summary, indent=2, ensure_ascii=False))
 
-            self.load_results(summary)
-            self.status_var.set("Summary обновлён")
-        except Exception as e:
-            self._show_error(e)
+        modules = list(summary.get("by_module", {}).keys())
+        self.filter_box["values"] = ["Все"] + modules
+        self.filter_box.set("Все" if modules else "")
 
-    def _show_error(self, e: Exception):
-        """Показывает ошибку в текстовом поле и статусе."""
-        self.text_widget.insert("end", f"\n[⚠️] Ошибка Threat Intel: {e}\n")
-        self.status_var.set("Ошибка Threat Intel")
+        self.load_results(summary)
+        self.status_var.set("Summary обновлён")
+    # ============================================================
+    # Экспорт
+    # ============================================================
 
     def export_json(self):
         """Экспорт summary в JSON."""
-        try:
-            summary = THREAT_CONNECTOR.summary()
-            path = filedialog.asksaveasfilename(
-                defaultextension=".json",
-                filetypes=[("JSON files", "*.json")],
-            )
-            if not path:
+        summary = self._last_summary
+        if not summary:
+            try:
+                summary = THREAT_CONNECTOR.summary()
+            except Exception as e:
+                self.status_var.set(f"Ошибка экспорта: {e}")
                 return
+
+        path = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json")],
+        )
+        if not path:
+            return
+
+        try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(summary, f, indent=2, ensure_ascii=False)
             self.status_var.set(f"Экспортировано: {path}")
         except Exception as e:
             self.status_var.set(f"Ошибка экспорта: {e}")
 
+    # ============================================================
+    # Фильтр и поиск
+    # ============================================================
+
     def apply_filter(self):
-        """Фильтр по модулю."""
         module = self.filter_var.get()
-        try:
-            summary = THREAT_CONNECTOR.summary()
-        except Exception as e:
-            self._show_error(e)
+        summary = self._last_summary
+        if not summary:
             return
 
         if module == "Все" or not module:
             self.load_results(summary)
+            self.status_var.set("Фильтр: все модули")
             return
 
         filtered = {
@@ -180,15 +218,12 @@ class ThreatAnalysisTab(ttk.Frame):
         self.status_var.set(f"Фильтр по модулю: {module}")
 
     def apply_search(self):
-        """Поиск по ключам и значениям в summary."""
         query = self.search_var.get().lower().strip()
         if not query:
             return
 
-        try:
-            summary = THREAT_CONNECTOR.summary()
-        except Exception as e:
-            self._show_error(e)
+        summary = self._last_summary
+        if not summary:
             return
 
         self.tree.delete(*self.tree.get_children())
@@ -207,12 +242,8 @@ class ThreatAnalysisTab(ttk.Frame):
     # ============================================================
 
     def load_results(self, payload):
-        """Универсальный рендерер дерева для summary и внешних payload'ов."""
-        try:
-            self.tree.delete(*self.tree.get_children())
-        except Exception:
-            pass
-
+        """Универсальный рендерер дерева."""
+        self.tree.delete(*self.tree.get_children())
         root = self.tree.insert("", "end", text="Threat Intel", open=True)
 
         def render(parent, obj):
@@ -229,32 +260,16 @@ class ThreatAnalysisTab(ttk.Frame):
 
         render(root, payload)
 
-    def _render_empty(self, message: str):
-        """Отображает сообщение о пустых данных или ошибке в дереве."""
-        try:
-            self.tree.delete(*self.tree.get_children())
-        except Exception:
-            pass
-
-        self.tree.insert(
-            "",
-            "end",
-            text="⚠️ Нет данных",
-            values=(self._to_str(message),),
-            open=True,
-        )
+    # ============================================================
+    # Вспомогательные методы
+    # ============================================================
 
     def _to_str(self, value) -> str:
-        """Безопасное приведение к строке с ограничением длины."""
         try:
             text = str(value)
         except Exception:
             text = repr(value)
         return text[:2000] + "…" if len(text) > 2000 else text
-
-    # ============================================================
-    # Контекстное меню
-    # ============================================================
 
     def _show_context_menu(self, event):
         selected = self.tree.identify_row(event.y)

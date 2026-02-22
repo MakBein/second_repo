@@ -1476,9 +1476,9 @@ def deep_crawl_site(url: str) -> dict:
     }
 
     result = {
-        "pages": raw,
-        "details": pages,
+        "pages": pages,
         "summary": summary,
+        "raw": raw
     }
 
     os.makedirs(LOGS_DIR, exist_ok=True)

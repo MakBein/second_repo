@@ -21,7 +21,7 @@ from tkinter import ttk, messagebox
 # Универсальные импорты
 from xss_security_gui import settings
 from xss_security_gui.threat_analysis.threat_connector import THREAT_CONNECTOR
-from utils.threat_sender import ThreatSenderMixin
+from xss_security_gui.utils.threat_sender import ThreatSenderMixin
 from xss_security_gui.crawler import crawl_site, save_outputs
 from xss_security_gui.form_fuzzer import fuzz_form
 from xss_security_gui.param_fuzzer import fuzz_url_params

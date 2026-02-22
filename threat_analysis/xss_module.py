@@ -1,19 +1,21 @@
 # xss_security_gui/threat_analysis/xss_module.py
 import logging
-import requests
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
+import requests
+
 from xss_security_gui.threat_analysis.tester_base import TesterBase
+from xss_security_gui.settings import settings
 
 
 class XSSTester(TesterBase):
     """
-    Enterprise 6.0 XSS Tester
-    -------------------------
+    Enterprise 6.5 XSS Tester (ULTRA Hybrid)
+    ----------------------------------------
     • Проверяет отражение XSS payload'ов
     • Определяет контекст (HTML, JS, Attribute, URL)
-    • Возвращает унифицированный результат для Threat Intel
+    • Использует гибридные настройки из settings.py
     """
 
     def __init__(
@@ -23,12 +25,29 @@ class XSSTester(TesterBase):
         base_value: str,
         payloads: List[str],
         output_callback: Optional[callable] = None,
-        timeout: int = 7,
+        timeout: Optional[int] = None,
         headers: Optional[Dict[str, str]] = None
     ):
         super().__init__("XSS", base_url, param, base_value, payloads, output_callback)
-        self.timeout = timeout
-        self.headers = headers or {"User-Agent": "XSS-Security-GUI/6.0"}
+
+        # Таймаут из гибридных настроек (http.request_timeout) или fallback
+        self.timeout: int = timeout or int(settings.get("http.request_timeout", 7))
+
+        # User-Agent и заголовки из настроек
+        default_ua = settings.get("http.default_user_agent", "XSS-Security-GUI/6.0")
+        base_headers = {
+            "User-Agent": default_ua
+        }
+
+        if headers:
+            base_headers.update(headers)
+
+        self.headers: Dict[str, str] = base_headers
+
+        # Логирование уровня из настроек (если нужно)
+        log_level = settings.get("logging.level")
+        if isinstance(log_level, str):
+            logging.getLogger(__name__).setLevel(getattr(logging, log_level.upper(), logging.INFO))
 
     def _test_single(self, category: str, payload: str, full_value: str) -> Dict[str, Any]:
         result: Dict[str, Any] = {
@@ -77,7 +96,10 @@ class XSSTester(TesterBase):
                 "final_url": r.url
             })
 
-            logging.debug(f"[XSSTester] {self.base_url} param={self.param} payload={payload} status={status}")
+            logging.debug(
+                f"[XSSTester] {self.base_url} param={self.param} "
+                f"payload={payload} status={status} context={context_type}"
+            )
             return result
 
         except Exception as e:

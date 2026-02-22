@@ -1,4 +1,5 @@
 # xss_security_gui/auto_recon/analyzer.py
+
 import logging
 import time
 import json
@@ -11,9 +12,19 @@ from xss_security_gui.threat_analysis.dom_xss_detector import DOMXSSDetector
 from xss_security_gui.threat_analysis.csrf_analyzer import CSRFAnalyzer
 from xss_security_gui.threat_analysis.sqli_module import SQLiTester
 from xss_security_gui.threat_analysis.ssrf_module import SSRFTester
-from xss_security_gui.auto_recon.token_extractor import extract_tokens, analyze_tokens, save_token_log
+
+from xss_security_gui.auto_recon.token_extractor import (
+    extract_tokens,
+    analyze_tokens,
+    save_token_log,
+)
+
 from xss_security_gui import DIRS
 
+
+# ============================================================
+#  Простые анализаторы структуры страницы
+# ============================================================
 
 def analyze_page(html: str, url: str) -> dict:
     lower = html.lower()
@@ -22,7 +33,10 @@ def analyze_page(html: str, url: str) -> dict:
         "length": len(html),
         "has_script": "<script" in lower,
         "has_form": "<form" in lower,
-        "keywords": [k for k in ["login", "password", "token", "auth"] if k in lower]
+        "keywords": [
+            k for k in ["login", "password", "token", "auth"]
+            if k in lower
+        ],
     }
 
 
@@ -39,9 +53,14 @@ def analyze_structure(html: str) -> dict:
     }
 
 
+# ============================================================
+#  AutoRecon Analyzer 6.0
+# ============================================================
+
 class AutoReconAnalyzerV2:
     """
     Enterprise 6.0 AutoRecon Analyzer
+
     • Объединяет все анализаторы (CSP, DOM-XSS, CSRF, SQLi, SSRF, Tokens, Headers)
     • Логирует результаты в NDJSON и ThreatConnector
     • Возвращает унифицированный отчёт
@@ -50,6 +69,7 @@ class AutoReconAnalyzerV2:
     def __init__(self, threat_connector: ThreatConnector):
         self.connector = threat_connector
 
+        # Собранные отчёты
         self.token_report: List[Dict[str, Any]] = []
         self.csrf_report: List[Dict[str, Any]] = []
         self.sqli_report: List[Dict[str, Any]] = []
@@ -60,11 +80,15 @@ class AutoReconAnalyzerV2:
         self.page_report: List[Dict[str, Any]] = []
         self.structure_report: List[Dict[str, Any]] = []
 
+        # Анализаторы
         self.csp_analyzer = CSPAnalyzer(threat_tab=self.connector)
         self.dom_analyzer = DOMXSSDetector(threat_tab=self.connector)
 
+        # NDJSON лог
         self.log_path = os.path.join(DIRS["logs"], "analysis_results.ndjson")
         os.makedirs(DIRS["logs"], exist_ok=True)
+
+    # --------------------------------------------------------
 
     def _log_ndjson(self, entry: dict):
         try:
@@ -72,6 +96,8 @@ class AutoReconAnalyzerV2:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception as e:
             logging.error(f"[AutoReconAnalyzerV2] NDJSON log error: {e}")
+
+    # --------------------------------------------------------
 
     def analyze_security_headers(self, headers: dict) -> dict:
         return {
@@ -81,6 +107,8 @@ class AutoReconAnalyzerV2:
             "permissions_policy": headers.get("Permissions-Policy"),
             "strict_transport_security": headers.get("Strict-Transport-Security"),
         }
+
+    # --------------------------------------------------------
 
     def analyze(self, responses: List[Dict[str, Any]]) -> Dict[str, Any]:
         for r in responses:
@@ -110,7 +138,7 @@ class AutoReconAnalyzerV2:
             csrf_entry = {
                 "tokens": csrf_tokens,
                 "headers": csrf_headers,
-                "severity": "medium" if not csrf_tokens else "low"
+                "severity": "medium" if not csrf_tokens else "low",
             }
             if csrf_tokens or csrf_headers:
                 self.csrf_report.append({"url": url, **csrf_entry})
@@ -119,14 +147,22 @@ class AutoReconAnalyzerV2:
 
             # 4. SQLi
             sqli = SQLiTester(url, "id", "1", ["' OR 1=1 --"], None)
-            sqli_result = sqli._test_single("AutoRecon", "' OR 1=1 --", "1' OR 1=1 --")
+            sqli_result = sqli._test_single(
+                "AutoRecon",
+                "' OR 1=1 --",
+                "1' OR 1=1 --",
+            )
             self.sqli_report.append({"url": url, "results": [sqli_result]})
             self.connector.add_artifact("SQLi", url, [sqli_result])
             result_entry["sqli"] = sqli_result
 
             # 5. SSRF
             ssrf = SSRFTester(url, "url", "", ["http://127.0.0.1"], None)
-            ssrf_result = ssrf._test_single("AutoRecon", "http://127.0.0.1", "http://127.0.0.1")
+            ssrf_result = ssrf._test_single(
+                "AutoRecon",
+                "http://127.0.0.1",
+                "http://127.0.0.1",
+            )
             self.ssrf_report.append({"url": url, "results": [ssrf_result]})
             self.connector.add_artifact("SSRF", url, [ssrf_result])
             result_entry["ssrf"] = ssrf_result
@@ -173,9 +209,13 @@ class AutoReconAnalyzerV2:
             "security_headers": self.security_headers_report,
             "page": self.page_report,
             "structure": self.structure_report,
-            "threat_summary": self.connector.summary()
+            "threat_summary": self.connector.summary(),
         }
 
+
+# ============================================================
+#  Публичный API модуля
+# ============================================================
 
 __all__ = [
     "AutoReconAnalyzerV2",

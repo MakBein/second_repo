@@ -1,7 +1,7 @@
 # xss_security_gui/full_analysis_tab.py
 
 from tkinter import ttk
-from utils.threat_sender import ThreatSenderMixin
+from xss_security_gui.utils.threat_sender import ThreatSenderMixin
 
 
 class FullAnalysisTab(ttk.Frame, ThreatSenderMixin):

@@ -1,7 +1,7 @@
 # xss_security_gui/threat_analysis/csrf_module.py
 import requests
 from datetime import datetime
-from threat_analysis.tester_base import TesterBase
+from xss_security_gui.threat_analysis.tester_base import TesterBase
 
 
 class CSRFTester(TesterBase):

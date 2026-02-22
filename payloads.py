@@ -121,8 +121,14 @@ class PayloadManager:
     # --------------------------------------------------------
     #  Получение payload’ов категории
     # --------------------------------------------------------
-    def get(self, category: str) -> List[str]:
-        return self.cache.get(category, [])
+    def get(self, category: str, default=None) -> List[str]:
+        """
+        Совместимость с dict.get(category, default)
+        Используется в analyzer.py и других модулях.
+        """
+        if default is None:
+            default = []
+        return self.cache.get(category, default)
 
     # --------------------------------------------------------
     #  Проверка существования payload’а
@@ -230,3 +236,24 @@ add_payload = PAYLOADS.add
 get_stats = PAYLOADS.stats
 get_categories = PAYLOADS.get_categories
 load_payloads = lambda: None
+
+# ============================================================
+#  Универсальный генератор payload’ов
+# ============================================================
+
+def generate_payloads() -> Dict[str, List[str]]:
+    """
+    Возвращает словарь всех payload’ов по категориям.
+    Используется в GUI (например, ExploitTab, SiteMapTab).
+    """
+    return {cat: PAYLOADS.get(cat, []) for cat in PAYLOADS.get_categories()}
+
+def gen_payloads_from_templates() -> dict[str, list[str]]:
+    """
+    Генерирует словарь payload’ов по категориям из базы PayloadManager.
+    Используется в ExploitTab и других GUI-компонентах.
+    """
+    return {
+        cat: PAYLOADS.get(cat, [])
+        for cat in PAYLOADS.get_categories()
+    }

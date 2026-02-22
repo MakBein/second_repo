@@ -58,6 +58,7 @@ def attack_found_targets(engine, scripts, payloads=None, methods=None):
                     }
                     engine._record_result("endpoint_attack", result)
 
+
 # === DOM-вектора ===
 def attack_dom_vectors(engine, scripts, dom_payloads=None):
     dom_payloads = dom_payloads or {
@@ -102,6 +103,7 @@ def attack_dom_vectors(engine, scripts, dom_payloads=None):
                     "severity": "error"
                 })
 
+
 # === Генератор заголовков ===
 def build_headers_list(tokens):
     headers_set = [
@@ -123,7 +125,9 @@ def build_headers_list(tokens):
 
     return headers_set
 
-# === API Endpoints ===
+
+# === Нові модулі ===
+
 def attack_api_endpoints(engine, session, base_url, endpoints, headers_list, log_func):
     log_func("🔷 API Endpoint Attacks...")
     for ep in endpoints:
@@ -144,8 +148,8 @@ def attack_api_endpoints(engine, session, base_url, endpoints, headers_list, log
                     "severity": "error"
                 })
 
-# === Token Brute Force ===
-def attack_tokens(engine, session, base_url, token_candidates, log_func):
+
+def brute_force_tokens(engine, session, base_url, token_candidates, log_func):
     log_func("🔷 Token Brute Force...")
     for token in token_candidates:
         try:
@@ -163,7 +167,7 @@ def attack_tokens(engine, session, base_url, token_candidates, log_func):
                 "severity": "error"
             })
 
-# === Parameters ===
+
 def attack_parameters(engine, session, base_url, parameters, log_func):
     log_func("🔷 Parameter Attacks...")
     for param in parameters:
@@ -184,7 +188,7 @@ def attack_parameters(engine, session, base_url, parameters, log_func):
                 "severity": "error"
             })
 
-# === User IDs ===
+
 def attack_user_ids(engine, session, base_url, user_ids, log_func):
     log_func("🔷 User ID Attacks...")
     for uid in user_ids:
@@ -203,7 +207,7 @@ def attack_user_ids(engine, session, base_url, user_ids, log_func):
                 "severity": "error"
             })
 
-# === XSS Targets ===
+
 def attack_xss_targets(engine, session, base_url, xss_targets, log_func):
     log_func("🔷 XSS Target Attacks...")
     for target in xss_targets:

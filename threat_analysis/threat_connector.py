@@ -517,10 +517,14 @@ class ThreatConnector:
     def _flush_batch(self, batch: List[Dict[str, Any]]) -> None:
         try:
             self.backend.add_batch(batch)
+            self.log.info(f"[ThreatIntel] Flushed {len(batch)} artifacts")
             for a in batch:
-                self.log.info(f"[ThreatIntel] {a['module']} → {a['target']}")
+                self.log.debug(f"[ThreatIntel] {a.get('module')} → {a.get('target')}")
         except Exception:
             self.log.error("Failed to flush batch to backend", exc_info=True)
+        finally:
+            # очищаем батч независимо от результата
+            batch.clear()
 
     # ---------------------------------------------------------
     #  Управление жизненным циклом
