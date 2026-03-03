@@ -1,6 +1,6 @@
 # xss_security_gui/config_manager.py
 """
-config_manager.py — единая система конфигурации XSS Security GUI (v3.0)
+config_manager.py — единая система конфигурации XSS Security GUI (v3.3 ULTRA)
 Автор: Aleksandr + Copilot
 """
 
@@ -8,6 +8,7 @@ import os
 import json
 from pathlib import Path
 from dotenv import load_dotenv
+import xss_security_gui
 from xss_security_gui.settings import LOG_DIR
 
 
@@ -15,17 +16,16 @@ from xss_security_gui.settings import LOG_DIR
 # 📁 БАЗОВЫЕ ДИРЕКТОРИИ
 # ================================
 
-BASE_DIR: Path = Path(__file__).parent.resolve()
+# Абсолютный путь к корню пакета (работает везде: GUI, PyCharm, REPL, exe)
+BASE_DIR: Path = Path(xss_security_gui.__file__).parent.resolve()
 
 LOGS_DIR: Path = BASE_DIR / "logs"
-CONFIGS_DIR: Path = BASE_DIR / "configs"
+CONFIGS_DIR: Path = BASE_DIR / "target"
 PAYLOADS_DIR: Path = BASE_DIR / "payloads"
 EXPORTS_DIR: Path = BASE_DIR / "exports"
 
-# Автосоздание директорий
 for d in (LOGS_DIR, CONFIGS_DIR, PAYLOADS_DIR, EXPORTS_DIR):
     d.mkdir(parents=True, exist_ok=True)
-
 
 # ================================
 # 📄 ПУТИ К ФАЙЛАМ
@@ -53,6 +53,7 @@ JSON_EXPORT_PATH = EXPORTS_DIR / "json"
 
 PDF_EXPORT_PATH.mkdir(parents=True, exist_ok=True)
 JSON_EXPORT_PATH.mkdir(parents=True, exist_ok=True)
+
 # === Новые алиасы для OverviewTab и других модулей ===
 THREAT_LOG_PATH = LOGS_DIR / "threat_intel.log"
 LOG_HONEYPOT_HITS = LOGS_DIR / "honeypot_hits.log"
@@ -77,7 +78,6 @@ def load_json(path: Path) -> dict:
     if not path.exists():
         print(f"[⚠] Файл не найден: {path}")
         return {}
-
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception as e:
@@ -86,17 +86,18 @@ def load_json(path: Path) -> dict:
 
 
 def load_settings() -> dict:
-    """Загружает settings.json."""
-    return load_json(SETTINGS_JSON_PATH)
+    """Загружает settings.json, fallback на default_config.json."""
+    cfg = load_json(SETTINGS_JSON_PATH)
+    if not cfg:
+        cfg = load_json(DEFAULT_CONFIG_PATH)
+    return cfg
 
 
 def load_default_config() -> dict:
-    """Загружает default_config.json."""
     return load_json(DEFAULT_CONFIG_PATH)
 
 
 def load_user_config() -> dict:
-    """Загружает user_config.json."""
     return load_json(USER_CONFIG_PATH)
 
 
@@ -116,11 +117,12 @@ def validate_config(cfg: dict) -> dict:
     """Проверяет корректность ключевых параметров."""
     validated = cfg.copy()
 
-    # Пример валидации
-    if validated.get("honeypot", {}).get("poll_interval", 0) < 1:
+    validated.setdefault("honeypot", {})
+    if validated["honeypot"].get("poll_interval", 0) < 1:
         validated["honeypot"]["poll_interval"] = 4
 
-    if validated.get("gui", {}).get("max_report_line_length", 0) < 50:
+    validated.setdefault("gui", {})
+    if validated["gui"].get("max_report_line_length", 0) < 50:
         validated["gui"]["max_report_line_length"] = 110
 
     return validated
@@ -135,11 +137,10 @@ def load_full_config() -> dict:
     Загружает:
     - default_config.json
     - user_config.json
-    - settings.json
+    - settings.json (с fallback)
     - .env
     Объединяет всё в один словарь.
     """
-
     cfg_default = load_default_config()
     cfg_user = load_user_config()
     cfg_settings = load_settings()

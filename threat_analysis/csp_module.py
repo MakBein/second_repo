@@ -1,27 +1,30 @@
 # xss_security_gui/threat_analysis/csp_module.py
+"""
+CSPAnalyzer 2.1
+---------------
+Анализатор Content-Security-Policy:
+• Полный парсинг директив
+• Определение слабых мест
+• Severity-оценка
+• Threat Intel-friendly структура
+"""
 
 from typing import Dict, Any, List
 
 
 class CSPAnalyzer:
-    """
-    CSPAnalyzer 2.0
-    ----------------
-    Покращений аналізатор Content-Security-Policy з:
-    • повним парсингом директив
-    • визначенням слабких місць
-    • severity-оцінкою
-    • Threat Intel-friendly структурою
-    """
+    """Модуль анализа CSP-заголовков."""
 
-    WEAK_SOURCES = ["data:", "blob:", "*"]
-    DANGEROUS_FLAGS = ["'unsafe-inline'", "'unsafe-eval'"]
+    DEFAULT_WEAK_SOURCES = ["data:", "blob:", "*"]
+    DEFAULT_DANGEROUS_FLAGS = ["'unsafe-inline'", "'unsafe-eval'"]
 
-    def __init__(self, threat_tab=None):
+    def __init__(self, threat_tab=None, weak_sources: List[str] | None = None, dangerous_flags: List[str] | None = None):
         self.threat_tab = threat_tab
+        self.WEAK_SOURCES = weak_sources if weak_sources is not None else self.DEFAULT_WEAK_SOURCES
+        self.DANGEROUS_FLAGS = dangerous_flags if dangerous_flags is not None else self.DEFAULT_DANGEROUS_FLAGS
 
     # ---------------------------------------------------------
-    # Основний метод
+    # Основной метод
     # ---------------------------------------------------------
     def run(self, page_data: Dict[str, Any]) -> Dict[str, Any]:
         headers = page_data.get("headers", {})
@@ -29,33 +32,34 @@ class CSPAnalyzer:
 
         if not csp:
             result = {
+                "status": "success",
                 "present": False,
-                "severity": "critical",
+                "severity": "CRITICAL",
                 "issues": ["CSP header missing"],
                 "directives": {},
-                "raw": ""
+                "raw": "",
             }
             self._report(result)
             return result
 
         directives = self._parse_csp(csp)
         issues = self._analyze_directives(directives)
-
         severity = self._calculate_severity(issues)
 
         result = {
+            "status": "success",
             "present": True,
             "severity": severity,
             "issues": issues,
             "directives": directives,
-            "raw": csp
+            "raw": csp,
         }
 
         self._report(result)
         return result
 
     # ---------------------------------------------------------
-    # Парсинг CSP у dict
+    # Парсинг CSP в dict
     # ---------------------------------------------------------
     def _parse_csp(self, header: str) -> Dict[str, List[str]]:
         directives: Dict[str, List[str]] = {}
@@ -72,63 +76,47 @@ class CSPAnalyzer:
         return directives
 
     # ---------------------------------------------------------
-    # Аналіз директив
+    # Анализ директив
     # ---------------------------------------------------------
     def _analyze_directives(self, directives: Dict[str, List[str]]) -> List[str]:
         issues = []
-
         script_src = directives.get("script-src") or directives.get("default-src") or []
 
-        # Небезпечні флаги
+        # Опасные флаги
         for flag in self.DANGEROUS_FLAGS:
             if flag in script_src:
                 issues.append(f"DANGEROUS: {flag} detected")
 
-        # Нестабільні джерела
+        # Слабые источники
         for weak in self.WEAK_SOURCES:
             if weak in script_src:
                 issues.append(f"WEAK_SOURCE: script-src contains {weak}")
 
-        # Відсутність script-src
-        if "script-src" not in directives:
-            issues.append("MISSING: script-src directive missing")
-
-        # Відсутність object-src (важливо для XSS)
-        if "object-src" not in directives:
-            issues.append("MISSING: object-src directive missing")
-
-        # Відсутність base-uri
-        if "base-uri" not in directives:
-            issues.append("MISSING: base-uri directive missing")
-
-        # Відсутність frame-ancestors
-        if "frame-ancestors" not in directives:
-            issues.append("MISSING: frame-ancestors directive missing")
+        # Критичные отсутствующие директивы
+        for required in ["script-src", "object-src", "base-uri", "frame-ancestors"]:
+            if required not in directives:
+                issues.append(f"MISSING: {required} directive missing")
 
         return issues
 
     # ---------------------------------------------------------
-    # Severity логіка
+    # Severity логика
     # ---------------------------------------------------------
     def _calculate_severity(self, issues: List[str]) -> str:
         if not issues:
-            return "strong"
-
+            return "STRONG"
         if any("DANGEROUS" in i for i in issues):
-            return "high"
-
+            return "HIGH"
         if any("WEAK_SOURCE" in i for i in issues):
-            return "medium"
-
+            return "MEDIUM"
         if any("MISSING" in i for i in issues):
-            return "medium"
-
-        return "low"
+            return "MEDIUM"
+        return "LOW"
 
     # ---------------------------------------------------------
-    # Threat Intel інтеграція
+    # Threat Intel интеграция
     # ---------------------------------------------------------
-    def _report(self, result: Dict[str, Any]):
+    def _report(self, result: Dict[str, Any]) -> None:
         if not self.threat_tab:
             return
 
@@ -138,5 +126,5 @@ class CSPAnalyzer:
             "issues": result["issues"],
             "directives": result["directives"],
             "raw": result["raw"],
-            "source": "CSPAnalyzer"
+            "source": "CSPAnalyzer",
         })

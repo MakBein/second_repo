@@ -34,7 +34,7 @@ LOG_DIR: Path = BASE_DIR / "logs"
 EXPORT_DIR: Path = BASE_DIR / "exports"
 PDF_DIR: Path = EXPORT_DIR / "reports"
 PAYLOADS_DIR: Path = BASE_DIR / "payloads"
-CONFIG_DIR: Path = BASE_DIR / "configs"
+CONFIG_DIR: Path = BASE_DIR / "target"
 
 
 for d in (LOG_DIR, EXPORT_DIR, PDF_DIR, PAYLOADS_DIR, CONFIG_DIR):
@@ -214,6 +214,7 @@ class Settings:
             "payloads.sqli_file": str(PAYLOADS_DIR / "sqli.json"),
             "payloads.xss_file": str(PAYLOADS_DIR / "xss.json"),
             "payloads.ssrf_file": str(PAYLOADS_DIR / "ssrf.json"),
+            "payloads.csrf_file": str(PAYLOADS_DIR / "csrf.json"),
 
             # Threat Intel artifacts
             "threat.artifact_path": str(LOG_DIR / "threat_intel_artifact.json"),
@@ -274,6 +275,10 @@ ENABLE_AUTO_TRAPS = settings.get("honeypot.enable", True)
 CRAWL_DEPTH_LIMIT = settings.get("crawl.depth_limit")
 CRAWL_DOMAINS_WHITELIST = settings.get("crawl.domains_whitelist")
 CRAWLER_ERROR_LOG = settings.get("crawl.error_log")
+# Логи и артефакты краулера
+LOG_CRAWL_STRUCTURE_PATH = LOG_DIR / "crawl_structure.log"
+LOG_CRAWL_GRAPH_DOT = LOG_DIR / "crawl_graph.dot"
+LOG_CRAWL_GRAPH_SVG = LOG_DIR / "crawl_graph.svg"
 
 PARAM_FUZZ_LOG_PATH = LOG_DIR / "form_fuzz_hits.log"   # исправлено
 MAX_REPORT_LINE_LENGTH = settings.get("export.max_line_length", 110)
@@ -303,7 +308,12 @@ def crawler_results_path() -> Path:
     Используется в main.py, overview_tab.py и других модулях.
     """
     return LOG_DIR / "crawler_results.json"
+# ============================================================
+#  Backward compatibility: CONFIG alias
+# ============================================================
 
+# CONFIG — это просто ссылка на settings.data (словарь всех настроек)
+CONFIG = settings.data
 
 # ============================================================
 #  ULTRA 6.5 — Автоматический валидатор настроек
@@ -373,6 +383,13 @@ class SettingsValidator:
                         f"(ожидалось {expected_type.__name__}, получено {type(value).__name__})"
                     )
 
+                # Дополнительные проверки
+                if expected_type is int and isinstance(value, int) and value < 0:
+                    errors.append(f"Недопустимое значение: {full_key} < 0")
+
+                if expected_type is str and isinstance(value, str) and not value.strip():
+                    errors.append(f"Пустая строка: {full_key}")
+
         return errors
 
 
@@ -407,7 +424,7 @@ SSRF_HEADER_INDICATORS = settings.get("ssrf.header_indicators")
 SQLI_PAYLOAD_FILE = settings.get("payloads.sqli_file")
 XSS_PAYLOAD_FILE = settings.get("payloads.xss_file")
 SSRF_PAYLOAD_FILE = settings.get("payloads.ssrf_file")
-
+CSRF_PAYLOAD_FILE = settings.get("payloads.csrf_file")
 THREAT_INTEL_ARTIFACT_PATH = Path(settings.get("threat.artifact_path"))
 
 # ============================================================
@@ -415,7 +432,7 @@ THREAT_INTEL_ARTIFACT_PATH = Path(settings.get("threat.artifact_path"))
 # ============================================================
 
 __all__ = [
-    "settings", "Settings",
+    "settings", "Settings", "CONFIG",
     "BASE_DIR", "LOG_DIR", "EXPORT_DIR", "PDF_DIR", "PAYLOADS_DIR",
 
     "JSON_CRAWL_EXPORT_PATH", "LOG_SUCCESS_PATH",
@@ -427,16 +444,15 @@ __all__ = [
     "DEEP_CRAWL_JSON_PATH", "DEEP_ANALYSIS_EXPORT_PATH",
     "ATTACK_PLAN_PATH", "ATTACK_LOGS_PATH",
     "HONEYPOT_EVENTS_JSONL", "NETWORK_LOG_PATH",
-
     "DOMParser",
 
-    # Новые алиасы
+    "LOG_CRAWL_STRUCTURE_PATH", "LOG_CRAWL_GRAPH_DOT", "LOG_CRAWL_GRAPH_SVG",
+
     "REQUEST_TIMEOUT", "DEFAULT_USER_AGENT",
     "IDOR_DELAY",
     "LFI_DELAY", "LFI_PAYLOADS", "LFI_SIGNATURES",
     "SQLI_ERROR_INDICATORS", "SQLI_WAF_INDICATORS",
     "SSRF_BODY_INDICATORS", "SSRF_HEADER_INDICATORS",
-    "SQLI_PAYLOAD_FILE", "XSS_PAYLOAD_FILE", "SSRF_PAYLOAD_FILE",
+    "SQLI_PAYLOAD_FILE", "XSS_PAYLOAD_FILE", "SSRF_PAYLOAD_FILE", "CSRF_PAYLOAD_FILE",
     "THREAT_INTEL_ARTIFACT_PATH", "crawler_results_path",
-
 ]

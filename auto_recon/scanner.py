@@ -406,33 +406,6 @@ class EndpointScanner:
 
         return results
 
-    # ============================================================
-    #  GUI callback
-    # ============================================================
-    def _report_gui(self, data: Dict[str, Any]):
-        """
-        Безопасная отправка данных в GUI.
-
-        Args:
-            data: словарь результата или ошибки
-        """
-        data.setdefault("timestamp", datetime.datetime.utcnow().isoformat())
-        wrapped = {"scanner": data}
-
-        # Логирование
-        if "error" in data:
-            logging.error(f"[GUI] {data.get('error')}")
-        elif data.get("vulnerable"):
-            logging.info(f"[GUI] XSS найден: {data.get('url')} payload={data.get('payload')}")
-        else:
-            logging.info(f"[GUI] {data.get('url')} → {data.get('status')}")
-
-        if self.gui_callback:
-            try:
-                self.gui_callback(wrapped)
-            except Exception as e:
-                logging.warning(f"[GUI] Ошибка при вызове callback: {e}")
-
 # ============================================================
 #  Вспомогательные функции
 # ============================================================

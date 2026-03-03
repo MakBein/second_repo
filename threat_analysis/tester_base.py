@@ -1,4 +1,13 @@
 # xss_security_gui/threat_analysis/tester_base.py
+"""
+TesterBase (ULTRA Hybrid 6.5)
+-----------------------------
+Базовый класс для всех тестеров (SQLi, XSS, CSRF, SSRF, LFI, RCE).
+• Поддерживает гибридные настройки (таймауты, ретраи, User-Agent).
+• Централизованная отправка артефактов в ThreatConnector.
+• Единая система логирования.
+"""
+
 import threading
 import logging
 import time
@@ -9,14 +18,7 @@ from xss_security_gui.settings import settings
 
 
 class TesterBase(threading.Thread):
-    """
-    Enterprise 6.5 TesterBase (ULTRA Hybrid)
-    ----------------------------------------
-    • Базовый класс для всех тестеров (SQLi, XSS, CSRF, SSRF, LFI, RCE)
-    • Поддерживает гибридные настройки (таймауты, ретраи, User-Agent)
-    • Централизованная отправка артефактов в ThreatConnector
-    • Единая система логирования
-    """
+    """Базовый класс для тестеров уязвимостей."""
 
     def __init__(
         self,
@@ -25,7 +27,7 @@ class TesterBase(threading.Thread):
         param: str,
         base_value: str,
         payloads: Dict[str, List[str]],
-        output_callback: Optional[callable] = None
+        output_callback: Optional[callable] = None,
     ):
         super().__init__()
 
@@ -51,14 +53,15 @@ class TesterBase(threading.Thread):
         }
 
         # Логирование
+        self.logger = logging.getLogger(f"{__name__}.{self.module_name}")
         log_level = settings.get("logging.level", "INFO").upper()
-        logging.getLogger(__name__).setLevel(getattr(logging, log_level, logging.INFO))
+        self.logger.setLevel(getattr(logging, log_level, logging.INFO))
 
     # ============================================================
     #  Основной поток тестирования
     # ============================================================
     def run(self) -> None:
-        logging.info(f"[{self.module_name}] Запуск тестирования для {self.base_url}")
+        self.logger.info(f"[{self.module_name}] Запуск тестирования для {self.base_url}")
 
         for category, plist in self.payloads.items():
             for payload in plist:
@@ -74,19 +77,19 @@ class TesterBase(threading.Thread):
         # Отправка артефактов в ThreatConnector
         if self.results:
             self.connector.add_artifact(self.module_name, self.base_url, self.results)
-            logging.info(
+            self.logger.info(
                 f"[{self.module_name}] {len(self.results)} результатов отправлено в ThreatConnector"
             )
 
     # ============================================================
     #  Ретраи (повторные попытки)
     # ============================================================
-    def _execute_with_retries(self, category: str, payload: str, full_value: str):
+    def _execute_with_retries(self, category: str, payload: str, full_value: str) -> Optional[Dict[str, Any]]:
         for attempt in range(1, self.max_retries + 1):
             try:
                 return self._test_single(category, payload, full_value)
             except Exception as e:
-                logging.error(
+                self.logger.error(
                     f"[{self.module_name}] Ошибка payload={payload} "
                     f"(попытка {attempt}/{self.max_retries}): {e}"
                 )
@@ -99,3 +102,18 @@ class TesterBase(threading.Thread):
     # ============================================================
     def _test_single(self, category: str, payload: str, full_value: str) -> Dict[str, Any]:
         raise NotImplementedError("Подкласс должен реализовать _test_single()")
+
+    # ============================================================
+    #  Унифицированный формат результата
+    # ============================================================
+    def _format_result(self, category: str, payload: str, severity: str, details: Any) -> Dict[str, Any]:
+        return {
+            "module": self.module_name,
+            "url": self.base_url,
+            "param": self.param,
+            "payload": payload,
+            "category": category,
+            "severity": severity,
+            "details": details,
+            "status": "success",
+        }

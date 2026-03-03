@@ -1,5 +1,4 @@
 # xss_security_gui/auto_recon/analyzer.py
-
 import logging
 import time
 import json
@@ -25,22 +24,20 @@ from xss_security_gui import DIRS
 # ============================================================
 #  Простые анализаторы структуры страницы
 # ============================================================
-
 def analyze_page(html: str, url: str) -> dict:
+    """Простейший анализ содержимого страницы."""
     lower = html.lower()
     return {
         "url": url,
         "length": len(html),
         "has_script": "<script" in lower,
         "has_form": "<form" in lower,
-        "keywords": [
-            k for k in ["login", "password", "token", "auth"]
-            if k in lower
-        ],
+        "keywords": [k for k in ["login", "password", "token", "auth"] if k in lower],
     }
 
 
 def analyze_structure(html: str) -> dict:
+    """Подсчёт базовых HTML-тегов."""
     lower = html.lower()
     return {
         "tags": {
@@ -56,7 +53,6 @@ def analyze_structure(html: str) -> dict:
 # ============================================================
 #  AutoRecon Analyzer 6.0
 # ============================================================
-
 class AutoReconAnalyzerV2:
     """
     Enterprise 6.0 AutoRecon Analyzer
@@ -88,18 +84,16 @@ class AutoReconAnalyzerV2:
         self.log_path = os.path.join(DIRS["logs"], "analysis_results.ndjson")
         os.makedirs(DIRS["logs"], exist_ok=True)
 
-    # --------------------------------------------------------
-
     def _log_ndjson(self, entry: dict):
+        """Записывает результат анализа в NDJSON-лог."""
         try:
             with open(self.log_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception as e:
             logging.error(f"[AutoReconAnalyzerV2] NDJSON log error: {e}")
 
-    # --------------------------------------------------------
-
     def analyze_security_headers(self, headers: dict) -> dict:
+        """Анализ базовых security-заголовков."""
         return {
             "x_frame_options": headers.get("X-Frame-Options"),
             "x_content_type_options": headers.get("X-Content-Type-Options"),
@@ -108,9 +102,8 @@ class AutoReconAnalyzerV2:
             "strict_transport_security": headers.get("Strict-Transport-Security"),
         }
 
-    # --------------------------------------------------------
-
     def analyze(self, responses: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Запускает полный анализ набора HTTP-ответов."""
         for r in responses:
             start = time.time()
             url = r.get("url", "")
@@ -147,22 +140,14 @@ class AutoReconAnalyzerV2:
 
             # 4. SQLi
             sqli = SQLiTester(url, "id", "1", ["' OR 1=1 --"], None)
-            sqli_result = sqli._test_single(
-                "AutoRecon",
-                "' OR 1=1 --",
-                "1' OR 1=1 --",
-            )
+            sqli_result = sqli._test_single("AutoRecon", "' OR 1=1 --", "1' OR 1=1 --")
             self.sqli_report.append({"url": url, "results": [sqli_result]})
             self.connector.add_artifact("SQLi", url, [sqli_result])
             result_entry["sqli"] = sqli_result
 
             # 5. SSRF
             ssrf = SSRFTester(url, "url", "", ["http://127.0.0.1"], None)
-            ssrf_result = ssrf._test_single(
-                "AutoRecon",
-                "http://127.0.0.1",
-                "http://127.0.0.1",
-            )
+            ssrf_result = ssrf._test_single("AutoRecon", "http://127.0.0.1", "http://127.0.0.1")
             self.ssrf_report.append({"url": url, "results": [ssrf_result]})
             self.connector.add_artifact("SSRF", url, [ssrf_result])
             result_entry["ssrf"] = ssrf_result
@@ -216,7 +201,6 @@ class AutoReconAnalyzerV2:
 # ============================================================
 #  Публичный API модуля
 # ============================================================
-
 __all__ = [
     "AutoReconAnalyzerV2",
     "analyze_page",

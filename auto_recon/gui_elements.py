@@ -1,4 +1,7 @@
 # xss_security_gui/auto_recon/gui_elements.py
+"""
+GUI Elements — панель управления AutoRecon.
+"""
 
 from tkinter import Frame, Button, Label
 from typing import Callable
@@ -22,7 +25,6 @@ def build_auto_recon_panel(
     :param on_attack: callback для кнопки "Запустить атаку"
     :return: готовый Frame
     """
-
     panel = Frame(parent)
 
     Label(panel, text="🔍 AutoRecon Suite", font=("Arial", 12, "bold")).pack(pady=(0, 8))

@@ -25,18 +25,24 @@ LOG_FILE: Path = LOG_DIR / "token_risks.json"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
+# ============================================================
+#  Извлечение токенов
+# ============================================================
 def extract_tokens(headers: Dict[str, str], html: str) -> List[Dict[str, str]]:
     """Извлекает токены из заголовков и HTML."""
     tokens: List[Dict[str, str]] = []
     try:
+        # Заголовки
         for k, v in headers.items():
             if "token" in k.lower() or "authorization" in k.lower():
                 tokens.append({"source": k, "value": v})
 
+        # CSRF hidden field
         csrf_matches = re.findall(r'name=["\']csrf["\'].*?value=["\'](.*?)["\']', html, re.I)
         for match in csrf_matches:
             tokens.append({"source": "CSRF Hidden Field", "value": match})
 
+        # localStorage
         storage_matches = re.findall(r'localStorage\.setItem\(["\'](\w+)["\']\s*,\s*["\'](.*?)["\']\)', html)
         for key, val in storage_matches:
             tokens.append({"source": f"localStorage:{key}", "value": val})
@@ -46,6 +52,9 @@ def extract_tokens(headers: Dict[str, str], html: str) -> List[Dict[str, str]]:
     return tokens
 
 
+# ============================================================
+#  Анализ токенов
+# ============================================================
 def analyze_tokens(tokens: List[Dict[str, str]], expected_aud: str = "expected-aud") -> List[Dict[str, Any]]:
     """Анализирует токены, определяет тип и риски."""
     analyzed: List[Dict[str, Any]] = []
@@ -75,6 +84,9 @@ def analyze_tokens(tokens: List[Dict[str, str]], expected_aud: str = "expected-a
     return analyzed
 
 
+# ============================================================
+#  Сохранение лога
+# ============================================================
 def save_token_log(analyzed: List[Dict[str, Any]], path: Path = LOG_FILE) -> None:
     """Сохраняет результаты анализа токенов в JSON."""
     try:
@@ -86,6 +98,9 @@ def save_token_log(analyzed: List[Dict[str, Any]], path: Path = LOG_FILE) -> Non
         logging.error(f"[TokenExtractor] Ошибка записи лога: {e}", exc_info=True)
 
 
+# ============================================================
+#  Общая логика
+# ============================================================
 def _process_tokens(headers: Dict[str, str], html: str, output_path: Path = LOG_FILE) -> List[Dict[str, Any]]:
     """Общая логика извлечения, анализа и сохранения токенов."""
     tokens = extract_tokens(headers, html)
@@ -94,8 +109,11 @@ def _process_tokens(headers: Dict[str, str], html: str, output_path: Path = LOG_
     return analyzed
 
 
-# 📦 CLI-режим
+# ============================================================
+#  CLI-режим
+# ============================================================
 def run_from_cli(headers_path: Path, html_path: Path, output_path: Path = LOG_FILE) -> None:
+    """Запуск анализа токенов из CLI."""
     try:
         with headers_path.open(encoding="utf-8") as f:
             headers = json.load(f)
@@ -109,7 +127,9 @@ def run_from_cli(headers_path: Path, html_path: Path, output_path: Path = LOG_FI
     print(f"✅ Анализ завершён. Лог сохранён в: {output_path}")
 
 
-# 🔧 GUI-режим (асинхронный запуск)
+# ============================================================
+#  GUI-режим (асинхронный запуск)
+# ============================================================
 def analyze_from_gui(headers: Dict[str, str], html: str, output_path: Path = LOG_FILE, callback=None) -> None:
     """Запускает анализ токенов в фоне, чтобы не блокировать GUI."""
     def worker():
@@ -123,7 +143,9 @@ def analyze_from_gui(headers: Dict[str, str], html: str, output_path: Path = LOG
     threading.Thread(target=worker, daemon=True).start()
 
 
-# 🚀 Автоматический выбор режима
+# ============================================================
+#  Автоматический выбор режима
+# ============================================================
 if __name__ == "__main__":
     import sys
 

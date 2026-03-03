@@ -31,7 +31,7 @@ VERSION = "6.5.0"
 
 DIRS = {
     "logs": str(LOG_DIR),
-    "configs": str(CONFIG_DIR),
+    "target": str(CONFIG_DIR),
     "exports": str(EXPORT_DIR),
     "payloads": str(PAYLOADS_DIR),
     "resources": os.path.join(BASE_DIR, "resources"),
@@ -130,8 +130,8 @@ def load_config() -> dict:
     Legacy-конфиг (default_config.json / user_config.json).
     Используется как дополнительный слой поверх settings, но не заменяет его.
     """
-    default_cfg = os.path.join(DIRS["configs"], "default_config.json")
-    user_cfg = os.path.join(DIRS["configs"], "user_config.json")
+    default_cfg = os.path.join(DIRS["target"], "default_config.json")
+    user_cfg = os.path.join(DIRS["target"], "user_config.json")
 
     cfg = load_json(default_cfg)
     if cfg:

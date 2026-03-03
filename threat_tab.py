@@ -133,6 +133,10 @@ class ThreatAnalysisTab(ttk.Frame):
         if self._reload_lock.locked():
             return  # не запускаем повторно
 
+        # Если GUI не запущен — не обновляем
+        if not hasattr(self.master, "after"):
+            return
+
         self.status_var.set("Загрузка Threat Intel…")
         threading.Thread(target=self._reload_worker, daemon=True).start()
 
@@ -142,14 +146,21 @@ class ThreatAnalysisTab(ttk.Frame):
             try:
                 summary = THREAT_CONNECTOR.summary()
             except Exception as e:
-                # Передаём ошибку в главный поток
-                self.after(0, self._show_error, e)
+                # GUI может быть неактивен — проверяем
+                try:
+                    self.after(0, self._show_error, e)
+                except RuntimeError:
+                    return
                 return
 
             self._last_summary = summary
 
             # Передаём обновление GUI в главный поток
-            self.master.after(0, lambda: self._apply_summary(summary))
+            try:
+                self.master.after(0, lambda: self._apply_summary(summary))
+            except RuntimeError:
+                # GUI не запущен (CLI режим) — тихо выходим
+                return
 
     def _apply_summary(self, summary: dict):
         """Обновляет GUI после фоновой загрузки."""

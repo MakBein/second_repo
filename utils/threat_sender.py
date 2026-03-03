@@ -2,8 +2,28 @@
 import json
 from typing import Any, Dict, List, Union
 
+
 class ThreatSenderMixin:
-    def send_to_threat_intel(self, module_name: str, data: Union[Dict[str, Any], List[Any], Any]) -> None:
+    """
+    ThreatSenderMixin — универсальный миксин для отправки артефактов
+    в ThreatConnector/Threat Intel.
+
+    • Формирует унифицированный payload
+    • Поддерживает dict, list и простые значения
+    • Логирует ошибки через self.log (если доступен)
+    """
+
+    def send_to_threat_intel(
+        self,
+        module_name: str,
+        data: Union[Dict[str, Any], List[Any], Any],
+    ) -> None:
+        """
+        Отправляет данные в ThreatConnector.
+
+        :param module_name: имя модуля-источника
+        :param data: данные (dict, list или простое значение)
+        """
         if not hasattr(self, "threat_tab") or self.threat_tab is None:
             if hasattr(self, "log"):
                 self.log.debug("Threat Intel skipped: no tab")
@@ -14,13 +34,17 @@ class ThreatSenderMixin:
         try:
             if isinstance(data, dict):
                 for k, v in data.items():
-                    payload["entries"].append({"key": str(k), "value": json.dumps(v, ensure_ascii=False)})
+                    payload["entries"].append(
+                        {"key": str(k), "value": json.dumps(v, ensure_ascii=False)}
+                    )
 
             elif isinstance(data, list):
                 for item in data:
                     if isinstance(item, dict):
                         for k, v in item.items():
-                            payload["entries"].append({"key": str(k), "value": json.dumps(v, ensure_ascii=False)})
+                            payload["entries"].append(
+                                {"key": str(k), "value": json.dumps(v, ensure_ascii=False)}
+                            )
                     else:
                         payload["entries"].append({"key": "info", "value": str(item)})
 
@@ -31,4 +55,7 @@ class ThreatSenderMixin:
 
         except Exception as e:
             if hasattr(self, "log"):
-                self.log.error(f"Threat Intel send error: {type(e).__name__}: {e}", exc_info=True)
+                self.log.error(
+                    f"Threat Intel send error: {type(e).__name__}: {e}",
+                    exc_info=True,
+                )
