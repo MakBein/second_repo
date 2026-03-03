@@ -214,12 +214,12 @@ python main.py
 python -m xss_security_gui.main
 
 Пример запуска краулера CLI&GUI:
-python -m xss_security_gui.main crawl https://gazprombank.ru
+python -m xss_security_gui.main crawl <url>
 
 Пример запуска краулера в режиме only CLI:
-python -m xss_security_gui.cli crawl https://gazprombank.ru
+python -m xss_security_gui.cli crawl <url>
 python -m xss_security_gui.main_cli js file.js
-python -m xss_security_gui.main_cli recon https://gazprombank.ru
+python -m xss_security_gui.main_cli recon <url>
 
 
 
