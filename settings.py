@@ -34,7 +34,7 @@ LOG_DIR: Path = BASE_DIR / "logs"
 EXPORT_DIR: Path = BASE_DIR / "exports"
 PDF_DIR: Path = EXPORT_DIR / "reports"
 PAYLOADS_DIR: Path = BASE_DIR / "payloads"
-CONFIG_DIR: Path = BASE_DIR / "target"
+CONFIG_DIR: Path = BASE_DIR / "configs"
 
 
 for d in (LOG_DIR, EXPORT_DIR, PDF_DIR, PAYLOADS_DIR, CONFIG_DIR):
@@ -142,6 +142,7 @@ class Settings:
             "attack_engine.threads": 6,
             "gui.theme": "dark",
             "gui.sound_alerts": True,
+            "gui.default_trap_type": "js",
 
             # Crawler
             "crawl.depth_limit": 2,
@@ -150,8 +151,18 @@ class Settings:
             "crawl.max_workers": 20,
             "crawl.max_links": 500,
             "crawl.max_scripts": 200,
+            "crawl.max_links_per_page": 500,
+            "crawl.max_scripts_per_page": 200,
+            "crawl.max_rps": 2.0,
+            "crawl.max_matches_per_key": 200,
+            "crawl.max_api_endpoints": 200,
             "crawl.domains_whitelist": [],
             "crawl.error_log": str(LOG_DIR / "crawler_errors.log"),
+
+            # Crawler / JS detection (js_inspector, etc.)
+            "crawler.enable_graphql_detection": True,
+            "js.enable_dynamic_detection": True,
+            "js.enable_framework_detection": True,
 
             # API
             "api.max_tokens": 200,
@@ -165,6 +176,8 @@ class Settings:
             # HTTP / сетевые дефолты
             "http.request_timeout": 7,
             "http.default_user_agent": "XSS-Security-GUI/6.5",
+            "http.aggressive_headers": True,
+            "http.proxies": None,
 
             # IDOR
             "idor.delay": 0.5,
@@ -243,8 +256,24 @@ class Settings:
             if k not in self.data:
                 self.data[k] = v
 
+    # Плоские ключи из settings_gui / settings.json ↔ точечные ключи
+    _KEY_ALIASES = {
+        "ENABLE_AUTO_TRAPS": "honeypot.enable",
+        "HONEYPOT_POLL_INTERVAL": "honeypot.poll_interval",
+        "DEFAULT_TRAP_TYPE": "gui.default_trap_type",
+    }
+    _KEY_ALIASES_REVERSE = {v: k for k, v in _KEY_ALIASES.items()}
+
     def get(self, key: str, default: Any = None) -> Any:
-        return self.data.get(key, default)
+        flat = self._KEY_ALIASES_REVERSE.get(key)
+        if flat is not None and flat in self.data:
+            return self.data[flat]
+        if key in self.data:
+            return self.data[key]
+        alias = self._KEY_ALIASES.get(key)
+        if alias is not None and alias in self.data:
+            return self.data[alias]
+        return default
 
     def _convert(self, value: str) -> Any:
         v = value.strip()
@@ -307,7 +336,9 @@ def crawler_results_path() -> Path:
     Возвращает универсальный путь к crawler_results.json.
     Используется в main.py, overview_tab.py и других модулях.
     """
-    return LOG_DIR / "crawler_results.json"
+    return JSON_CRAWL_EXPORT_PATH
+
+
 # ============================================================
 #  Backward compatibility: CONFIG alias
 # ============================================================
@@ -322,13 +353,19 @@ CONFIG = settings.data
 class SettingsValidator:
     REQUIRED_STRUCTURE = {
         "gui": {
-            # мы валидируем через export.max_line_length, но секцию оставим для будущего расширения
+            "theme": str,
+            "sound_alerts": bool,
+            "default_trap_type": str,
         },
         "honeypot": {
             "enable": bool,
             "poll_interval": int,
             "log_path": str,
             "hits_log_path": str,
+        },
+        "crawl": {
+            "depth_limit": int,
+            "error_log": str,
         },
         "http": {
             "request_timeout": int,
@@ -428,12 +465,40 @@ CSRF_PAYLOAD_FILE = settings.get("payloads.csrf_file")
 THREAT_INTEL_ARTIFACT_PATH = Path(settings.get("threat.artifact_path"))
 
 # ============================================================
+#  Обратная совместимость: атрибуты на объекте settings
+#  (модули используют settings.LOG_DIR, settings.REQUEST_TIMEOUT и т.д.)
+# ============================================================
+
+def _attach_settings_aliases() -> None:
+    """Привязывает алиасы путей и констант к объекту settings для совместимости."""
+    attrs = (
+        "BASE_DIR", "LOG_DIR", "EXPORT_DIR", "PDF_DIR", "PAYLOADS_DIR", "CONFIG_DIR",
+        "JSON_CRAWL_EXPORT_PATH", "LOG_SUCCESS_PATH", "LOG_CRAWL_STRUCTURE_PATH",
+        "LOG_CRAWL_GRAPH_DOT", "LOG_CRAWL_GRAPH_SVG", "PARAM_FUZZ_LOG_PATH",
+        "LOG_HONEYPOT_PATH", "LOG_HONEYPOT_HITS", "THREAT_LOG_PATH",
+        "REQUEST_TIMEOUT", "DEFAULT_USER_AGENT", "IDOR_DELAY",
+        "LFI_DELAY", "LFI_PAYLOADS", "LFI_SIGNATURES",
+        "SQLI_ERROR_INDICATORS", "SQLI_WAF_INDICATORS",
+        "SSRF_BODY_INDICATORS", "SSRF_HEADER_INDICATORS",
+        "SQLI_PAYLOAD_FILE", "XSS_PAYLOAD_FILE", "SSRF_PAYLOAD_FILE", "CSRF_PAYLOAD_FILE",
+        "THREAT_INTEL_ARTIFACT_PATH",
+        "CRAWL_DEPTH_LIMIT", "CRAWL_DOMAINS_WHITELIST", "CRAWLER_ERROR_LOG",
+    )
+    g = globals()
+    for name in attrs:
+        if name in g:
+            setattr(settings, name, g[name])
+
+_attach_settings_aliases()
+
+# ============================================================
 #  Публичный API пакета (ULTRA 6.x)
 # ============================================================
 
 __all__ = [
     "settings", "Settings", "CONFIG",
-    "BASE_DIR", "LOG_DIR", "EXPORT_DIR", "PDF_DIR", "PAYLOADS_DIR",
+    "BASE_DIR", "LOG_DIR", "EXPORT_DIR", "PDF_DIR", "PAYLOADS_DIR", "CONFIG_DIR",
+    "SETTINGS_JSON_PATH", "SETTINGS_JSON",
 
     "JSON_CRAWL_EXPORT_PATH", "LOG_SUCCESS_PATH",
     "ENABLE_AUTO_TRAPS", "CRAWL_DEPTH_LIMIT",
@@ -444,7 +509,7 @@ __all__ = [
     "DEEP_CRAWL_JSON_PATH", "DEEP_ANALYSIS_EXPORT_PATH",
     "ATTACK_PLAN_PATH", "ATTACK_LOGS_PATH",
     "HONEYPOT_EVENTS_JSONL", "NETWORK_LOG_PATH",
-    "DOMParser",
+    "GUI_STATE_PATH", "DOMParser",
 
     "LOG_CRAWL_STRUCTURE_PATH", "LOG_CRAWL_GRAPH_DOT", "LOG_CRAWL_GRAPH_SVG",
 

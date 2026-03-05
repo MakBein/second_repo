@@ -1,8 +1,8 @@
 # xss_security_gui/crawler.py
-
 import os
 import json
 import re
+import time
 import threading
 import logging
 import tempfile
@@ -18,46 +18,103 @@ import cloudscraper
 from bs4 import BeautifulSoup, Comment
 
 from xss_security_gui.js_inspector import extract_js_insights
-from settings import (
+from xss_security_gui.settings import settings
+from xss_security_gui.settings import (
     CRAWL_DEPTH_LIMIT,
     CRAWL_DOMAINS_WHITELIST,
     LOG_CRAWL_STRUCTURE_PATH,
     LOG_CRAWL_GRAPH_DOT,
     LOG_CRAWL_GRAPH_SVG,
     JSON_CRAWL_EXPORT_PATH,
-    CRAWLER_ERROR_LOG
+    CRAWLER_ERROR_LOG,
 )
 
-# Попробуем Playwright, но не ломаем модуль, если его нет
+# ---------------------------------------------------------------------
+# Configuration (from settings with sensible defaults)
+# ---------------------------------------------------------------------
+REQUEST_TIMEOUT: int = settings.get("http.request_timeout", 10)
+PROXIES: Optional[Dict[str, str]] = settings.get("http.proxies", None)
+RATE_LIMIT: float = float(settings.get("crawl.max_rps", 2.0) or 2.0)
+
+# internal rate-limit state
+_last_request: float = 0.0
+_rate_lock = threading.Lock()
+
+# ---------------------------------------------------------------------
+# Logger and error logging helper
+# ---------------------------------------------------------------------
+logger = logging.getLogger("crawler")
+logger.setLevel(logging.INFO)
+
+
+def log_error(msg: str) -> None:
+    """
+    Append an error line to the crawler error log and emit logger.error.
+    Best-effort only: failures to write the file are logged but do not raise.
+    """
+    try:
+        logger.error(msg)
+        if CRAWLER_ERROR_LOG:
+            with open(CRAWLER_ERROR_LOG, "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.utcnow().isoformat()}] {msg}\n")
+    except Exception:
+        logger.exception("Failed to write to CRAWLER_ERROR_LOG")
+
+
+
+# ---------------------------------------------------------------------
+# Rate limiter
+# ---------------------------------------------------------------------
+def rate_limit() -> None:
+    """
+    Simple global rate limiter (process-wide). Uses seconds between requests = 1 / RATE_LIMIT.
+    Safe against RATE_LIMIT == 0 or None.
+    """
+    global _last_request
+    with _rate_lock:
+        try:
+            r = float(RATE_LIMIT) if RATE_LIMIT else 1.0
+        except Exception:
+            r = 1.0
+        min_interval = 1.0 / max(r, 0.0001)
+        now = time.time()
+        delta = now - _last_request
+        if delta < min_interval:
+            time.sleep(min_interval - delta)
+        _last_request = time.time()
+
+
+# Try Playwright but don't break if it's not installed
 try:
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import sync_playwright  # type: ignore
+
     PLAYWRIGHT_AVAILABLE = True
 except Exception:
     PLAYWRIGHT_AVAILABLE = False
 
-logger = logging.getLogger("crawler")
-logger.setLevel(logging.INFO)
+# Global in-memory structures (reset by reset_state)
 
-# Глобальные структуры
-visited: Set[str] = set()       # SHA1 хэш URL без query/fragment
-tree_log: List[str] = []         # человекочитаемое дерево обхода
-dot_edges: List[tuple] = []        # рёбра графа (from → to)
-nodes_json: List[Dict[str, Any]] = []       # описание узлов
-js_cache: Dict[str, Dict] = {}         # кэш JS: url → insights
+visited: Set[str] = set()
+tree_log: List[str] = []
+dot_edges: List[tuple] = []
+nodes_json: List[Dict[str, Any]] = []
+js_cache: Dict[str, Dict] = {}
+
 visited_lock = threading.Lock()
 nodes_lock = threading.Lock()
 dot_lock = threading.Lock()
 
 
-# Агрессивные настройки
-MAX_LINKS_PER_PAGE = 500  # Увеличено с 50 до 500
-MAX_SCRIPTS_PER_PAGE = 200  # Увеличено с 50 до 200
-MAX_CONCURRENT_REQUESTS = 20  # Параллельная обработка ссылок
-AGGRESSIVE_HEADERS = True  # Использовать агрессивные заголовки
+# Aggressive defaults (can be overridden via settings)
 
-# Ограничения для извлечения чувствительных данных
-MAX_MATCHES_PER_KEY = 200
-MAX_API_ENDPOINTS = 200
+MAX_LINKS_PER_PAGE: int = int(settings.get("crawl.max_links_per_page", 500))
+MAX_SCRIPTS_PER_PAGE: int = int(settings.get("crawl.max_scripts_per_page", 200))
+MAX_CONCURRENT_REQUESTS: int = int(settings.get("crawl.max_workers", 20))
+AGGRESSIVE_HEADERS: bool = bool(settings.get("http.aggressive_headers", True))
+
+MAX_MATCHES_PER_KEY: int = int(settings.get("crawl.max_matches_per_key", 200))
+MAX_API_ENDPOINTS: int = int(settings.get("crawl.max_api_endpoints", 200))
+
 
 # --- HTTP / Browser emulation ---
 
@@ -85,11 +142,25 @@ if AGGRESSIVE_HEADERS:
         "Sec-Fetch-Dest": "document",
     })
 
-# === УТИЛИТЫ ===
+# Utilities
 
-def dedupe_preserve_order(seq):
+def reset_state() -> None:
+    """Clear in-memory crawler state between runs."""
+    with visited_lock:
+        visited.clear()
+    with nodes_lock:
+        nodes_json.clear()
+        tree_log.clear()
+    with dot_lock:
+        dot_edges.clear()
+    js_cache.clear()
+
+
+
+def dedupe_preserve_order(seq: List[Any]) -> List[Any]:
+    """Remove duplicates while preserving order. Works for hashable and JSON-serializable items."""
     seen = set()
-    out = []
+    out: List[Any] = []
     for item in seq:
         try:
             key = item if isinstance(item, (str, int, float, tuple)) else json.dumps(item, sort_keys=True, ensure_ascii=False)
@@ -100,18 +171,21 @@ def dedupe_preserve_order(seq):
             out.append(item)
     return out
 
+
+
 def _normalize_candidate(cand: str, base_url: str) -> str:
+    """Normalize relative/absolute candidate into absolute URL; return empty string for invalid."""
+    if not cand:
+        return ""
     cand = cand.strip().strip('\'"')
     if not cand:
         return ""
-    # если абсолютный URL
-    if cand.startswith("http://") or cand.startswith("https://"):
+    if cand.startswith(("http://", "https://")):
         return cand
-    # относительный путь
     if cand.startswith("/"):
         return urljoin(base_url, cand)
-    # возможно без ведущего слеша
     return urljoin(base_url, "/" + cand)
+
 
 def _is_http_url(u: str) -> bool:
     try:
@@ -129,26 +203,57 @@ def mask_secret(s: str, keep: int = 4) -> str:
         return "*" * len(s)
     return s[:keep] + "*" * (len(s) - keep * 2) + s[-keep:]
 
-# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
+
+def _merge_sensitive_into_node(node: Dict[str, Any], sensitive: Dict[str, List[str]]) -> None:
+    """Merge extracted sensitive data into node lists; only keys that exist on node are updated."""
+    for key, value in sensitive.items():
+        if key in node and value:
+            node[key].extend(value)
+
+
+def _trim_node_list_fields(node: Dict[str, Any], cap: int = MAX_MATCHES_PER_KEY) -> None:
+    """Dedupe and cap all list fields in node in place."""
+    for k in list(node.keys()):
+        if isinstance(node[k], list):
+            node[k] = dedupe_preserve_order(node[k])[:cap]
+
+
+# Helpers
 
 def hash_url_no_query(u: str) -> str:
     parsed = urlparse(u)._replace(query="", fragment="")
     return sha1(parsed.geturl().encode()).hexdigest()
 
 def normalize_scheme(url: str) -> str:
+    """
+    Ensure URL has a scheme. If missing, prepend https://.
+    Return full URL string (parsed.geturl()) to preserve normalization.
+    """
+    if not url:
+        return url
     parsed = urlparse(url)
     if not parsed.scheme:
         return "https://" + url.lstrip("/")
-    return url
+    return parsed.geturl()
+
 
 def is_same_domain(url: str, base_netloc: str) -> bool:
-    parsed = urlparse(url)
-    if not parsed.netloc:
-        return False
-    if CRAWL_DOMAINS_WHITELIST:
-        if not any(whitelisted in parsed.netloc for whitelisted in CRAWL_DOMAINS_WHITELIST):
+    """
+    Check whether `url` belongs to the same domain as `base_netloc`.
+    Honors CRAWL_DOMAINS_WHITELIST if configured.
+    """
+    try:
+        parsed = urlparse(url)
+        netloc = parsed.netloc
+        if not netloc:
             return False
-    return parsed.netloc == base_netloc or parsed.netloc.endswith("." + base_netloc)
+        if CRAWL_DOMAINS_WHITELIST:
+            if netloc not in CRAWL_DOMAINS_WHITELIST and not any(netloc.endswith("." + d) for d in CRAWL_DOMAINS_WHITELIST):
+                return False
+        return netloc == base_netloc or netloc.endswith("." + base_netloc)
+    except Exception:
+        return False
+
 
 def is_real_link(href: str) -> bool:
     if not href:
@@ -161,6 +266,10 @@ def is_real_link(href: str) -> bool:
 def make_session(aggressive: bool = True) -> requests.Session:
     """Создание сессии с агрессивными заголовками для максимального сбора данных"""
     s = requests.Session()
+
+    if PROXIES:
+        s.proxies.update(PROXIES)
+
     if aggressive:
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 XSSSecurityCrawler/2.0",
@@ -198,8 +307,8 @@ def luhn_check(number: str) -> bool:
 
     return checksum % 10 == 0
 
-# === ПРЕКОМПИЛИРОВАННЫЕ ПАТТЕРНЫ ===
-# SSN, PASSWORD и SECRET предкомпилированные паттерны
+# Precompiled patterns
+# SSN, PASSWORD и SECRET
 SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
 PASSWORD_PATTERNS_COMPILED = [
     re.compile(r"(?:password|passwd|pwd)[=:]\s*['\"]?([^'\"]{6,})['\"]?", re.I),
@@ -221,8 +330,9 @@ PHONE_RE_LIST = [
 TOKEN_PATTERNS_COMPILED = [
     re.compile(r"(?:auth[_-]?token|session[_-]?id|api[_-]?key|access[_-]?token|refresh[_-]?token)[=:]?\s*([A-Za-z0-9_\-\.]{8,})", re.I),
     re.compile(r"(?:bearer|token|key|secret)[=:]\s*([A-Za-z0-9_\-\.]{8,})", re.I),
-    re.compile(r"['\"]([a-zA-Z0-9_\-]{32,})['\"]")
+    re.compile(r"['\"]([a-zA-Z0-9_\-]{32,})['\"]"),
 ]
+
 
 JWT_RE = re.compile(r"eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+")
 IPV4_RE = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\b")
@@ -245,13 +355,27 @@ IPV6_RE = re.compile(
     r"(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}"
     r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d))\b"
 )
+
 MAC_RE = re.compile(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b|\b[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\b")
-CIDR_RE = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)/(?:[0-9]|[12][0-9]|3[0-2])\b|\b[0-9A-Fa-f:]+/[0-9]{1,3}\b")
+CIDR_RE = re.compile(
+    r"\b(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}"
+    r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)/(?:[0-9]|[12][0-9]|3[0-2])\b"
+    r"|\b[0-9A-Fa-f:]+/[0-9]{1,3}\b"
+)
+
+
 HOSTNAME_RE = re.compile(r"\b(?=.{1,253}\b)(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[A-Za-z]{2,63}\b")
 PARAM_RE = re.compile(r"\b([a-zA-Z0-9_]+=[a-zA-Z0-9_\-\.]+)\b")
-BASE64_RE = re.compile(r"(?:[A-Za-z0-9+/]{4}){5,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?")
+BASE64_RE = re.compile(r"\b(?:[A-Za-z0-9+/]{4}){5,}(?:==|=)?\b")
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
-HASH_PATTERNS = [re.compile(r"\b[a-f0-9]{32}\b", re.I), re.compile(r"\b[a-f0-9]{40}\b", re.I), re.compile(r"\b[a-f0-9]{64}\b", re.I)]
+
+HASH_PATTERNS = [
+    re.compile(r"\b[a-f0-9]{32}\b", re.I),
+    re.compile(r"\b[a-f0-9]{40}\b", re.I),
+    re.compile(r"\b[a-f0-9]{64}\b", re.I),
+]
+
+
 API_KEY_PATTERNS = [
     re.compile(r"(?:api[_-]?key|apikey)[=:]\s*([A-Za-z0-9_\-]{20,})", re.I),
     re.compile(r"(?:sk|pk)_[A-Za-z0-9_\-]{20,}"),
@@ -259,8 +383,10 @@ API_KEY_PATTERNS = [
     re.compile(r"AKIA[0-9A-Z]{16}")
 ]
 CREDIT_CARD_RE = re.compile(
-    r"\b(?:(4[0-9]{12}(?:[0-9]{3})?)|(5[1-5][0-9]{14})|(3[47][0-9]{13})|(6(?:011|5[0-9]{2})[0-9]{12})|(35[0-9]{14})|(62[0-9]{14,17}))\b"
+    r"\b(?:(4[0-9]{12}(?:[0-9]{3})?)|(5[1-5][0-9]{14})|(3[47][0-9]{13})|"
+    r"(6(?:011|5[0-9]{2})[0-9]{12})|(35[0-9]{14})|(62[0-9]{14,17}))\b"
 )
+
 
 # ============================================================
 #  Sensitive Data Extraction
@@ -268,164 +394,184 @@ CREDIT_CARD_RE = re.compile(
 
 def extract_sensitive_data(text: str) -> Dict[str, List[str]]:
     """
-    Агресивне, але безпечне вилучення чутливих даних.
-    Логіка збережена 1:1, але код очищений і стабілізований.
+    Aggressive but bounded extraction of sensitive artifacts from `text`.
+    Preserves original logic while adding safety, limits and deduplication.
+    Returns a dict with lists for each category.
     """
-    data = {
-        "emails": [], "phones": [], "tokens": [], "ips": [], "ipv4": [],
-        "ipv6": [], "mac": [], "cidr": [], "hostnames": [], "parameters": [],
-        "base64_strings": [], "uuids": [], "hashes": [], "api_keys": [],
-        "jwt_tokens": [], "credit_cards": [], "ssn": [], "passwords": [],
-        "secrets": []
+    data: Dict[str, List[str]] = {
+        "emails": [],
+        "phones": [],
+        "tokens": [],
+        "ips": [],
+        "ipv4": [],
+        "ipv6": [],
+        "mac": [],
+        "cidr": [],
+        "hostnames": [],
+        "parameters": [],
+        "base64_strings": [],
+        "uuids": [],
+        "hashes": [],
+        "api_keys": [],
+        "jwt_tokens": [],
+        "credit_cards": [],
+        "ssn": [],
+        "passwords": [],
+        "secrets": [],
     }
 
     if not text:
         return data
 
-    try:
-        # EMAILS
-        data["emails"].extend(m.group(0) for m in EMAIL_RE.finditer(text))
+    def _append_limited(lst: List[str], value: str, limit: int = MAX_MATCHES_PER_KEY) -> None:
+        if value and len(lst) < limit:
+            lst.append(value)
 
-        # PHONES
+    try:
+        # Emails
+        for m in EMAIL_RE.finditer(text):
+            _append_limited(data["emails"], m.group(0))
+
+        # Phones
         for p in PHONE_RE_LIST:
             for m in p.finditer(text):
-                data["phones"].append(m.group(0))
+                _append_limited(data["phones"], m.group(0))
                 if len(data["phones"]) >= MAX_MATCHES_PER_KEY:
                     break
             if len(data["phones"]) >= MAX_MATCHES_PER_KEY:
                 break
 
-        # TOKENS
+        # Tokens
         for p in TOKEN_PATTERNS_COMPILED:
             for m in p.finditer(text):
                 token = m.group(1) if m.groups() else m.group(0)
-                data["tokens"].append(token)
+                _append_limited(data["tokens"], token)
                 if len(data["tokens"]) >= MAX_MATCHES_PER_KEY:
                     break
             if len(data["tokens"]) >= MAX_MATCHES_PER_KEY:
                 break
 
-        # JWT
+        # JWTs
         for m in JWT_RE.finditer(text):
-            data["jwt_tokens"].append(m.group(0))
+            _append_limited(data["jwt_tokens"], m.group(0))
             if len(data["jwt_tokens"]) >= MAX_MATCHES_PER_KEY:
                 break
 
         # IPv4
         for m in IPV4_RE.finditer(text):
-            data["ips"].append(m.group(0))
-            if len(data["ips"]) >= MAX_MATCHES_PER_KEY:
+            _append_limited(data["ipv4"], m.group(0))
+            _append_limited(data["ips"], m.group(0))
+            if len(data["ipv4"]) >= MAX_MATCHES_PER_KEY:
                 break
 
         # IPv6
         for m in IPV6_RE.finditer(text):
-            data["ipv6"].append(m.group(0))
+            _append_limited(data["ipv6"], m.group(0))
             if len(data["ipv6"]) >= MAX_MATCHES_PER_KEY:
                 break
 
         # MAC
         for m in MAC_RE.finditer(text):
-            data["mac"].append(m.group(0))
+            _append_limited(data["mac"], m.group(0))
             if len(data["mac"]) >= MAX_MATCHES_PER_KEY:
                 break
 
         # CIDR
         for m in CIDR_RE.finditer(text):
-            data["cidr"].append(m.group(0))
+            _append_limited(data["cidr"], m.group(0))
             if len(data["cidr"]) >= MAX_MATCHES_PER_KEY:
                 break
 
-        # HOSTNAMES
+        # Hostnames
         for m in HOSTNAME_RE.finditer(text):
-            data["hostnames"].append(m.group(0))
+            _append_limited(data["hostnames"], m.group(0))
             if len(data["hostnames"]) >= MAX_MATCHES_PER_KEY:
                 break
 
-        # PARAMETERS
+        # Parameters
         for m in PARAM_RE.finditer(text):
-            data["parameters"].append(m.group(1))
+            _append_limited(data["parameters"], m.group(1))
             if len(data["parameters"]) >= MAX_MATCHES_PER_KEY:
                 break
 
-        # BASE64
+        # Base64-like strings
         for m in BASE64_RE.finditer(text):
-            data["base64_strings"].append(m.group(0))
+            _append_limited(data["base64_strings"], m.group(0))
             if len(data["base64_strings"]) >= MAX_MATCHES_PER_KEY:
                 break
 
-        # UUID
+        # UUIDs
         for m in UUID_RE.finditer(text):
-            data["uuids"].append(m.group(0))
+            _append_limited(data["uuids"], m.group(0))
             if len(data["uuids"]) >= MAX_MATCHES_PER_KEY:
                 break
 
-        # HASHES
+        # Hashes
         for p in HASH_PATTERNS:
             for m in p.finditer(text):
-                data["hashes"].append(m.group(0))
+                _append_limited(data["hashes"], m.group(0))
                 if len(data["hashes"]) >= MAX_MATCHES_PER_KEY:
                     break
             if len(data["hashes"]) >= MAX_MATCHES_PER_KEY:
                 break
 
-        # API KEYS
+        # API keys
         for p in API_KEY_PATTERNS:
             for m in p.finditer(text):
                 key = m.group(1) if m.groups() else m.group(0)
-                data["api_keys"].append(key)
+                _append_limited(data["api_keys"], key)
                 if len(data["api_keys"]) >= MAX_MATCHES_PER_KEY:
                     break
             if len(data["api_keys"]) >= MAX_MATCHES_PER_KEY:
                 break
 
-        # CREDIT CARDS (Luhn)
+        # Credit cards (validate with Luhn)
         raw_cards = [m.group(0) for m in CREDIT_CARD_RE.finditer(text)]
-        valid_cards = []
         for card in raw_cards[:MAX_MATCHES_PER_KEY]:
             digits = re.sub(r"\D", "", card)
             if 13 <= len(digits) <= 19 and luhn_check(digits):
-                valid_cards.append(digits)
-        data["credit_cards"].extend(valid_cards)
+                _append_limited(data["credit_cards"], digits)
 
         # SSN
         for m in SSN_RE.finditer(text):
-            data["ssn"].append(m.group(0))
+            _append_limited(data["ssn"], m.group(0))
             if len(data["ssn"]) >= MAX_MATCHES_PER_KEY:
                 break
 
-        # PASSWORDS (masked)
+        # Password-like patterns (mask before storing)
         for p in PASSWORD_PATTERNS_COMPILED:
             for m in p.finditer(text):
-                pwd = m.group(1)
+                pwd = m.group(1) if m.groups() else None
                 if pwd:
-                    data["passwords"].append(mask_secret(pwd, keep=2))
+                    _append_limited(data["passwords"], mask_secret(pwd, keep=2))
                 if len(data["passwords"]) >= MAX_MATCHES_PER_KEY:
                     break
             if len(data["passwords"]) >= MAX_MATCHES_PER_KEY:
                 break
 
-        # SECRETS
+        # Secrets (keys, PEM blocks)
         for p in SECRET_PATTERNS_COMPILED:
             for m in p.finditer(text):
                 if p.pattern.startswith("-----BEGIN"):
-                    data["secrets"].append(m.group(0))
+                    snippet = m.group(0)[:2000]
+                    _append_limited(data["secrets"], snippet)
                 else:
                     secret_val = m.group(1) if m.groups() else m.group(0)
-                    data["secrets"].append(mask_secret(secret_val, keep=4))
+                    _append_limited(data["secrets"], mask_secret(secret_val, keep=4))
                 if len(data["secrets"]) >= MAX_MATCHES_PER_KEY:
                     break
             if len(data["secrets"]) >= MAX_MATCHES_PER_KEY:
                 break
 
-    except Exception as e:
-        data["error"] = str(e)
 
-    # Дедуплікація
-    for key in list(data.keys()):
+
+    except Exception as e:
+        data.setdefault("error", str(e))
+        # Deduplicate and trim each list
+    for key, val in list(data.items()):
         if key == "error":
             continue
-        data[key] = dedupe_preserve_order(safe_list(data[key]))[:MAX_MATCHES_PER_KEY]
-
+        data[key] = dedupe_preserve_order(safe_list(val))[:MAX_MATCHES_PER_KEY]
     return data
 
 # ============================================================
@@ -434,9 +580,10 @@ def extract_sensitive_data(text: str) -> Dict[str, List[str]]:
 
 def extract_api_endpoints_from_text(text: str, base_url: str) -> List[str]:
     """
-    Витягує API endpoints з HTML/JS.
-    Логіка збережена, код очищений.
+    Extract API endpoints from HTML/JS/text.
+    Returns normalized absolute URLs limited by MAX_API_ENDPOINTS.
     """
+
     if not text:
         return []
 
@@ -447,15 +594,18 @@ def extract_api_endpoints_from_text(text: str, base_url: str) -> List[str]:
         re.compile(r"['\"](https?://[^'\"]+(?:/api/|/v\d+/|/rest/)[^'\"]+)['\"]", re.I),
     ]
 
-    candidates = []
+    candidates: List[str] = []
     for pat in api_patterns:
         for m in pat.finditer(text):
-            cand = m.group(1) if m.groups() else m.group(0)
-            norm = _normalize_candidate(cand, base_url)
-            if norm and _is_http_url(norm):
-                candidates.append(norm)
-            if len(candidates) >= MAX_API_ENDPOINTS:
-                break
+            try:
+                cand = m.group(1) if m.groups() else m.group(0)
+                norm = _normalize_candidate(cand, base_url)
+                if norm and _is_http_url(norm):
+                    candidates.append(norm)
+                if len(candidates) >= MAX_API_ENDPOINTS:
+                    break
+            except Exception:
+                continue
         if len(candidates) >= MAX_API_ENDPOINTS:
             break
 
@@ -466,10 +616,10 @@ def extract_api_endpoints_from_text(text: str, base_url: str) -> List[str]:
 #  ThreatIntel Reporter
 # ============================================================
 
-def report_threatintel(node: dict, gui_callback=None):
+def report_threatintel(node: Dict[str, Any], gui_callback=None) -> None:
     """
-    Безпечна передача метаданих у ThreatIntel.
-    Логіка збережена, код очищений.
+    Safe reporting of metadata to ThreatIntel / GUI callback.
+    Builds a masked, deduplicated summary and calls gui_callback if provided.
     """
     if not gui_callback:
         return
@@ -479,14 +629,14 @@ def report_threatintel(node: dict, gui_callback=None):
         forms = node.get("forms") or []
         scripts = node.get("scripts") or []
         headers = node.get("headers") or {}
-        api_endpoints = node.get("api_endpoints") or []
+        api_endpoints = dedupe_preserve_order(node.get("api_endpoints") or [])[:MAX_API_ENDPOINTS]
         links = node.get("links") or []
-        meta = node.get("meta") or {}
+        meta = node.get("meta") or []
         events = node.get("events") or []
         error = node.get("error")
 
-        # Безпечне вилучення шляхів скриптів
-        script_paths = []
+        # Extract script paths safely
+        script_paths: List[str] = []
         for s in scripts:
             if isinstance(s, dict):
                 p = s.get("path") or s.get("src") or s.get("url") or ""
@@ -496,8 +646,8 @@ def report_threatintel(node: dict, gui_callback=None):
                 script_paths.append(p)
         script_paths = dedupe_preserve_order(script_paths)[:50]
 
-        # Маскування довгих заголовків
-        safe_headers = {}
+        # Mask long header values
+        safe_headers: Dict[str, str] = {}
         for k, v in headers.items():
             vs = str(v)
             safe_headers[str(k)] = vs if len(vs) <= 200 else vs[:100] + "…"
@@ -518,42 +668,61 @@ def report_threatintel(node: dict, gui_callback=None):
         try:
             gui_callback({"crawler": safe_report})
         except Exception:
-            pass
-
+            logger.debug("gui_callback failed for %s", url)
     except Exception:
         try:
             gui_callback({"crawler": {"module": "crawler", "error": "failed to build safe report"}})
         except Exception:
             pass
 
+
 # ============================================================
 #  Hybrid Fetch Pipeline
 # ============================================================
 
-def fetch_with_requests_raw(url: str, timeout: int = 10, session: Optional[requests.Session] = None):
+def fetch_with_requests_raw(url: str, timeout: int = REQUEST_TIMEOUT, session: Optional[requests.Session] = None):
+    """
+    Try requests first. Returns Response on success or None on failure.
+    Uses DEFAULT_HEADERS and optional session.
+    """
+    sess = session or requests.Session()
     try:
-        sess = session or requests.Session()
+        rate_limit()
         return sess.get(url, headers=DEFAULT_HEADERS, timeout=timeout, allow_redirects=True)
     except Exception as e:
-        logger.warning("requests failed for %s: %s", url, e)
+        logger.debug("requests failed for %s: %s", url, e)
         return None
 
 
+
 def fetch_with_cloudscraper(url: str, timeout: int = 15) -> Optional[str]:
+    """
+    Use cloudscraper to bypass simple bot protections. Returns HTML text or None.
+    """
     try:
-        scraper = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False}
-        )
+        rate_limit()
+        scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
+        if PROXIES:
+            try:
+                scraper.proxies.update(PROXIES)
+            except Exception:
+                logger.debug("Invalid PROXIES for cloudscraper; skipping proxies.")
         resp = scraper.get(url, timeout=timeout, allow_redirects=True)
-        if resp.status_code >= 400:
+        if resp is None:
+            return None
+        if getattr(resp, "status_code", 0) >= 400:
             logger.warning("cloudscraper: %s returned HTTP %s", url, resp.status_code)
         return resp.text or ""
     except Exception as e:
-        logger.warning("cloudscraper failed for %s: %s", url, e)
+        logger.debug("cloudscraper failed for %s: %s", url, e)
         return None
 
 
 def fetch_with_playwright(url: str, timeout: int = 25) -> Optional[str]:
+    """
+    Render page with Playwright (headless). Returns HTML or None.
+    Safe-guards: returns None if Playwright not available or on error.
+    """
     if not PLAYWRIGHT_AVAILABLE:
         return None
 
@@ -563,23 +732,29 @@ def fetch_with_playwright(url: str, timeout: int = 25) -> Optional[str]:
                 browser = p.chromium.launch(headless=True)
                 context = browser.new_context(
                     viewport={"width": 1920, "height": 1080},
-                    user_agent=DEFAULT_HEADERS["User-Agent"],
+                    user_agent=DEFAULT_HEADERS.get("User-Agent"),
                 )
-                context.add_init_script(
-                    "Object.defineProperty(navigator, 'webdriver', {get: () => false});"
-                )
+                try:
+                    context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => false});")
+                except Exception:
+                    pass
 
                 page = context.new_page()
-                page.set_default_timeout(timeout * 1000)
+                page.set_default_timeout(max(1000, int(timeout * 1000)))
                 page.goto(url, wait_until="networkidle")
                 html = page.content()
-
-                context.close()
-                browser.close()
+                try:
+                    context.close()
+                except Exception:
+                    pass
+                try:
+                    browser.close()
+                except Exception:
+                    pass
                 return html
 
+        rate_limit()
         return _inner()
-
     except Exception as e:
         logger.warning("Playwright failed for %s: %s", url, e)
         return None
@@ -587,9 +762,10 @@ def fetch_with_playwright(url: str, timeout: int = 25) -> Optional[str]:
 
 def fetch_html_hybrid_fallback(url: str) -> Optional[str]:
     """
-    Гібридний HTML fetch:
-    1) cloudscraper
-    2) Playwright
+    Hybrid HTML fetch:
+      1) cloudscraper
+      2) Playwright (if cloudscraper result is too small or missing)
+    Returns HTML string or None.
     """
     url = normalize_scheme(url)
 
@@ -599,6 +775,7 @@ def fetch_html_hybrid_fallback(url: str) -> Optional[str]:
 
     return fetch_with_playwright(url)
 
+
 # ============================================================
 #  SUPER-CRAWLER — головна функція
 # ============================================================
@@ -606,52 +783,51 @@ def fetch_html_hybrid_fallback(url: str) -> Optional[str]:
 def crawl_site(
     url: str,
     depth: int = 0,
-    session: requests.Session | None = None,
+    session: Optional[requests.Session] = None,
     gui_callback=None,
     max_links: int = MAX_LINKS_PER_PAGE,
     max_scripts: int = MAX_SCRIPTS_PER_PAGE,
     aggressive: bool = AGGRESSIVE_HEADERS,
     parallel: bool = True,
-):
+) -> Dict[str, Any]:
     """
-    Головний краулер:
-      - requests → cloudscraper → Playwright fallback
-      - HTML/JS парсинг
-      - витяг чутливих даних
+    Main crawler:
+      - requests -> cloudscraper -> Playwright fallback
+      - HTML/JS parsing
+      - sensitive data extraction
       - ThreatIntel callback
-      - рекурсія + ThreadPoolExecutor
-      - запис у tree_log, dot_edges, nodes_json
-    Логіка збережена 1:1, код очищений.
+      - recursion + ThreadPoolExecutor
+      - writes to tree_log, dot_edges, nodes_json
+    Logic preserved; code cleaned and hardened.
     """
-
     global visited, tree_log, dot_edges, nodes_json, js_cache
 
+    # Initialize session lazily
     if session is None:
         session = make_session(aggressive=aggressive)
 
-    # Обмеження глибини
+    # Depth guard
     if depth > CRAWL_DEPTH_LIMIT:
         return {"url": url, "error": "Depth limit exceeded"}
 
     safe_url = normalize_scheme(url)
     parsed = urlparse(safe_url)
-    parsed_domain = parsed.netloc
+    parsed_domain = parsed.netloc or ""
 
-    # Перевірка білого списку доменів
-    if CRAWL_DOMAINS_WHITELIST and not any(
-        domain in parsed_domain for domain in CRAWL_DOMAINS_WHITELIST
-    ):
-        return {"url": safe_url, "error": "Domain not whitelisted"}
+    # Whitelist check
+    if CRAWL_DOMAINS_WHITELIST:
+        if parsed_domain not in CRAWL_DOMAINS_WHITELIST and not any(parsed_domain.endswith("." + d) for d in CRAWL_DOMAINS_WHITELIST):
+            return {"url": safe_url, "error": "Domain not whitelisted"}
 
-    # Унікальність URL
+    # Uniqueness (hash without query/fragment)
     url_id = hash_url_no_query(safe_url)
     with visited_lock:
         if url_id in visited:
             return {"url": safe_url, "error": "Already visited"}
         visited.add(url_id)
 
-    # Структура вузла
-    node = {
+    # Node skeleton
+    node: Dict[str, Any] = {
         "url": safe_url,
         "forms": [],
         "scripts": [],
@@ -691,69 +867,55 @@ def crawl_site(
     }
 
     try:
-        # ============================================================
-        # 1) Основний HTTP‑запит
-        # ============================================================
+        # Fetch (requests first; hybrid fallback later)
+        rate_limit()
+        resp = fetch_with_requests_raw(safe_url, timeout=REQUEST_TIMEOUT, session=session)
 
-        r = fetch_with_requests_raw(safe_url, timeout=10, session=session)
-
-        if r is None:
-            # fallback → HTML only
+        if resp is None:
             html = fetch_html_hybrid_fallback(safe_url) or ""
             content_type = "text/html"
             headers = {}
             cookies_obj = None
         else:
-            content_type = r.headers.get("Content-Type", "")
-            headers = r.headers
-            cookies_obj = r.cookies
-            html = r.text or ""
+            content_type = (resp.headers.get("Content-Type", "") or "").lower()
+            headers = dict(resp.headers or {})
+            cookies_obj = getattr(resp, "cookies", None)
+            html = resp.text or ""
 
-        # ============================================================
-        # 2) Заголовки
-        # ============================================================
-
+        # Headers summary
         node["headers"] = {
-            "CSP": headers.get("Content-Security-Policy", "-") if headers else "-",
-            "X-XSS-Protection": headers.get("X-XSS-Protection", "-") if headers else "-",
-            "Referrer-Policy": headers.get("Referrer-Policy", "-") if headers else "-",
-            "X-Content-Type-Options": headers.get("X-Content-Type-Options", "-") if headers else "-",
-            "X-Frame-Options": headers.get("X-Frame-Options", "-") if headers else "-",
-            "Strict-Transport-Security": headers.get("Strict-Transport-Security", "-") if headers else "-",
-            "Server": headers.get("Server", "-") if headers else "-",
-            "X-Powered-By": headers.get("X-Powered-By", "-") if headers else "-",
+            "CSP": headers.get("Content-Security-Policy", "-"),
+            "X-XSS-Protection": headers.get("X-XSS-Protection", "-"),
+            "Referrer-Policy": headers.get("Referrer-Policy", "-"),
+            "X-Content-Type-Options": headers.get("X-Content-Type-Options", "-"),
+            "X-Frame-Options": headers.get("X-Frame-Options", "-"),
+            "Strict-Transport-Security": headers.get("Strict-Transport-Security", "-"),
+            "Server": headers.get("Server", "-"),
+            "X-Powered-By": headers.get("X-Powered-By", "-"),
         }
 
         # Cookies
         if cookies_obj:
-            node["cookies"] = [
-                {"name": c.name, "value": (c.value or "")[:100], "domain": c.domain}
-                for c in cookies_obj
-            ]
+            try:
+                node["cookies"] = [{"name": c.name, "value": (c.value or "")[:100], "domain": c.domain} for c in
+                                   cookies_obj]
+            except Exception:
+                node["cookies"] = []
 
         # ============================================================
         # 3) JSON endpoint
         # ============================================================
 
-        if ("application/json" in content_type or safe_url.endswith(".json")) and r is not None:
+        if ("application/json" in content_type or safe_url.lower().endswith(".json")) and resp is not None:
             try:
-                json_data = r.json()
+                json_data = resp.json()
                 node["api_endpoints"].append(safe_url)
-
-                sensitive = extract_sensitive_data(json.dumps(json_data))
-                for key, value in sensitive.items():
-                    if key in node and value:
-                        node[key].extend(value)
-
+                _merge_sensitive_into_node(node, extract_sensitive_data(json.dumps(json_data)))
             except Exception as e:
                 node["error"] = f"json_parse_error: {e}"
 
             node["api_endpoints"] = dedupe_preserve_order(node["api_endpoints"])[:MAX_API_ENDPOINTS]
-
-            # Дедуплікація всіх списків
-            for k in node:
-                if isinstance(node[k], list):
-                    node[k] = dedupe_preserve_order(node[k])[:MAX_MATCHES_PER_KEY]
+            _trim_node_list_fields(node)
 
             with nodes_lock:
                 nodes_json.append(node)
@@ -762,19 +924,13 @@ def crawl_site(
             report_threatintel(node, gui_callback)
             return node
 
-        # ============================================================
-        # 4) HTML‑парсинг
-        # ============================================================
-
+            # HTML parsing
         soup = BeautifulSoup(html or "", "html.parser")
 
-        # Sensitive data по всьому HTML
-        sensitive = extract_sensitive_data(html)
-        for key, value in sensitive.items():
-            if key in node and value:
-                node[key].extend(value)
+        # Sensitive data from full HTML
+        _merge_sensitive_into_node(node, extract_sensitive_data(html))
 
-        # API endpoints з HTML
+        # API endpoints from HTML
         node["api_endpoints"].extend(extract_api_endpoints_from_text(html, safe_url))
 
         # ============================================================
@@ -836,10 +992,7 @@ def crawl_site(
                             )
 
                             # Sensitive data з JS
-                            js_sensitive = extract_sensitive_data(js_text)
-                            for key, value in js_sensitive.items():
-                                if key in node and value:
-                                    node[key].extend(value)
+                            _merge_sensitive_into_node(node, extract_sensitive_data(js_text))
                         else:
                             insights = {"functions": [], "fetch_calls": [], "ajax_calls": [], "sensitive": []}
 
@@ -866,10 +1019,7 @@ def crawl_site(
                         extract_api_endpoints_from_text(js, safe_url)
                     )
 
-                    js_sensitive = extract_sensitive_data(js)
-                    for key, value in js_sensitive.items():
-                        if key in node and value:
-                            node[key].extend(value)
+                    _merge_sensitive_into_node(node, extract_sensitive_data(js))
                 else:
                     insights = {"functions": [], "fetch_calls": [], "ajax_calls": [], "sensitive": []}
 
@@ -970,10 +1120,7 @@ def crawl_site(
 
         # Sensitive data з коментарів
         for c in node["comments"]:
-            cs = extract_sensitive_data(c)
-            for k, v in cs.items():
-                if k in node and v:
-                    node[k].extend(v)
+            _merge_sensitive_into_node(node, extract_sensitive_data(c))
 
         # ============================================================
         # 13) Кнопки
@@ -1049,10 +1196,7 @@ def crawl_site(
         # ============================================================
 
         node["api_endpoints"] = dedupe_preserve_order(node["api_endpoints"])[:MAX_API_ENDPOINTS]
-
-        for k in list(node.keys()):
-            if isinstance(node[k], list):
-                node[k] = dedupe_preserve_order(node[k])[:MAX_MATCHES_PER_KEY]
+        _trim_node_list_fields(node)
 
         # Запис у nodes_json
         with nodes_lock:
@@ -1071,13 +1215,10 @@ def crawl_site(
             for link in unique_links:
                 if not is_same_domain(link, parsed_domain):
                     continue
-
                 link_id = hash_url_no_query(link)
                 with visited_lock:
                     if link_id in visited:
                         continue
-                    visited.add(link_id)
-
                 to_visit.append(link)
 
             if to_visit:
@@ -1108,13 +1249,10 @@ def crawl_site(
             for link in unique_links:
                 if not is_same_domain(link, parsed_domain):
                     continue
-
                 link_id = hash_url_no_query(link)
                 with visited_lock:
                     if link_id in visited:
                         continue
-                    visited.add(link_id)
-
                 crawl_site(
                     link,
                     depth + 1,
@@ -1148,17 +1286,11 @@ def build_final_dict(nodes: List[Dict[str, Any]], max_items: int = 500) -> Dict[
     except Exception:
         dedupe = lambda s: list(dict.fromkeys(s))
 
-    def _mask(s: str, keep: int = 4) -> str:
-        mask_fn = globals().get("mask_secret", None)
-        if callable(mask_fn):
-            try:
-                return mask_fn(s, keep=keep)
-            except Exception:
-                pass
-        s = str(s)
-        if len(s) <= keep * 2:
-            return "*" * len(s)
-        return s[:keep] + "*" * (len(s) - keep * 2) + s[-keep:]
+    def _safe_mask(s: str, keep: int = 4) -> str:
+        try:
+            return mask_secret(str(s), keep=keep)
+        except Exception:
+            return "*" * min(len(str(s)), 8)
 
     if not nodes:
         empty = {
@@ -1262,7 +1394,7 @@ def build_final_dict(nodes: List[Dict[str, Any]], max_items: int = 500) -> Dict[
         items = [str(i) for i in items if i]
         items = dedupe(items)
         count = len(items)
-        examples = [_mask(it) for it in items[:example_limit]]
+        examples = [_safe_mask(it) for it in items[:example_limit]]
         return {"count": count, "examples": examples}
 
     root["tokens"] = _summarize_sensitive(combined_map.get("tokens", []))
@@ -1271,11 +1403,11 @@ def build_final_dict(nodes: List[Dict[str, Any]], max_items: int = 500) -> Dict[
 
     root["passwords"] = {
         "count": len(dedupe(combined_map.get("passwords", []))),
-        "examples": [_mask(x, keep=2) for x in dedupe(combined_map.get("passwords", []))[:3]],
+        "examples": [_safe_mask(x, keep=2) for x in dedupe(combined_map.get("passwords", []))[:3]],
     }
     root["secrets"] = {
         "count": len(dedupe(combined_map.get("secrets", []))),
-        "examples": [_mask(x, keep=4) for x in dedupe(combined_map.get("secrets", []))[:3]],
+        "examples": [_safe_mask(x, keep=4) for x in dedupe(combined_map.get("secrets", []))[:3]],
     }
 
     expected_list_fields = [
@@ -1487,17 +1619,17 @@ def save_outputs(result: Dict[str, Any], gui_callback=None, max_nodes_save: int 
             if not isinstance(n, dict):
                 continue
             try:
+                api_ep = n.get("api_endpoints")
+                api_ep_count = (
+                    api_ep.get("count", 0)
+                    if isinstance(api_ep, dict)
+                    else safe_len(n, "api_endpoints")
+                )
                 summary.append({
                     "url": safe_url(n.get("url", "")),
                     "forms": safe_len(n, "forms"),
                     "scripts": safe_len(n, "scripts"),
-                    "api_endpoints": (
-                        n.get("api_endpoints", []) and (
-                            n.get("api_endpoints").get("count")
-                            if isinstance(n.get("api_endpoints"), dict)
-                            else safe_len(n, "api_endpoints")
-                        )
-                    ),
+                    "api_endpoints": api_ep_count,
                     "ipv6": safe_len(n, "ipv6"),
                     "mac": safe_len(n, "mac"),
                     "cidr": safe_len(n, "cidr"),

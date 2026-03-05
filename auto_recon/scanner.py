@@ -18,7 +18,7 @@ from bs4 import BeautifulSoup
 
 # === Локальные утилиты ===
 from xss_security_gui.utils.core_utils import normalize_url
-from xss_security_gui.config_manager import LOGS_DIR
+from xss_security_gui.settings import LOG_DIR
 
 # === Локальные модули ===
 from xss_security_gui.xss_detector import XSSDetector
@@ -487,7 +487,7 @@ def scan_multiple(urls: List[str]) -> List[Dict[str, Any]]:
 #  NDJSON логирование XSS
 # ============================================================
 
-LOG_DIR: Path = LOGS_DIR / "xss"
+LOG_DIR: Path = LOG_DIR / "xss"
 LOG_FILE: Path = LOG_DIR / "reflected_responses.json"
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)

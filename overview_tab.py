@@ -27,8 +27,8 @@ from tkinter import ttk, messagebox, filedialog
 from xss_security_gui.report_merger import ReportMerger
 from xss_security_gui.crawler import crawl_site
 from xss_security_gui.api_parser import extract_api_data
-from xss_security_gui.config_manager import (
-    CRAWLER_RESULTS_PATH,
+from xss_security_gui.settings import (
+    crawler_results_path,
     DEEP_CRAWL_JSON_PATH,
     THREAT_LOG_PATH,
     LOG_HONEYPOT_HITS,
@@ -53,7 +53,7 @@ class OverviewTab(ttk.Frame):
         self.threat_tab = threat_tab
 
         # Пути к основным артефактам (универсальные)
-        self.crawler_path: Path = CRAWLER_RESULTS_PATH
+        self.crawler_path: Path = crawler_results_path()
         self.deep_crawl_path: Path = DEEP_CRAWL_JSON_PATH
         self.threat_log_path: Path = THREAT_LOG_PATH
 

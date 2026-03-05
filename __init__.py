@@ -111,53 +111,12 @@ def check_libraries() -> None:
             sys.exit(1)
 
 # ============================================================
-# ⚙️ Загрузка дополнительной конфигурации (legacy)
-# ============================================================
-
-def load_json(path: str) -> dict:
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        logger.warning(f"Ошибка загрузки {path}: {e}")
-        return {}
-
-
-def load_config() -> dict:
-    """
-    Legacy-конфиг (default_config.json / user_config.json).
-    Используется как дополнительный слой поверх settings, но не заменяет его.
-    """
-    default_cfg = os.path.join(DIRS["target"], "default_config.json")
-    user_cfg = os.path.join(DIRS["target"], "user_config.json")
-
-    cfg = load_json(default_cfg)
-    if cfg:
-        logger.info(f"Загружена базовая конфигурация: {default_cfg}")
-        print(f"[⚙️] Загружена базовая конфигурация: {default_cfg}")
-
-    user = load_json(user_cfg)
-    if user:
-        cfg.update(user)
-        logger.info(f"Загружена пользовательская конфигурация: {user_cfg}")
-        print(f"[⚙️] Загружена пользовательская конфигурация: {user_cfg}")
-
-    if not cfg:
-        logger.warning("Дополнительная конфигурация не найдена.")
-        print("[⚠️] Дополнительная конфигурация не найдена.")
-
-    return cfg
-
-# ============================================================
 # 🧩 AppContext — единый объект окружения
 # ============================================================
 
 class AppContext:
-    def __init__(self, config: dict):
+    def __init__(self):
         self.version = VERSION
-        self.config = config
         self.paths = DIRS
         self.logger = logger
         self.initialized_at = datetime.datetime.now().isoformat()
@@ -168,7 +127,6 @@ class AppContext:
             "version": self.version,
             "initialized_at": self.initialized_at,
             "paths": self.paths,
-            "config_keys": list(self.config.keys()),
             "profile": self.settings.profile,
         }
 
@@ -193,9 +151,6 @@ def init_environment() -> AppContext:
     # === Загрузка payload'ов ===
     load_payloads()
 
-    # === Дополнительная конфигурация (legacy) ===
-    cfg = load_config()
-
     # === ThreatConnector: экспорт статистики payload'ов ===
     try:
         from xss_security_gui.payloads import PAYLOADS
@@ -203,15 +158,13 @@ def init_environment() -> AppContext:
     except Exception as e:
         logger.warning(f"Не удалось отправить статистику payload'ов: {e}")
 
-    cfg.setdefault("threat_enabled", True)
-
     print(f"[🛡️ XSS GUI] Запуск: {datetime.datetime.now().isoformat()}")
     print(f"[📦 Версия GUI] {VERSION}")
     print("[✅] Инициализация завершена. Payload’ы загружены. Логи активны.")
 
     logger.info("Окружение успешно инициализировано.")
 
-    _context = AppContext(cfg)
+    _context = AppContext()
     _initialized = True
     return _context
 

@@ -6,9 +6,9 @@ import os
 import logging
 from typing import Optional, List, Dict, Any, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from mutator import mutate_payload
-from xss_detector import XSSDetector
-from utils.core_utils import normalize_url
+from xss_security_gui.payload_mutator import mutate_payload
+from xss_security_gui.xss_detector import XSSDetector
+from xss_security_gui.utils.core_utils import normalize_url
 
 logger = logging.getLogger(__name__)
 

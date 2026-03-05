@@ -8,25 +8,37 @@ import shutil
 import threading
 import datetime
 import json
+import logging
 import tkinter as tk
 from tkinter import ttk
-from xss_security_gui.config import SETTINGS_PATH
+
 from XSStrike.core.fuzzer import fuzzer
 from XSStrike.core.config import xsschecker
+
 # ============================================================
 #  Централизованная конфигурация (ULTRA Hybrid)
 # ============================================================
 from xss_security_gui.settings import (
+    SETTINGS_JSON_PATH,
+    GUI_STATE_PATH,
     settings,
     BASE_DIR,
     LOG_DIR,
-    crawler_results_path,   # snake_case функция
+    crawler_results_path,
     LOG_SUCCESS_PATH,
-    ENABLE_AUTO_TRAPS, PAYLOADS_DIR,
+    ENABLE_AUTO_TRAPS,
+    PAYLOADS_DIR,
+)
+from xss_security_gui.settings import (
+    XSS_PAYLOAD_FILE,
+    SQLI_PAYLOAD_FILE,
+    CSRF_PAYLOAD_FILE,
+    SSRF_PAYLOAD_FILE,
 )
 
-GUI_STATE_FILE = LOG_DIR / "gui_state.json"
 CRAWLER_RESULTS_PATH = crawler_results_path()
+_logger = logging.getLogger(__name__)
+
 
 # ============================================================
 #  Загрузка результатов предыдущего краулинга
@@ -37,7 +49,7 @@ def load_crawler_results() -> dict:
     try:
         return json.loads(CRAWLER_RESULTS_PATH.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
-        logger.warning(f"Ошибка чтения crawler_results: {e}")
+        _logger.warning("Ошибка чтения crawler_results: %s", e)
         return {}
 
 
@@ -46,7 +58,7 @@ crawler_results = load_crawler_results()
 #  Импорты функциональных модулей
 # ============================================================
 from xss_security_gui.crawler import save_outputs, build_final_dict
-from xss_security_gui.analyzer import XSSAnalyzerApp, logger
+from xss_security_gui.analyzer import XSSAnalyzerApp
 from xss_security_gui.honeypot_monitor import monitor_log_thread
 from xss_security_gui.honeypot_server import start_honeypot_server
 from xss_security_gui.xss_detector import XSSDetector
@@ -157,7 +169,7 @@ class XSSSecurityGUI(tk.Tk):
         print(env_status)
         self.log(env_status)
 
-        print(f"[📦 Версия GUI] 1.2.5")
+        print(f"[📦 Версия GUI] {__version__}")
         print(f"[AutoTrap] {'Включены' if ENABLE_AUTO_TRAPS else 'Отключены'}")
 
         # Тема интерфейса из ULTRA Hybrid Settings
@@ -365,28 +377,23 @@ class XSSSecurityGUI(tk.Tk):
 
         existing = [self.tab_control.tab(i, "text") for i in range(self.tab_control.index("end"))]
 
-        xss_payload_path = PAYLOADS_DIR / "xss.json"
-        sqli_payload_path = PAYLOADS_DIR / "sqli.json"
-        csrf_payload_path = PAYLOADS_DIR / "csrf.json"
-        ssrf_payload_path = PAYLOADS_DIR / "ssrf.json"
-
         if "🛡️ SQLi" not in existing:
-            tab = SQLiTab(self.tab_control, url, payload_file=str(sqli_payload_path))
+            tab = SQLiTab(self.tab_control, url, payload_file=str(SQLI_PAYLOAD_FILE))
             tab.pack(fill="both", expand=True)
             self.tab_control.add(tab, text="🛡️ SQLi")
 
         if "🛡️ XSS" not in existing:
-            tab = XSSTab(self.tab_control, url, payload_file=str(xss_payload_path))
+            tab = XSSTab(self.tab_control, url, payload_file=str(XSS_PAYLOAD_FILE))
             tab.pack(fill="both", expand=True)
             self.tab_control.add(tab, text="🛡️ XSS")
 
         if "🛡️ CSRF" not in existing:
-            tab = CSRFTab(self.tab_control, url, payload_file=str(csrf_payload_path))
+            tab = CSRFTab(self.tab_control, url, payload_file=str(CSRF_PAYLOAD_FILE))
             tab.pack(fill="both", expand=True)
             self.tab_control.add(tab, text="🛡️ CSRF")
 
         if "🛡️ SSRF" not in existing:
-            tab = SSRFTab(self.tab_control, url, payload_file=str(ssrf_payload_path))
+            tab = SSRFTab(self.tab_control, url, payload_file=str(SSRF_PAYLOAD_FILE))
             tab.pack(fill="both", expand=True)
             self.tab_control.add(tab, text="🛡️ SSRF")
 
@@ -401,7 +408,6 @@ class XSSSecurityGUI(tk.Tk):
         def callback(success, message):
             self.after(0, self._on_graph_render_done, success, message)
 
-        from xss_security_gui.visualizer import render_dot_to_svg
         render_dot_to_svg(dot_path, svg_path, callback=callback)
 
     def _on_graph_render_done(self, success, message):
@@ -483,13 +489,13 @@ class XSSSecurityGUI(tk.Tk):
     def save_gui_state(self):
         try:
             index = self.tab_control.index(self.tab_control.select())
-            save_json(GUI_STATE_FILE, {"last_tab": index})
+            save_json(GUI_STATE_PATH, {"last_tab": index})
         except Exception as e:
             self.log(f"⚠️ Не удалось сохранить состояние GUI: {e}")
 
     def load_gui_state(self):
         try:
-            data = load_json(GUI_STATE_FILE, default={})
+            data = load_json(GUI_STATE_PATH, default={})
             last_index = data.get("last_tab", 0)
 
             if 0 <= last_index < self.tab_control.index("end"):
@@ -598,14 +604,12 @@ class XSSSecurityGUI(tk.Tk):
             self.log(f"⚠️ Не удалось активировать вкладку логов: {e}")
 
 def check_dependencies():
-    if not SETTINGS_PATH.exists():
-        print(f"[⚠️] settings.json не найден: {SETTINGS_PATH}")
-
+    if not SETTINGS_JSON_PATH.exists():
+        print(f"[⚠️] settings.json не найден: {SETTINGS_JSON_PATH}")
     if not shutil.which("ngrok"):
         print("[⚠️] Ngrok не найден. Туннель будет недоступен.")
 
-    #  CLI справка
-    # ============================================================
+
 def show_usage():
     print(
         """
@@ -625,12 +629,18 @@ def show_usage():
 #  Точка входа
 # ============================================================
 if __name__ == "__main__":
-    check_dependencies()
-
     args = sys.argv
     cmd = args[1].lower() if len(args) > 1 else "gui"
 
-    # Honeypot всегда запускается
+    if cmd == "--help" or cmd == "-h":
+        show_usage()
+        sys.exit(0)
+    if cmd == "--version" or cmd == "-v":
+        print(f"XSS Security Suite {__version__}")
+        sys.exit(0)
+
+    check_dependencies()
+
     try:
         threading.Thread(target=start_honeypot_server, daemon=True).start()
     except Exception as e:

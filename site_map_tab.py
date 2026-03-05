@@ -32,7 +32,7 @@ from typing import Dict, Any, List
 
 from xss_security_gui.dom_parser import DOMParser
 from xss_security_gui.site_decomposer import SiteDecomposerEngine
-from xss_security_gui.config_manager import CRAWLER_RESULTS_PATH
+from xss_security_gui.settings import crawler_results_path
 
 class SiteMapTab(ttk.Frame):
     def __init__(self, parent, threat_tab=None):
@@ -79,7 +79,7 @@ class SiteMapTab(ttk.Frame):
         self.events_box.pack(fill="x", padx=5)
 
         # === JSON crawler (универсальный путь) ===
-        self.json_path = CRAWLER_RESULTS_PATH
+        self.json_path = crawler_results_path()
         self.last_size = 0
         self.data: Dict[str, Any] = {}
 

@@ -8,7 +8,7 @@ Token Extractor ULTRA 6.5
 • Сохраняет отчёт в JSON
 • Поддерживает CLI и GUI режимы
 """
-
+import sys
 import re
 import json
 import logging
@@ -17,10 +17,10 @@ from pathlib import Path
 from typing import List, Dict, Any
 
 from xss_security_gui.utils.jwt_decoder import decode_jwt, assess_risks
-from xss_security_gui.config_manager import LOGS_DIR
+from xss_security_gui.settings import LOG_DIR
 
 # 📁 Универсальный путь к логам
-LOG_DIR: Path = LOGS_DIR / "tokens"
+LOG_DIR: Path = LOG_DIR / "tokens"
 LOG_FILE: Path = LOG_DIR / "token_risks.json"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -147,7 +147,7 @@ def analyze_from_gui(headers: Dict[str, str], html: str, output_path: Path = LOG
 #  Автоматический выбор режима
 # ============================================================
 if __name__ == "__main__":
-    import sys
+
 
     logging.basicConfig(
         level=logging.INFO,

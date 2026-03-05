@@ -16,10 +16,10 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from collections import Counter
 
-from xss_security_gui.config_manager import LOGS_DIR
+from xss_security_gui.settings import LOG_DIR
 
 # Директория и файл логов
-LOG_DIR: Path = LOGS_DIR / "xss"
+LOG_DIR: Path = LOG_DIR / "xss"
 LOG_FILE: Path = LOG_DIR / "reflected_responses.json"
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
