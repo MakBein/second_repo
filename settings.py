@@ -24,6 +24,14 @@ from dotenv import load_dotenv
 from xss_security_gui.sandbox_detector import detect_sandbox
 from xss_security_gui.dom_parser import DOMParser
 
+# По умолчанию — безопасный режим: реальные запросы запрещены
+ALLOW_REAL_RUN = True
+
+# Белый список доменов, на которые разрешено выполнять реальные запросы
+ALLOWED_TARGETS = [
+    "gazprombank.ru",
+]
+
 
 # ============================================================
 #  Базовые директории

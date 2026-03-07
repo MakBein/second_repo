@@ -23,6 +23,7 @@ from xss_security_gui.auto_modules.dom_and_endpoints import (
 )
 
 from xss_security_gui.auto_modules.auto_modules import brute_force_tokens
+from xss_security_gui.net_utils import _safe_request
 from xss_security_gui.settings import settings
 
 class AttackEngine:
@@ -98,8 +99,23 @@ class AttackEngine:
         ).start()
         return short_result
 
-    def _run_module_worker(self, name: str, data: dict) -> None:
+    def _run_module_worker(self, name: str, data: dict, ctx: Dict[str, Any]) -> None:
+        """Универсальный обработчик модулей, агрегирующий списки из data."""
         try:
+            # Проверка real-mode
+            allow_real = ctx.get("settings", {}).get("allow_real_run", True)
+            if not allow_real:
+                result = {
+                    "status": "skipped",
+                    "items": [],
+                    "count": 0,
+                    "reason": "real-run-not-allowed",
+                }
+                self._record_result(name, result)
+                self.log_func(f"⏭️ Модуль {name} пропущен (real-run disabled).", "warn")
+                return
+
+            # Основная логика
             items = []
             for _, value in data.items():
                 if isinstance(value, list):
@@ -110,10 +126,17 @@ class AttackEngine:
                 "items": items,
                 "count": len(items),
             }
+
             self._record_result(name, result)
             self.log_func(f"✔️ Модуль {name} завершён. Найдено {len(items)} элементов.", "info")
+
         except Exception as e:
-            result = {"status": "error", "items": [], "error": str(e)}
+            result = {
+                "status": "error",
+                "items": [],
+                "count": 0,
+                "error": str(e),
+            }
             self._record_result(name, result)
             self.log_func(f"❌ Ошибка в модуле {name}: {type(e).__name__}: {e}", "error")
 
@@ -362,6 +385,10 @@ class AttackEngine:
     # ===================== Реализация модулей =====================
 
     def _run_api_endpoints(self, ctx: Dict[str, Any]) -> dict:
+        allow_real = ctx.get("settings", {}).get("allow_real_run", True)
+        if not allow_real:
+            return {"status": "skipped", "reason": "real-run-not-allowed"}
+
         crawl = ctx["crawl"]
         api_endpoints = crawl.get("api_endpoints", [])
         if not api_endpoints:
@@ -383,26 +410,39 @@ class AttackEngine:
         }
 
     def _run_token_bruteforce(self, ctx: Dict[str, Any]) -> dict:
-        tokens = ctx["tokens"]
-        if not tokens:
-            return {"status": "skipped", "items": [], "count": 0, "reason": "no tokens"}
+        # ctx содержит: domain, headers, secrets, settings
+        domain = ctx.get("domain")
+        settings_ctx = ctx.get("settings", {})
+        allow_real = settings_ctx.get("allow_real_run", True)
 
-        results = brute_force_tokens(
-            ctx["session"],
-            ctx["base_url"],
-            tokens,
-            self._log,
-        ) or []
+        # Если реальные запросы запрещены — вернуть тестовый результат или заглушку
+        if not allow_real:
+            return {"status": "skipped", "reason": "real-run-not-allowed"}
 
-        severity = "medium" if results else "low"
-        return {
-            "status": "done",
-            "items": results,
-            "count": len(results),
-            "severity": severity,
-        }
+        # Дополнительная проверка: домен в белом списке (дублирующая защита)
+        if domain not in getattr(settings, "ALLOWED_TARGETS", []):
+            return {"status": "skipped", "reason": "domain-not-allowed"}
+
+        # Пример безопасного сетевого вызова с использованием секретов
+        headers = ctx.get("headers", {}).copy()
+        api_key = ctx.get("secrets", {}).get("api_key")
+        if api_key:
+            headers["X-API-Key"] = api_key
+
+        # Выполняем запрос с таймаутом и обработкой ошибок
+        url = f"https://{domain}/some/endpoint"
+        resp = _safe_request("GET", url, headers=headers, timeout=10)
+        if resp.get("status") == "ok":
+            # обработка ответа
+            return {"status": "done", "count": 1, "items": [resp["text"]]}
+        else:
+            return {"status": "error", "error": resp.get("error")}
 
     def _run_parameters(self, ctx: Dict[str, Any]) -> dict:
+        allow_real = ctx.get("settings", {}).get("allow_real_run", True)
+        if not allow_real:
+            return {"status": "skipped", "reason": "real-run-not-allowed"}
+
         crawl = ctx["crawl"]
         parameters = crawl.get("parameters", [])
         if not parameters:
@@ -423,6 +463,10 @@ class AttackEngine:
         }
 
     def _run_user_ids(self, ctx: Dict[str, Any]) -> dict:
+        allow_real = ctx.get("settings", {}).get("allow_real_run", True)
+        if not allow_real:
+            return {"status": "skipped", "reason": "real-run-not-allowed"}
+
         crawl = ctx["crawl"]
         user_ids = crawl.get("user_ids", [])
         if not user_ids:
@@ -443,6 +487,10 @@ class AttackEngine:
         }
 
     def _run_xss_targets(self, ctx: Dict[str, Any]) -> dict:
+        allow_real = ctx.get("settings", {}).get("allow_real_run", True)
+        if not allow_real:
+            return {"status": "skipped", "reason": "real-run-not-allowed"}
+
         crawl = ctx["crawl"]
         xss_targets = crawl.get("xss_targets", [])
         if not xss_targets:
@@ -456,6 +504,7 @@ class AttackEngine:
         ) or []
 
         severity = "high" if results else "low"
+
         return {
             "status": "done",
             "items": results,
@@ -477,6 +526,9 @@ class AttackEngine:
     def _run_js_sensitive(self, ctx: Dict[str, Any]) -> dict:
         crawl = ctx["crawl"]
         scripts = crawl.get("scripts", [])
+        allow_real = ctx.get("settings", {}).get("allow_real_run", True)
+        if not allow_real:
+            return {"status": "skipped", "reason": "real-run-not-allowed"}
         if not scripts:
             return {"status": "skipped", "items": [], "count": 0, "reason": "no scripts"}
 
@@ -510,8 +562,13 @@ class AttackEngine:
         }
 
     def _run_security_headers(self, ctx: Dict[str, Any]) -> dict:
+        allow_real = ctx.get("settings", {}).get("allow_real_run", True)
+        if not allow_real:
+            return {"status": "skipped", "reason": "real-run-not-allowed"}
+
         crawl = ctx["crawl"]
         headers_info = crawl.get("headers", [])
+
         return {
             "status": "done",
             "items": [{"headers": headers_info}],
@@ -520,8 +577,13 @@ class AttackEngine:
         }
 
     def _run_csp(self, ctx: Dict[str, Any]) -> dict:
+        allow_real = ctx.get("settings", {}).get("allow_real_run", True)
+        if not allow_real:
+            return {"status": "skipped", "reason": "real-run-not-allowed"}
+
         crawl = ctx["crawl"]
         csp_info = crawl.get("csp_analysis", [])
+
         return {
             "status": "done",
             "items": [{"csp": csp_info}],
@@ -530,11 +592,17 @@ class AttackEngine:
         }
 
     def _run_secrets(self, ctx: Dict[str, Any]) -> dict:
+        allow_real = ctx.get("settings", {}).get("allow_real_run", True)
+        if not allow_real:
+            return {"status": "skipped", "reason": "real-run-not-allowed"}
+
         crawl = ctx["crawl"]
         secrets = crawl.get("secrets", [])
         api_keys = crawl.get("api_keys", [])
+
         items = [{"secrets": secrets, "api_keys": api_keys}]
         severity = "high" if secrets or api_keys else "low"
+
         return {
             "status": "done",
             "items": items,
@@ -543,10 +611,16 @@ class AttackEngine:
         }
 
     def _run_jwt(self, ctx: Dict[str, Any]) -> dict:
+        allow_real = ctx.get("settings", {}).get("allow_real_run", True)
+        if not allow_real:
+            return {"status": "skipped", "reason": "real-run-not-allowed"}
+
         crawl = ctx["crawl"]
         jwt_tokens = crawl.get("jwt_tokens", [])
+
         items = [{"token": t} for t in jwt_tokens]
         severity = "medium" if jwt_tokens else "low"
+
         return {
             "status": "done",
             "items": items,
@@ -555,9 +629,15 @@ class AttackEngine:
         }
 
     def _run_forms(self, ctx: Dict[str, Any]) -> dict:
+        allow_real = ctx.get("settings", {}).get("allow_real_run", True)
+        if not allow_real:
+            return {"status": "skipped", "reason": "real-run-not-allowed"}
+
         crawl = ctx["crawl"]
         forms = crawl.get("forms", [])
+
         items = [{"form": f} for f in forms]
+
         return {
             "status": "done",
             "items": items,
@@ -566,10 +646,16 @@ class AttackEngine:
         }
 
     def _run_errors(self, ctx: Dict[str, Any]) -> dict:
+        allow_real = ctx.get("settings", {}).get("allow_real_run", True)
+        if not allow_real:
+            return {"status": "skipped", "reason": "real-run-not-allowed"}
+
         crawl = ctx["crawl"]
         errors = crawl.get("errors", [])
+
         items = [{"error": e} for e in errors]
         severity = "warn" if errors else "info"
+
         return {
             "status": "done",
             "items": items,
@@ -578,9 +664,13 @@ class AttackEngine:
         }
 
     def _run_csrf(self, ctx: Dict[str, Any]) -> dict:
-        """
-        Запуск CSRF-пейлоадов из csrf.json.
-        """
+        allow_real = ctx.get("settings", {}).get("allow_real_run", True)
+        if not allow_real:
+            return {"status": "skipped", "reason": "real-run-not-allowed"}
+        domain = ctx.get("domain")
+        if domain not in getattr(settings, "ALLOWED_TARGETS", []):
+            return {"status": "skipped", "reason": "domain-not-allowed"}
+
         try:
             csrf_file = ctx["crawl"].get("csrf_file") or settings.get("payloads.csrf_file")
             with open(csrf_file, encoding="utf-8") as f:

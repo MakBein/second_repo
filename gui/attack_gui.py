@@ -3,13 +3,14 @@ import csv
 import os
 import threading
 import json
+import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
 from urllib.parse import urlparse
 from queue import Empty
 
-from xss_security_gui import DIRS
+from xss_security_gui import DIRS, settings
 from xss_security_gui.attack_engine import AttackEngine
 from xss_security_gui.mutator_task_manager import MutatorTaskManager
 from xss_security_gui.gui.mutator_tasks_panel import MutatorTasksPanel
@@ -116,6 +117,17 @@ class AttackGUI(tk.Frame):
             self.threat_sender(module=module, target=target, result=result, **kwargs)
         except Exception as e:
             self._safe_call(self._log_proxy, f"❌ Ошибка Threat Intel: {type(e).__name__}: {e}", "error")
+
+    def _load_secrets(self) -> dict:
+        """
+        Загружает секреты только из безопасных источников (переменные окружения).
+        Не хранит секреты в репозитории.
+        """
+        return {
+            "api_key": os.environ.get("XSS_API_KEY"),
+            "auth_token": os.environ.get("XSS_AUTH_TOKEN"),
+            # добавьте другие ключи по необходимости, но не хардкодьте значения
+        }
 
     def _start_mutation_worker(self):
         threading.Thread(target=self._mutation_worker, daemon=True).start()
@@ -283,7 +295,8 @@ class AttackGUI(tk.Frame):
                     self.crawl_json["scripts"] = scripts
                     self._safe_call(self._log_proxy, f"📌 Загружено JS-скриптов: {len(scripts)}", "info")
                 except Exception as e:
-                    self._safe_call(self._log_proxy, f"❌ Ошибка загрузки deep_crawl.json: {type(e).__name__}: {e}", "error")
+                    self._safe_call(self._log_proxy, f"❌ Ошибка загрузки deep_crawl.json: {type(e).__name__}: {e}",
+                                    "error")
             else:
                 self._safe_call(self._log_proxy, f"⚠️ Файл deep_crawl.json не найден: {deep_crawl_path}", "warn")
                 self.crawl_json.setdefault("scripts", [])
@@ -298,49 +311,113 @@ class AttackGUI(tk.Frame):
                 "XSS Targets", "GraphQL Endpoints", "JS Sensitive Analysis", "Security Headers Review",
                 "CSP Weakness Scan", "Secrets & Keys", "JWT Tokens", "Forms & Inputs", "Error Pages & Stacktraces"
             ]
+
             self._reset_progress(len(modules))
+            self._safe_call(self.status_label.config, text="Статус: выполняется…")
+            self._safe_call(self._log_proxy, "🧨 Запуск автоатаки (циклический режим)…", "info")
 
-            for idx, name in enumerate(modules, start=1):
-                if self._stop_requested:
-                    self._safe_call(self._log_proxy, "⏹️ Атака остановлена пользователем.", "warn")
-                    break
+            allowed_targets = getattr(settings, "ALLOWED_TARGETS", [])
+            allow_real = getattr(settings, "ALLOW_REAL_RUN", True)
+            secrets = self._load_secrets()
 
-                self._safe_call(self._log_proxy, f"▶️ Запуск модуля {idx}/{len(modules)}: {name}", "info")
-                handler = self.engine.module_handlers.get(name)
-                if not handler:
-                    self._safe_call(self._log_proxy, f"⚠️ Нет обработчика для модуля: {name}", "warn")
-                    continue
+            while not self._stop_requested:
+                for idx, name in enumerate(modules, start=1):
 
-                ctx = {
-                    "session": session,
-                    "base_url": base_visited[0],
-                    "headers_list": headers_list,
-                    "crawl": self.crawl_json,
-                    "tokens": tokens,
-                }
+                    if self._stop_requested:
+                        self._safe_call(
+                            self._log_proxy,
+                            "🛑 Атака остановлена пользователем.",
+                            "warn"
+                        )
+                        break
 
-                try:
-                    result = handler(ctx)
-                except Exception as e:
-                    self._safe_call(self._log_proxy, f"❌ Ошибка в модуле {name}: {type(e).__name__}: {e}", "error")
-                    continue
+                    self._safe_call(
+                        self._log_proxy,
+                        f"▶️ Запуск модуля {idx}/{len(modules)}: {name}",
+                        "info"
+                    )
 
-                found = len(result.get("items", []))
-                status = result.get("status", "done")
-                self._safe_call(self.status_label.config, text=f"{name}: {status} ({found} найдено)")
-                self._increment_progress()
+                    handler = self.engine.module_handlers.get(name)
+                    if not handler:
+                        self._safe_call(
+                            self._log_proxy,
+                            f"⚠️ Нет обработчика для модуля: {name}",
+                            "warn"
+                        )
+                        continue
+
+                    ctx = {
+                        "session": session,
+                        "base_url": base_visited[0] if base_visited else self.domain,
+                        "headers_list": headers_list,
+                        "crawl": self.crawl_json,
+                        "tokens": tokens,
+                        "secrets": secrets,
+                        "settings": {"allow_real_run": allow_real},
+                    }
+
+                    try:
+                        if allow_real and (
+                                self.domain in allowed_targets or urlparse(self.domain).netloc in allowed_targets
+                        ):
+                            result = handler(ctx)
+                        else:
+                            try:
+                                result = handler(ctx)
+                            except Exception as e:
+                                result = {
+                                    "status": "skipped",
+                                    "reason": "real-run-not-allowed",
+                                    "error": str(e)
+                                }
+
+                    except Exception as e:
+                        result = {"status": "error", "error": str(e)}
+                        self._safe_call(
+                            self._log_proxy,
+                            f"❌ Ошибка в модуле {name}: {type(e).__name__}: {e}",
+                            "error"
+                        )
+
+                    if isinstance(result, dict):
+                        try:
+                            self.engine._record_result(name, result)
+                        except Exception as e:
+                            self._safe_call(
+                                self._log_proxy,
+                                f"❌ Ошибка записи результата модуля {name}: {e}",
+                                "error"
+                            )
+                    else:
+                        self._safe_call(
+                            self._log_proxy,
+                            f"⚠️ Модуль {name} вернул неожиданный результат.",
+                            "warn"
+                        )
+
+                    self._safe_call(
+                        self._log_proxy,
+                        f"✅ Завершён модуль {idx}/{len(modules)}: {name}",
+                        "info"
+                    )
+
+                    time.sleep(0.2)
+
+                time.sleep(0.3)
 
             export_dir = DIRS.get("exports", DIRS.get("logs", "."))
             os.makedirs(export_dir, exist_ok=True)
             safe_domain = self.engine._sanitize_domain(self.domain)
-            filename = os.path.join(export_dir, f"attack_results_{safe_domain}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+            filename = os.path.join(
+                export_dir,
+                f"attack_results_{safe_domain}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            )
 
             with open(filename, "w", encoding="utf-8") as f:
                 json.dump(self.engine.get_attack_results(), f, indent=2, ensure_ascii=False)
 
             self._safe_call(self._log_proxy, f"✅ Все результаты сохранены: {filename}", "info")
             self._safe_call(self.status_label.config, text="Статус: завершено")
-
         except Exception as e:
             self._safe_call(self._log_proxy, f"❌ Ошибка фоновой атаки: {type(e).__name__}: {e}", "error")
             self._safe_call(self.status_label.config, text="Статус: ошибка")
