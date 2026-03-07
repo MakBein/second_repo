@@ -40,7 +40,6 @@ git log origin/main --oneline
 ###############################################################
 # cd C:\Users\sanch\PycharmProjects\itproger\xss_security_gui
 # показует все файлы проекта dir -Recurse
-# Select-String -Path xss_security_gui\attack_engine.py -Pattern "def _run_" -AllMatches
 ##############################################################
 Следующий шаг
 Теперь можешь запустить краулер:
