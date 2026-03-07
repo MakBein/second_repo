@@ -1,0 +1,5 @@
+{
+  "xss_patterns": [
+    "onerror=", "onload=", "javascript:", "srcdoc=", "eval(", "script>", "img src=x", "iframe"
+  ]
+}

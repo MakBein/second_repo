@@ -1,0 +1,57 @@
+{
+  "gui": {
+    "max_report_line_length": 80
+  },
+
+  "honeypot": {
+    "enable": false,
+    "trap_type": "html",
+    "poll_interval": 10,
+    "max_log_size_mb": 1,
+    "log_path": "logs/honeypot.log",
+    "hits_log_path": "logs/honeypot_hits.log"
+  },
+
+  "http": {
+    "request_timeout": 2,
+    "default_user_agent": "Safe-Mode-Agent"
+  },
+
+  "idor": {
+    "delay": 1.0
+  },
+
+  "lfi": {
+    "delay": 1.0,
+    "payloads": [],
+    "signatures": []
+  },
+
+  "sqli": {
+    "error_indicators": [],
+    "waf_indicators": []
+  },
+
+  "ssrf": {
+    "body_indicators": [],
+    "header_indicators": []
+  },
+
+  "payloads": {
+    "sqli_file": "payloads/sqli.json",
+    "xss_file": "payloads/xss.json",
+    "ssrf_file": "payloads/ssrf.json"
+  },
+
+  "logging": {
+    "enable_cloudflare_bypass": false,
+    "enable_js_rendering": false,
+    "enable_browser_emulation": false
+  },
+
+  "threat": {
+    "artifact_path": "logs/threat_intel_artifact.json",
+    "log_path": "logs/threat_intel.log",
+    "max_size_mb": 5
+  }
+}

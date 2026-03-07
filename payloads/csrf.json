@@ -1,0 +1,90 @@
+{
+  "StateChange": [
+    "/change_email?email=hacker@example.com",
+    "/delete_account",
+    "/update_password?new=123456",
+    "/change_username?name=attacker",
+    "/update_profile?bio=Hacked",
+    "/change_phone?number=+15551234567",
+    "/reset_security_questions",
+    "/update_address?line1=123+Main+St&city=Springfield",
+    "/deactivate_account",
+    "/set_language?lang=es",
+    "/accept_terms?version=2025",
+    "/enable_email_notifications?status=off"
+  ],
+
+  "TokenBypass": [
+    "/transfer?amount=1000",
+    "/settings?admin=true",
+    "/enable_2fa?status=off",
+    "/grant_role?role=superadmin",
+    "/disable_security?firewall=false",
+    "/api_key?generate=true",
+    "/session?extend=3600",
+    "/impersonate?user=target_user",
+    "/override_rate_limit?enabled=true",
+    "/bypass_captcha?token=abcd1234",
+    "/refresh_token?force=true",
+    "/disable_mfa?method=sms"
+  ],
+
+  "SilentActions": [
+    "/subscribe_newsletter?email=attacker@evil.com",
+    "/vote_poll?option=3",
+    "/like_post?id=42",
+    "/follow_user?id=1337",
+    "/add_friend?id=999",
+    "/view_profile?user=12345",
+    "/search?query=confidential+doc",
+    "/mark_read?message_id=9876",
+    "/download_report?id=42",
+    "/log_event?type=heartbeat",
+    "/track_pageview?url=/admin/dashboard",
+    "/set_cookie?name=theme&value=dark"
+  ],
+
+  "FinancialActions": [
+    "/withdraw?amount=5000",
+    "/deposit?amount=10000",
+    "/buy_item?id=123&price=999",
+    "/sell_item?id=321&price=100",
+    "/donate?amount=250&to=attacker",
+    "/transfer?to=account123&amount=2500&currency=EUR",
+    "/request_refund?order_id=777&amount=199.99",
+    "/apply_coupon?code=FREE100",
+    "/set_budget?category=travel&limit=500",
+    "/exchange_currency?from=USD&to=JPY&amount=1000",
+    "/add_payment_method?type=card&last4=4242",
+    "/auto_pay?enabled=true&day=1"
+  ],
+
+  "PrivilegeEscalation": [
+    "/set_role?user=attacker&role=admin",
+    "/grant_access?resource=confidential",
+    "/enable_debug_mode?status=true",
+    "/unlock_feature?premium=true",
+    "/change_permissions?level=root",
+    "/assign_group?user=attacker&group=admin",
+    "/enable_feature?name=beta_testing&status=true",
+    "/override_acl?resource=repo&access=write",
+    "/set_quota?user=attacker&limit=unlimited",
+    "/activate_root?token=xyz",
+    "/grant_api_access?key=abcd1234&scope=full",
+    "/disable_audit_logging?status=on"
+  ],
+
+  "ServiceManipulation": [
+    "/unsubscribe_service?id=1",
+    "/disable_notifications?status=true",
+    "/stop_subscription?plan=premium",
+    "/pause_account?duration=30",
+    "/cancel_order?id=555",
+    "/change_plan?user=attacker&plan=enterprise",
+    "/toggle_maintenance?mode=on",
+    "/reset_notifications?user=attacker",
+    "/revoke_license?license_id=ABC123",
+    "/schedule_backup?time=02:00&frequency=daily",
+    "/disable_auto_renewal?status=true"
+  ]
+}

@@ -1,0 +1,12 @@
+[
+  {
+    "name": "gbid",
+    "value": "5c66aafb0280abaac9fd03992e76b012",
+    "domain": "www.gazprombank.ru",
+    "path": "/",
+    "expires": 1803379772.956935,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "Strict"
+  }
+]

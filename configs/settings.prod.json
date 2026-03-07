@@ -1,0 +1,79 @@
+{
+  "gui": {
+    "max_report_line_length": 110
+  },
+
+  "honeypot": {
+    "enable": true,
+    "trap_type": "html",
+    "poll_interval": 5,
+    "max_log_size_mb": 50,
+    "log_path": "logs/honeypot.log",
+    "hits_log_path": "logs/honeypot_hits.log"
+  },
+
+  "http": {
+    "request_timeout": 5,
+    "default_user_agent": "Mozilla/5.0 (Pentest-Mode)"
+  },
+
+  "idor": {
+    "delay": 0.3
+  },
+
+  "lfi": {
+    "delay": 0.3,
+    "payloads": [
+      "../../etc/passwd",
+      "../../../etc/passwd",
+      "../../../../etc/passwd",
+      "..%2f..%2fetc%2fpasswd",
+      "..\\\\..\\\\windows\\\\win.ini",
+      "/etc/passwd",
+      "..%252f..%252fetc%252fpasswd"
+    ],
+    "signatures": [
+      "root:x",
+      "[extensions]",
+      "[fonts]",
+      "[drivers]"
+    ]
+  },
+
+  "sqli": {
+    "error_indicators": [
+      "sql syntax", "mysql", "postgres", "sqlite", "odbc",
+      "warning", "fatal error", "unclosed quotation mark",
+      "unexpected end of input", "query failed",
+      "native client", "syntax error", "invalid query",
+      "unexpected token", "unterminated string", "invalid column"
+    ],
+    "waf_indicators": [
+      "waf", "blocked", "forbidden", "security", "mod_security",
+      "access denied", "firewall", "request rejected"
+    ]
+  },
+
+  "ssrf": {
+    "body_indicators": [
+      "169.254.", "metadata", "ec2", "internal", "localhost", "127.0.0.1",
+      "google.internal", "azure", "gcp", "aws", "openstack",
+      "file://", "ftp://", "unix://"
+    ],
+    "header_indicators": [
+      "via", "x-forwarded-for", "x-aws-", "metadata", "x-real-ip"
+    ]
+  },
+
+  "payloads": {
+    "sqli_file": "payloads/sqli.json",
+    "xss_file": "payloads/xss.json",
+    "ssrf_file": "payloads/ssrf.json"
+  },
+
+  "threat": {
+    "artifact_path": "logs/threat_intel_artifact.json",
+    "log_path": "logs/threat_intel.log",
+    "max_size_mb": 50
+  }
+}

