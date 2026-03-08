@@ -23,7 +23,7 @@ from xss_security_gui.auto_modules.dom_and_endpoints import (
 )
 
 from xss_security_gui.auto_modules.auto_modules import brute_force_tokens
-from xss_security_gui.net_utils import _safe_request
+
 from xss_security_gui.settings import settings
 
 class AttackEngine:
@@ -32,6 +32,8 @@ class AttackEngine:
     def __init__(self, domain: str, threat_sender=None, log_func=None):
         self.domain = domain
         self.threat_sender = threat_sender or (lambda *a, **kw: None)
+        self._init_logger(log_func)
+        self._init_session()
         self.log_func = log_func or (lambda msg, level="info": print(f"[{level}] {msg}"))
         self.results: List[Dict[str, Any]] = []
         self.attack_id = str(uuid.uuid4())
@@ -87,6 +89,15 @@ class AttackEngine:
 
     # ===================== API для GUI (модульные вызовы) =====================
 
+    def _init_session(self) -> None:
+        """Создаёт HTTP-сессию для всех сетевых модулей."""
+        self._session = requests.Session()
+        self._session.verify = False  # отключаем SSL warnings для тестовых целей
+
+    def _init_logger(self, log_func=None) -> None:
+        """Инициализирует лог-функцию для всех модулей."""
+        self._log_func = log_func or (lambda msg, level="info": print(f"[{level}] {msg}"))
+
     def run_module(self, name: str, data: dict) -> dict:
         """
         Лёгкий API для GUI: запускает модуль в отдельном потоке и сразу возвращает короткий результат.
@@ -99,22 +110,9 @@ class AttackEngine:
         ).start()
         return short_result
 
-    def _run_module_worker(self, name: str, data: dict, ctx: Dict[str, Any]) -> None:
+    def _run_module_worker(self, name: str, data: dict) -> None:
         """Универсальный обработчик модулей, агрегирующий списки из data."""
         try:
-            # Проверка real-mode
-            allow_real = ctx.get("settings", {}).get("allow_real_run", True)
-            if not allow_real:
-                result = {
-                    "status": "skipped",
-                    "items": [],
-                    "count": 0,
-                    "reason": "real-run-not-allowed",
-                }
-                self._record_result(name, result)
-                self.log_func(f"⏭️ Модуль {name} пропущен (real-run disabled).", "warn")
-                return
-
             # Основная логика
             items = []
             for _, value in data.items():
@@ -128,7 +126,7 @@ class AttackEngine:
             }
 
             self._record_result(name, result)
-            self.log_func(f"✔️ Модуль {name} завершён. Найдено {len(items)} элементов.", "info")
+            self._log(f"✔️ Модуль {name} завершён. Найдено {len(items)} элементов.", "info")
 
         except Exception as e:
             result = {
@@ -138,7 +136,7 @@ class AttackEngine:
                 "error": str(e),
             }
             self._record_result(name, result)
-            self.log_func(f"❌ Ошибка в модуле {name}: {type(e).__name__}: {e}", "error")
+            self._log(f"❌ Ошибка в модуле {name}: {type(e).__name__}: {e}", "error")
 
     def get_attack_results(self) -> List[Dict[str, Any]]:
         return self.results
@@ -334,6 +332,9 @@ class AttackEngine:
                 "headers_list": headers_list,
                 "crawl": crawl_json,
                 "tokens": token_candidates,
+                "settings": settings,
+                "domain": self.domain,
+                "secrets": {"tokens": token_candidates},
             }
 
             # Запуск модулей
@@ -410,33 +411,37 @@ class AttackEngine:
         }
 
     def _run_token_bruteforce(self, ctx: Dict[str, Any]) -> dict:
-        # ctx содержит: domain, headers, secrets, settings
         domain = ctx.get("domain")
         settings_ctx = ctx.get("settings", {})
         allow_real = settings_ctx.get("allow_real_run", True)
 
-        # Если реальные запросы запрещены — вернуть тестовый результат или заглушку
         if not allow_real:
             return {"status": "skipped", "reason": "real-run-not-allowed"}
 
-        # Дополнительная проверка: домен в белом списке (дублирующая защита)
         if domain not in getattr(settings, "ALLOWED_TARGETS", []):
             return {"status": "skipped", "reason": "domain-not-allowed"}
 
-        # Пример безопасного сетевого вызова с использованием секретов
-        headers = ctx.get("headers", {}).copy()
-        api_key = ctx.get("secrets", {}).get("api_key")
-        if api_key:
-            headers["X-API-Key"] = api_key
+        # список токенів
+        tokens = ctx.get("secrets", {}).get("tokens", [])
+        if not tokens:
+            return {"status": "skipped", "reason": "no-tokens"}
 
-        # Выполняем запрос с таймаутом и обработкой ошибок
-        url = f"https://{domain}/some/endpoint"
-        resp = _safe_request("GET", url, headers=headers, timeout=10)
-        if resp.get("status") == "ok":
-            # обработка ответа
-            return {"status": "done", "count": 1, "items": [resp["text"]]}
-        else:
-            return {"status": "error", "error": resp.get("error")}
+        # базовий URL
+        base_url = f"https://{domain}"
+
+        # виклик реального brute-force
+        results = brute_force_tokens(
+            session=self._session,
+            base_url=base_url,
+            tokens=tokens,
+            log=self._log_func,
+        )
+
+        return {
+            "status": "done",
+            "count": len(results),
+            "items": results,
+        }
 
     def _run_parameters(self, ctx: Dict[str, Any]) -> dict:
         allow_real = ctx.get("settings", {}).get("allow_real_run", True)
