@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+exports/*.json
 
 # === Виртуальное окружение ===
 .venv/

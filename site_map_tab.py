@@ -28,7 +28,7 @@ import json
 import os
 import time
 import threading
-from typing import Dict, Any, List
+from typing import Dict, Any, Callable
 
 from xss_security_gui.dom_parser import DOMParser
 from xss_security_gui.site_decomposer import SiteDecomposerEngine
@@ -125,37 +125,48 @@ class SiteMapTab(ttk.Frame):
 
         try:
             engine = SiteDecomposerEngine(url)
-            report = engine.run()
+            report = engine.run()  # <-- DecompositionReport (dataclass)
             engine.export_json()
 
+            # ============================
+            #   Threat Intel интеграция
+            # ============================
             if self.threat_tab:
-                for inp in report.get("inputs", []):
-                    self.threat_tab.add_threat(
-                        {
-                            "type": "FORM_INPUT",
-                            "input": inp,
-                            "url": url,
-                            "source": "Site Decomposer",
-                        }
-                    )
 
-                for ev in report.get("events", []):
-                    self.threat_tab.add_threat(
-                        {
-                            "type": "DOM_EVENT",
-                            "event": ev,
-                            "url": url,
-                            "risk": ev.get("risk_level", "UNKNOWN"),
-                            "source": "Site Decomposer",
-                        }
-                    )
+                # --- Inputs ---
+                for inp in report.inputs:
+                    self.threat_tab.add_threat({
+                        "type": "FORM_INPUT",
+                        "input": inp.name or inp.id or "(unknown)",
+                        "url": report.url,
+                        "source": "Site Decomposer",
+                    })
+
+                # --- Events ---
+                for ev in report.events:
+                    self.threat_tab.add_threat({
+                        "type": "DOM_EVENT",
+                        "event": ev.type,
+                        "url": report.url,
+                        "risk": ev.risk_level,
+                        "source": "Site Decomposer",
+                    })
+
+            # ============================
+            #   Статистика для popup
+            # ============================
+            total_inputs = len(report.inputs)
+            total_events = len(report.events)
+            high_risk = sum(1 for e in report.events if e.risk_level in ("HIGH", "MEDIUM"))
 
             msg = (
                 f"🔍 Декомпозиция завершена\n\n"
-                f"✅ Форм: {len(report.get('inputs', []))}\n"
-                f"✅ Событий: {len(report.get('events', []))}\n"
-                f"✅ Угроз: {sum(1 for e in report.get('events', []) if e.get('risk_level') in ['HIGH', 'MEDIUM'])}"
+                f"📌 Заголовок: {report.title}\n"
+                f"📝 Форм: {total_inputs}\n"
+                f"⚡ Событий: {total_events}\n"
+                f"🚨 Угроз (HIGH/MEDIUM): {high_risk}\n"
             )
+
             messagebox.showinfo("📊 Декомпозиция сайта", msg)
 
         except Exception as e:
@@ -171,7 +182,7 @@ class SiteMapTab(ttk.Frame):
                     size = os.path.getsize(self.json_path)
                     if size != self.last_size:
                         self.last_size = size
-                        self.after(0, self.load_json)
+                        self.after(0, lambda: self.load_json())
                 time.sleep(5)
             except Exception as e:
                 print(f"[⚠️] Ошибка автообновления SiteMap: {e}")
@@ -210,6 +221,28 @@ class SiteMapTab(ttk.Frame):
             return "MEDIUM"
         return "LOW"
 
+    def _add_section(
+            self,
+            title: str,
+            items: list,
+            *,
+            open: bool = False,
+            formatter: Callable[[Any], str] = str
+    ):
+        """
+        Универсальный метод для добавления секции в дерево.
+        formatter — функция, превращающая элемент в строку.
+        """
+        root = self.tree.insert("", "end", text=f"{title} [{len(items)}]", open=open)
+
+        for item in items:
+            text = formatter(item)
+            if self._filter_text and self._filter_text.lower() not in text.lower():
+                continue
+            self.tree.insert(root, "end", text=text)
+
+        return root
+
     # ============================================================
     #                      Загрузка JSON
     # ============================================================
@@ -222,13 +255,63 @@ class SiteMapTab(ttk.Frame):
 
         try:
             with open(self.json_path, "r", encoding="utf-8") as f:
-                self.data = json.load(f)
+                raw = json.load(f)
+
+            # --------------------------------------------------------
+            # НОРМАЛИЗАЦИЯ ФОРМАТА JSON
+            # --------------------------------------------------------
+            if isinstance(raw, dict):
+                data = raw
+
+            elif isinstance(raw, list):
+                visited, scripts, api_endpoints, emails, tokens, user_ids = [], [], [], [], [], []
+
+                for node in raw:
+                    if not isinstance(node, dict):
+                        continue
+
+                    url = node.get("url")
+                    if url:
+                        visited.append(url)
+
+                    for s in node.get("scripts", []):
+                        if isinstance(s, dict):
+                            p = s.get("path") or s.get("src") or s.get("url")
+                            if p:
+                                scripts.append(p)
+                        else:
+                            scripts.append(str(s))
+
+                    api_endpoints.extend(node.get("api_endpoints", []))
+                    emails.extend(node.get("emails", []))
+                    tokens.extend(node.get("tokens", []))
+                    user_ids.extend(node.get("user_ids", []))
+
+                def _dedupe(seq):
+                    return list(dict.fromkeys(seq))
+
+                data = {
+                    "visited": _dedupe(visited),
+                    "scripts": _dedupe(scripts),
+                    "api_endpoints": _dedupe(api_endpoints),
+                    "emails": _dedupe(emails),
+                    "tokens": _dedupe(tokens),
+                    "user_ids": _dedupe(user_ids),
+                }
+
+            else:
+                messagebox.showerror("Ошибка JSON", f"Неожиданный формат: {type(raw).__name__}")
+                return
+
+            self.data = data
+
+            # --------------------------------------------------------
+            #                ПОСТРОЕНИЕ ДЕРЕВА
+            # --------------------------------------------------------
 
             # === URLs ===
-            urls = self.data.get("visited", []) or []
-            urls_root = self.tree.insert(
-                "", "end", text=f"🔗 URLs [{len(urls)}]", open=True
-            )
+            urls = data.get("visited", []) or []
+            urls_root = self.tree.insert("", "end", text=f"🔗 URLs [{len(urls)}]", open=True)
 
             for url in urls:
                 if self._filter_text and self._filter_text.lower() not in url.lower():
@@ -236,7 +319,11 @@ class SiteMapTab(ttk.Frame):
 
                 parsed = urlparse(url)
                 risk = self.classify_url_risk(url)
-                tag = "risk_high" if risk == "HIGH" else "risk_medium" if risk == "MEDIUM" else "risk_low"
+                tag = (
+                    "risk_high" if risk == "HIGH"
+                    else "risk_medium" if risk == "MEDIUM"
+                    else "risk_low"
+                )
 
                 url_node = self.tree.insert(
                     urls_root,
@@ -250,56 +337,47 @@ class SiteMapTab(ttk.Frame):
                     self.tree.insert(url_node, "end", text=f"↳ {k} = {', '.join(v)}")
 
             # === JS Files ===
-            scripts = self.data.get("scripts", []) or []
-            scripts_root = self.tree.insert(
-                "", "end", text=f"📜 JS Files [{len(scripts)}]", open=False
+            self._add_section(
+                "📜 JS Files",
+                data.get("scripts", []) or [],
+                open=False,
+                formatter=str
             )
-            for s in scripts:
-                if self._filter_text and self._filter_text.lower() not in s.lower():
-                    continue
-                self.tree.insert(scripts_root, "end", text=s)
 
             # === API Endpoints ===
-            apis = self.data.get("api_endpoints", []) or []
-            api_root = self.tree.insert(
-                "", "end", text=f"📡 API Endpoints [{len(apis)}]", open=False
+            self._add_section(
+                "📡 API Endpoints",
+                data.get("api_endpoints", []) or [],
+                open=False,
+                formatter=str
             )
-            for api in apis:
-                if self._filter_text and self._filter_text.lower() not in api.lower():
-                    continue
-                self.tree.insert(api_root, "end", text=api)
 
             # === Tokens ===
-            tokens = self.data.get("tokens", []) or []
-            tokens_root = self.tree.insert(
-                "", "end", text=f"🔑 Tokens [{len(tokens)}]", open=False
+            self._add_section(
+                "🔑 Tokens",
+                data.get("tokens", []) or [],
+                open=False,
+                formatter=lambda t: (
+                        (t if isinstance(t, str) else str(t))[:80]
+                        + ("..." if len(str(t)) > 80 else "")
+                )
             )
-            for t in tokens:
-                val = t if isinstance(t, str) else str(t)
-                if self._filter_text and self._filter_text.lower() not in val.lower():
-                    continue
-                self.tree.insert(tokens_root, "end", text=val[:80] + ("..." if len(val) > 80 else ""))
 
             # === Emails ===
-            emails = self.data.get("emails", []) or []
-            emails_root = self.tree.insert(
-                "", "end", text=f"📧 Emails [{len(emails)}]", open=False
+            self._add_section(
+                "📧 Emails",
+                data.get("emails", []) or [],
+                open=False,
+                formatter=str
             )
-            for e in emails:
-                if self._filter_text and self._filter_text.lower() not in e.lower():
-                    continue
-                self.tree.insert(emails_root, "end", text=e)
 
             # === User IDs ===
-            user_ids = self.data.get("user_ids", []) or []
-            uids_root = self.tree.insert(
-                "", "end", text=f"🆔 User IDs [{len(user_ids)}]", open=False
+            self._add_section(
+                "🆔 User IDs",
+                data.get("user_ids", []) or [],
+                open=False,
+                formatter=lambda uid: str(uid)
             )
-            for uid in user_ids:
-                val = str(uid)
-                if self._filter_text and self._filter_text.lower() not in val.lower():
-                    continue
-                self.tree.insert(uids_root, "end", text=val)
 
         except Exception as e:
             messagebox.showerror("Ошибка загрузки", str(e))
@@ -319,7 +397,7 @@ class SiteMapTab(ttk.Frame):
     # ============================================================
     #                      Выбор узла дерева
     # ============================================================
-    def on_node_selected(self, event):
+    def on_node_selected(self, event=None):
         selected = self.tree.focus()
         item = self.tree.item(selected)
         values = item.get("values", [])
