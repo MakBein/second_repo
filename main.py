@@ -65,6 +65,7 @@ from xss_security_gui.xss_detector import XSSDetector
 from xss_security_gui.env_check import run_env_check
 from xss_security_gui.visualizer import render_dot_to_svg
 from xss_security_gui.js_inspector import analyze_js_file
+from xss_security_gui.network_tab import NetworkTab
 from xss_security_gui.utils.disable_ssl_warnings import disable_ssl_warnings
 disable_ssl_warnings()
 # ============================================================
@@ -224,6 +225,7 @@ class XSSSecurityGUI(tk.Tk):
             (IDORTab, "🔓 IDOR Тест"),
             (LFITab, "📂 LFI Тест"),
             (SiteMapTab, "🗺️ Карта сайта"),
+            (NetworkTab, "🌐 Network Scanner"),
         ]
         self.dynamic_tabs = []
         for cls, label in tabs_with_threat:
@@ -705,8 +707,8 @@ if __name__ == "__main__":
                         final = {"items": final}
                     elif not isinstance(final, dict):
                         final = {"data": final}
-
-                    save_outputs(gui_callback=None)
+                    # save_outputs(result, gui_callback=None)
+                    save_outputs(final, gui_callback=None)
                     ui_log("✔️ Краулінг завершено. Дані збережено.")
 
                     ui_call(app.threat_connector.emit, "crawler", url, final)
@@ -776,6 +778,3 @@ if __name__ == "__main__":
 
         threading.Thread(target=run_cli, daemon=True).start()
         app.mainloop()
-
-
-

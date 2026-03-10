@@ -311,7 +311,28 @@ class ThreatAnalysisTab(ttk.Frame):
     # Интеграция с другими модулями
     # ============================================================
 
-    def send_to_threat_intel(self, module, data):
+    def get_all_threats(self) -> list:
+        """
+        Возвращает полный список всех Threat Intel событий.
+        Использует THREAT_CONNECTOR.summary(), чтобы не ломать архитектуру.
+        """
+        try:
+            summary = THREAT_CONNECTOR.summary()
+        except Exception:
+            return []
+
+        results = []
+
+        # summary["entries"] — это список всех событий Threat Intel
+        entries = summary.get("entries", [])
+        if not isinstance(entries, list):
+            return []
+
+        # Возвращаем копию, чтобы никто не сломал оригинал
+        return list(entries)
+
+
+def send_to_threat_intel(self, module, data):
         """
         Получение данных от других модулей (crawler, js_inspector, autorecon и т.д.).
         Ожидает:

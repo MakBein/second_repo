@@ -13,7 +13,7 @@ import os
 import threading
 import json
 from flask import Flask, request
-from xss_security_gui import settings
+import xss_security_gui.settings as settings
 from xss_security_gui.threat_analysis.threat_connector import THREAT_CONNECTOR
 
 app = Flask(__name__)
