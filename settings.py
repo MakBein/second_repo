@@ -55,6 +55,10 @@ ENV_PATH = BASE_DIR / ".env"
 if ENV_PATH.exists():
     load_dotenv(ENV_PATH)
 
+# === Honeypot / Trap Engine ===
+TRAP_WEBHOOK_URL = os.getenv("TRAP_WEBHOOK_URL", "")
+
+
 # ============================================================
 #  Загрузка settings.json
 # ============================================================
@@ -643,6 +647,7 @@ _PUBLIC_EXPORTS = [
     "CSRF_PAYLOAD_FILE",
     "THREAT_INTEL_ARTIFACT_PATH",
     "crawler_results_path",
+    "TRAP_WEBHOOK_URL",
 ]
 
 __all__ = _PUBLIC_EXPORTS
