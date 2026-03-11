@@ -4,17 +4,25 @@ import time
 import hashlib
 import requests
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from typing import List, Dict, Any, Optional
 
 from xss_security_gui.settings import settings
 
 
+# ---------------------------------------------------------
+# URL builder
+# ---------------------------------------------------------
 def build_url_with_param(url: str, param: str, value: str) -> str:
-    """Формирует новый URL с подменённым параметром."""
+    """
+    Формує новий URL з підміненою змінною параметра.
+    Завжди повертає коректний URL.
+    """
     parsed = urlparse(url)
-    query = parse_qs(parsed.query)
-    query[param] = [value]
+    query = parse_qs(parsed.query, keep_blank_values=True)
 
+    query[param] = [value]
     new_query = urlencode(query, doseq=True)
+
     return urlunparse((
         parsed.scheme,
         parsed.netloc,
@@ -25,13 +33,30 @@ def build_url_with_param(url: str, param: str, value: str) -> str:
     ))
 
 
+# ---------------------------------------------------------
+# Hash helper
+# ---------------------------------------------------------
 def hash_response(text: str) -> str:
-    """Возвращает MD5-хеш ответа."""
-    return hashlib.md5(text.encode()).hexdigest()
+    """Повертає MD5-хеш відповіді."""
+    return hashlib.md5(text.encode("utf-8", errors="ignore")).hexdigest()
 
 
-def send_request(url: str, method: str, param: str, value: str, headers: dict, timeout: int):
-    """Отправляет GET или POST запрос с подменённым параметром."""
+# ---------------------------------------------------------
+# Request sender
+# ---------------------------------------------------------
+def send_request(
+    url: str,
+    method: str,
+    param: str,
+    value: str,
+    headers: Dict[str, str],
+    timeout: int
+):
+    """
+    Відправляє GET або POST запит.
+    GET — параметр у URL.
+    POST — параметр у form-data.
+    """
     method = method.upper()
 
     if method == "GET":
@@ -40,79 +65,99 @@ def send_request(url: str, method: str, param: str, value: str, headers: dict, t
     if method == "POST":
         parsed = urlparse(url)
         base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-        return requests.post(base_url, headers=headers, data={param: value}, timeout=timeout)
+        return requests.post(
+            base_url,
+            headers=headers,
+            data={param: value},
+            timeout=timeout
+        )
 
     raise ValueError(f"Unsupported method: {method}")
 
 
+# ---------------------------------------------------------
+# Main IDOR fuzzing engine
+# ---------------------------------------------------------
 def fuzz_id_parameter(
     url: str,
     param: str = "id",
     start: int = 1,
     stop: int = 10,
     method: str = "GET",
-    headers: dict | None = None,
-    delay: float | None = None,
-    timeout: int | None = None,
-    auth_token: str | None = None
-):
+    headers: Optional[Dict[str, str]] = None,
+    delay: Optional[float] = None,
+    timeout: Optional[int] = None,
+    auth_token: Optional[str] = None
+) -> List[Dict[str, Any]]:
     """
-    Основной IDOR‑фаззер.
-    Возвращает список результатов с информацией о различиях.
+    Основний IDOR‑фаззер.
+    Повертає список результатів у форматі:
+    {
+        "url": str,
+        "status": int | "ERR",
+        "length": int,
+        "hash": str | None,
+        "differs": bool,
+        "error": Optional[str]
+    }
     """
 
     # -----------------------------
-    # Валидация
+    # Валідація
     # -----------------------------
     if not url or not param:
-        raise ValueError("URL и параметр должны быть указаны")
+        raise ValueError("URL і параметр повинні бути вказані")
 
     if start > stop:
         start, stop = stop, start
 
     # -----------------------------
-    # Настройки по умолчанию из settings.py
+    # Settings defaults
     # -----------------------------
-    delay = delay if delay is not None else settings.IDOR_DELAY
-    timeout = timeout if timeout is not None else settings.REQUEST_TIMEOUT
+    delay = delay if delay is not None else getattr(settings, "IDOR_DELAY", 0.5)
+    timeout = timeout if timeout is not None else getattr(settings, "REQUEST_TIMEOUT", 10)
 
     # -----------------------------
-    # Заголовки
+    # Headers
     # -----------------------------
     if headers is None:
         headers = {
-            "User-Agent": settings.DEFAULT_USER_AGENT
+            "User-Agent": getattr(settings, "DEFAULT_USER_AGENT", "IDOR-Scanner")
         }
 
     if auth_token:
         headers["Authorization"] = f"Bearer {auth_token}"
 
     # -----------------------------
-    # Основная логика
+    # Main logic
     # -----------------------------
-    results = []
-    base_hash = None
-    base_length = None
+    results: List[Dict[str, Any]] = []
+    base_hash: Optional[str] = None
+    base_length: Optional[int] = None
 
     for value in range(start, stop + 1):
+        new_url = build_url_with_param(url, param, str(value))
+
         try:
-            # Формируем URL
-            new_url = build_url_with_param(url, param, str(value))
+            response = send_request(
+                new_url,
+                method,
+                param,
+                str(value),
+                headers,
+                timeout
+            )
 
-            # Отправляем запрос
-            response = send_request(new_url, method, param, str(value), headers, timeout)
             text = response.text.strip()
-
-            # Хеш и длина
             resp_hash = hash_response(text)
             resp_len = len(text)
 
-            # Базовый ответ
+            # Базовий відповідь
             if value == start:
                 base_hash = resp_hash
                 base_length = resp_len
 
-            # Проверка различий
+            # Перевірка різниці
             differs = (resp_hash != base_hash) or (resp_len != base_length)
 
             results.append({
@@ -138,11 +183,11 @@ def fuzz_id_parameter(
     return results
 
 
-# -----------------------------
-# Тестовый запуск
-# -----------------------------
+# ---------------------------------------------------------
+# Test run
+# ---------------------------------------------------------
 if __name__ == "__main__":
-    test_url = "https://gazprombank.ru/"
+    test_url = "https://example.com/profile?user_id=1"
     param = "user_id"
 
     res = fuzz_id_parameter(

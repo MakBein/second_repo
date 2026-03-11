@@ -3,6 +3,7 @@
 import json
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+from typing import Any, Dict
 
 from xss_security_gui.settings import settings
 from xss_security_gui.threat_analysis.sqli_module import SQLiTester
@@ -13,15 +14,23 @@ class SQLiTab(ttk.Frame):
         super().__init__(parent)
 
         self.url = url
-        self.payload_file = payload_file or settings.SQLI_PAYLOAD_FILE
-        self.payloads = self._load_payloads()
+
+        # Безпечний доступ до settings (dict / об'єкт)
+        default_file = (
+            settings.get("sqli.payload_file")
+            if isinstance(settings, dict)
+            else getattr(settings, "SQLI_PAYLOAD_FILE", "sqli_payloads.json")
+        )
+
+        self.payload_file = payload_file or default_file
+        self.payloads: Dict[str, list] = self._load_payloads()
 
         self._build_ui()
 
     # ---------------------------------------------------------
     # Payload loader
     # ---------------------------------------------------------
-    def _load_payloads(self) -> dict:
+    def _load_payloads(self) -> Dict[str, list]:
         try:
             with open(self.payload_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -81,8 +90,20 @@ class SQLiTab(ttk.Frame):
         ttk.Button(btn_frame, text="🗑 Очистити лог артефактів", command=self.clear_artifact_log).pack(side="left", padx=3)
 
         # Output
-        self.output = tk.Text(self, height=20, wrap="none", bg="black", fg="lime", insertbackground="white")
+        self.output = tk.Text(
+            self, height=20, wrap="none", bg="black", fg="lime", insertbackground="white"
+        )
         self.output.pack(fill="both", expand=True, padx=5, pady=5)
+
+    # ---------------------------------------------------------
+    # Thread-safe log
+    # ---------------------------------------------------------
+    def _safe_log(self, text: str) -> None:
+        self.after(0, lambda: self._append_text(text))
+
+    def _append_text(self, text: str) -> None:
+        self.output.insert("end", text)
+        self.output.see("end")
 
     # ---------------------------------------------------------
     # Actions
@@ -97,10 +118,9 @@ class SQLiTab(ttk.Frame):
         category = self.category_var.get()
 
         if not param or not base_value:
-            self.output.insert("end", "⚠️ Введіть параметр і значення перед запуском\n")
+            self._safe_log("⚠️ Введіть параметр і значення перед запуском\n")
             return
 
-        # Вибір payload-ів
         if category == "Всі категорії":
             selected_payloads = self.payloads
         else:
@@ -111,22 +131,28 @@ class SQLiTab(ttk.Frame):
             param=param,
             base_value=base_value,
             payloads=selected_payloads,
-            output_callback=self.display_result
+            output_callback=self.display_result,
         )
         tester.start()
 
-        self.output.insert("end", f"🚀 Запущено SQLi-тестування для {self.url} (param={param})\n")
-        self.output.see("end")
+        self._safe_log(f"🚀 Запущено SQLi-тестування для {self.url} (param={param})\n")
 
-    def display_result(self, result: dict):
+    def display_result(self, result: Dict[str, Any]):
+        """
+        Гнучкий, безпечний вивід результатів.
+        """
         status = result.get("status", "unknown")
-        length = result.get("response_length", 0)
+        length = result.get("response_length")
         category = result.get("category", "?")
         payload = result.get("payload", "?")
 
-        line = f"[{category}] {payload} → {status} (len={length})\n"
-        self.output.insert("end", line)
-        self.output.see("end")
+        if isinstance(length, (int, float)):
+            len_part = f"(len={length})"
+        else:
+            len_part = ""
+
+        line = f"[{category}] {payload} → {status} {len_part}\n"
+        self._safe_log(line)
 
     def clear_output(self):
         self.output.delete("1.0", "end")
@@ -134,7 +160,7 @@ class SQLiTab(ttk.Frame):
     def choose_payload_file(self):
         path = filedialog.askopenfilename(
             title="Вибрати файл SQLi payload-ів",
-            filetypes=[("JSON файли", "*.json"), ("Всі файли", "*.*")]
+            filetypes=[("JSON файли", "*.json"), ("Всі файли", "*.*")],
         )
         if not path:
             return
@@ -146,15 +172,18 @@ class SQLiTab(ttk.Frame):
         self.category_combo["values"] = categories
         self.category_var.set("Всі категорії")
 
-        self.output.insert("end", f"✅ Payload-и завантажено з: {path}\n")
-        self.output.see("end")
+        self._safe_log(f"✅ Payload-и завантажено з: {path}\n")
 
     def clear_artifact_log(self):
-        artifact_path = settings.THREAT_INTEL_ARTIFACT_PATH
+        artifact_path = (
+            settings.get("threat_intel.artifact_path")
+            if isinstance(settings, dict)
+            else getattr(settings, "THREAT_INTEL_ARTIFACT_PATH", "threat_artifacts.json")
+        )
+
         try:
             with open(artifact_path, "w", encoding="utf-8") as f:
                 json.dump([], f)
-            self.output.insert("end", f"✅ Лог артефактів очищено: {artifact_path}\n")
+            self._safe_log(f"✅ Лог артефактів очищено: {artifact_path}\n")
         except Exception as e:
-            self.output.insert("end", f"❌ Помилка очищення: {e}\n")
-        self.output.see("end")
+            self._safe_log(f"❌ Помилка очищення: {e}\n")

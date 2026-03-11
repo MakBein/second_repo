@@ -23,15 +23,20 @@ DEFAULT_XSS_VECTORS: List[str] = [
     "\"><script>confirm(1)</script>",
 ]
 
+# Попередньо скомпільовані патерни для швидкості
+_ATTR_ON_EVENT_RE = re.compile(r'\son\w+\s*=')
+_ATTR_GENERIC_RE = re.compile(r'\s[\w:-]+\s*=\s*["\'].*?["\']')
+
 
 # ===========================================
 # Класс XSSDetector с Threat Intel интеграцией
 # ===========================================
 
 class XSSDetector:
-    def __init__(self, threat_tab=None):
+    def __init__(self, threat_tab: Any = None) -> None:
         """
         Конструктор: принимает threat_tab для интеграции в Threat Intel.
+        threat_tab ожидается с методом add_threat(dict).
         """
         self.threat_tab = threat_tab
 
@@ -42,6 +47,9 @@ class XSSDetector:
         """
         Возвращает тип контекста для отражённого payload.
         """
+        if not payload:
+            return None
+
         index = response_text.find(payload)
         if index == -1:
             return None
@@ -52,13 +60,13 @@ class XSSDetector:
         snippet_lower = snippet.lower()
 
         # 1) Внутри <script>...</script>?
-        left_tag_open = snippet_lower.rfind("<script")
-        left_tag_open = left_tag_open if left_tag_open != -1 else None
-        right_tag_close = snippet_lower.find("</script>", index - start)
+        rel_index = index - start
+        left_tag_open = snippet_lower.rfind("<script", 0, rel_index)
+        right_tag_close = snippet_lower.find("</script>", rel_index)
         in_script = (
-            left_tag_open is not None
+            left_tag_open != -1
             and right_tag_close != -1
-            and left_tag_open < (index - start) < right_tag_close
+            and left_tag_open < rel_index < right_tag_close
         )
 
         if in_script:
@@ -66,46 +74,64 @@ class XSSDetector:
         else:
             # 2) Явные JS-контексты рядом
             js_indicators = (
-                "eval(", "new function", "settimeout(", "setinterval(",
-                "function(", "=>", "console.", "var ", "let ", "const "
+                "eval(",
+                "new function",
+                "settimeout(",
+                "setinterval(",
+                "function(",
+                "=>",
+                "console.",
+                "var ",
+                "let ",
+                "const ",
             )
             if any(i in snippet_lower for i in js_indicators):
                 context = "📜 Reflected JS"
             else:
                 # 3) Атрибутный контекст
-                lt = snippet_lower.rfind("<", 0, index - start)
-                gt = snippet_lower.find(">", index - start)
+                lt = snippet_lower.rfind("<", 0, rel_index)
+                gt = snippet_lower.find(">", rel_index)
 
-                if lt != -1 and gt != -1 and lt < (index - start) < gt:
+                if lt != -1 and gt != -1 and lt < rel_index < gt:
                     tag_segment = snippet_lower[lt:gt]
-                    if re.search(r'\son\w+\s*=', tag_segment):
+                    if _ATTR_ON_EVENT_RE.search(tag_segment):
                         context = "🧬 Attribute Injection"
-                    elif re.search(r'\s[\w:-]+\s*=\s*["\'].*?["\']', tag_segment):
+                    elif _ATTR_GENERIC_RE.search(tag_segment):
                         context = "🧬 Attribute Injection"
                     else:
                         context = "🔤 Reflected HTML"
 
-                elif any(s in snippet_lower for s in (
-                    "innerhtml", "outerhtml", "insertadjacenthtml",
-                    "document.write", "document.writeln"
-                )):
+                elif any(
+                    s in snippet_lower
+                    for s in (
+                        "innerhtml",
+                        "outerhtml",
+                        "insertadjacenthtml",
+                        "document.write",
+                        "document.writeln",
+                    )
+                ):
                     context = "🧠 DOM-based"
 
                 elif "<" in snippet_lower and ">" in snippet_lower:
                     context = "🔤 Reflected HTML"
-
                 else:
                     context = "❓ Unknown"
 
-        # Threat Intel интеграция
         if self.threat_tab and context:
-            self.threat_tab.add_threat({
-                "type": "XSS",
-                "payload": payload,
-                "context": context,
-                "snippet": snippet,
-                "source": "XSSDetector"
-            })
+            try:
+                self.threat_tab.add_threat(
+                    {
+                        "type": "XSS",
+                        "payload": payload,
+                        "context": context,
+                        "snippet": snippet,
+                        "source": "XSSDetector",
+                    }
+                )
+            except Exception:
+                # Threat Intel не должен ломать детектор
+                pass
 
         return context
 
@@ -115,12 +141,15 @@ class XSSDetector:
     def extract_inline_js_blocks(self, html: str) -> List[str]:
         """Извлекает все inline <script> без src."""
         soup = BeautifulSoup(html, "html.parser")
-        return [s.text.strip() for s in soup.find_all("script") if not s.get("src")]
+        return [s.get_text(strip=True) for s in soup.find_all("script") if not s.get("src")]
 
     def scan_inline_js_for_payload(self, html: str, payload: str, window: int = 60) -> List[Tuple[str, str]]:
         """
         Проверяет inline JS-блоки на наличие payload'а и классифицирует.
         """
+        if not payload:
+            return []
+
         scripts = self.extract_inline_js_blocks(html)
         hits: List[Tuple[str, str]] = []
 
@@ -130,15 +159,19 @@ class XSSDetector:
                 snippet = self.get_code_snippet(code, payload, window=window)
                 hits.append((vuln_type, snippet))
 
-                # Threat Intel интеграция
                 if self.threat_tab:
-                    self.threat_tab.add_threat({
-                        "type": "XSS_INLINE",
-                        "payload": payload,
-                        "context": vuln_type,
-                        "snippet": snippet,
-                        "source": "XSSDetector"
-                    })
+                    try:
+                        self.threat_tab.add_threat(
+                            {
+                                "type": "XSS_INLINE",
+                                "payload": payload,
+                                "context": vuln_type,
+                                "snippet": snippet,
+                                "source": "XSSDetector",
+                            }
+                        )
+                    except Exception:
+                        pass
 
         return hits
 
@@ -146,14 +179,22 @@ class XSSDetector:
         """Грубая классификация JS-контекста для payload внутри inline-скрипта."""
         code_lower = code.lower()
         dom_indicators = (
-            "eval(", "new function", "settimeout", "setinterval",
-            "document.write", "document.writeln", "innerhtml",
-            "outerhtml", "insertadjacenthtml"
+            "eval(",
+            "new function",
+            "settimeout",
+            "setinterval",
+            "document.write",
+            "document.writeln",
+            "innerhtml",
+            "outerhtml",
+            "insertadjacenthtml",
         )
         return "🧠 DOM-based" if any(ind in code_lower for ind in dom_indicators) else "📜 Reflected JS"
 
     def get_code_snippet(self, text: str, payload: str, window: int = 60) -> str:
         """Возвращает сниппет текста вокруг payload без переводов строк."""
+        if not payload:
+            return ""
         index = text.find(payload)
         if index == -1:
             return ""
@@ -182,11 +223,11 @@ class XSSDetector:
     # Генератор XSS‑фуззинга для GET и POST
     # -------------------------------------------
     def fuzz_xss_parameters(
-            self,
-            base_url: str,
-            payload_data: Optional[Dict[str, Any]],
-            method: str,
-            xss_vectors: Optional[List[str]] = None
+        self,
+        base_url: str,
+        payload_data: Optional[Dict[str, Any]],
+        method: str,
+        xss_vectors: Optional[List[str]] = None,
     ) -> List[Union[str, Dict[str, Any]]]:
 
         vectors = xss_vectors or DEFAULT_XSS_VECTORS
@@ -219,19 +260,26 @@ class XSSDetector:
                     mutated = mutate_params(base_params, key, vector)
                     fuzzed_url = self._build_get_url(base_url, mutated)
 
-                    if fuzzed_url not in seen:
-                        results.append(fuzzed_url)
-                        seen.add(fuzzed_url)
+                    if fuzzed_url in seen:
+                        continue
 
-                        if self.threat_tab:
-                            self.threat_tab.add_threat({
-                                "type": "XSS_FUZZ",
-                                "method": "GET",
-                                "url": fuzzed_url,
-                                "param": key,
-                                "payload": vector,
-                                "source": "XSSDetector"
-                            })
+                    results.append(fuzzed_url)
+                    seen.add(fuzzed_url)
+
+                    if self.threat_tab:
+                        try:
+                            self.threat_tab.add_threat(
+                                {
+                                    "type": "XSS_FUZZ",
+                                    "method": "GET",
+                                    "url": fuzzed_url,
+                                    "param": key,
+                                    "payload": vector,
+                                    "source": "XSSDetector",
+                                }
+                            )
+                        except Exception:
+                            pass
 
         # -----------------------
         # POST fuzzing
@@ -244,25 +292,34 @@ class XSSDetector:
 
                     key_ = (
                         entry["url"],
-                        tuple(sorted(
-                            (k, tuple(v) if isinstance(v, list) else v)
-                            for k, v in entry["json"].items()
-                        ))
+                        tuple(
+                            sorted(
+                                (k, tuple(v) if isinstance(v, list) else v)
+                                for k, v in entry["json"].items()
+                            )
+                        ),
                     )
 
-                    if key_ not in seen:
-                        results.append(entry)
-                        seen.add(key_)
+                    if key_ in seen:
+                        continue
 
-                        if self.threat_tab:
-                            self.threat_tab.add_threat({
-                                "type": "XSS_FUZZ",
-                                "method": "POST",
-                                "url": base_url,
-                                "param": key,
-                                "payload": vector,
-                                "json": mutated,
-                                "source": "XSSDetector"
-                            })
+                    results.append(entry)
+                    seen.add(key_)
+
+                    if self.threat_tab:
+                        try:
+                            self.threat_tab.add_threat(
+                                {
+                                    "type": "XSS_FUZZ",
+                                    "method": "POST",
+                                    "url": base_url,
+                                    "param": key,
+                                    "payload": vector,
+                                    "json": mutated,
+                                    "source": "XSSDetector",
+                                }
+                            )
+                        except Exception:
+                            pass
 
         return results

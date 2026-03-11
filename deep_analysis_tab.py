@@ -15,7 +15,7 @@ import requests
 
 from xss_security_gui.deep_crawler import deep_crawl_site
 from xss_security_gui.utils.threat_sender import ThreatSenderMixin
-from xss_security_gui import settings
+import xss_security_gui.settings as settings
 from xss_security_gui.network_checker import NetworkChecker
 from xss_security_gui.settings import JSON_CRAWL_EXPORT_PATH
 

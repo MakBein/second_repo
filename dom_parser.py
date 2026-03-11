@@ -10,7 +10,7 @@ import os
 import json
 from bs4 import BeautifulSoup, Comment
 from typing import Any, Dict, List
-from xss_security_gui import settings
+import xss_security_gui.settings as settings
 from xss_security_gui.threat_analysis.threat_connector import THREAT_CONNECTOR
 
 
