@@ -354,6 +354,7 @@ class AttackGUI(tk.Frame):
                         "tokens": tokens,
                         "secrets": secrets,
                         "settings": {"allow_real_run": allow_real},
+                        "domain": self.domain,
                     }
 
                     try:

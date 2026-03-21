@@ -1,47 +1,69 @@
 # xss_security_gui/visualizer.py
 import os
+import shutil
 import subprocess
 import threading
 
 
-def render_dot_to_svg(dot_path: str, output_path: str, callback=None, timeout=5):
+def render_dot_to_svg(dot_path: str, output_path: str, callback=None, timeout: int = 5):
     """
-    ULTRA 5.0:
-    - Рендер .dot → .svg в отдельном потоке
-    - Таймаут защиты от зависания Graphviz
-    - callback(success: bool, message: str) вызывается в конце
+    ULTRA 7.0:
+    - Перевірка наявності Graphviz (dot)
+    - Безпечний рендер .dot → .svg у окремому потоці
+    - Таймаут + гарантоване завершення процесу
+    - callback(success: bool, message: str) викликається завжди
+    - Повна ізоляція помилок, GUI ніколи не падає
     """
+
+    def safe_callback(success: bool, message: str):
+        if callback:
+            try:
+                callback(success, message)
+            except Exception:
+                pass
 
     def worker():
+        # 1) Перевірка існування .dot файлу
         if not os.path.exists(dot_path):
-            if callback:
-                callback(False, f"❌ DOT файл не найден: {dot_path}")
+            safe_callback(False, f"❌ DOT файл не знайдено: {dot_path}")
             return
 
+        # 2) Перевірка наявності Graphviz
+        if shutil.which("dot") is None:
+            safe_callback(False, "❌ Graphviz (dot) не знайдено у PATH")
+            return
+
+        # 3) Перевірка директорії для output
         try:
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        except Exception as e:
+            safe_callback(False, f"❌ Неможливо створити директорію: {e}")
+            return
 
-            result = subprocess.run(
+        # 4) Запуск Graphviz
+        try:
+            proc = subprocess.Popen(
                 ["dot", "-Tsvg", dot_path, "-o", output_path],
-                capture_output=True,
-                text=True,
-                timeout=timeout
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
             )
 
-            if result.returncode == 0:
-                if callback:
-                    callback(True, f"✅ SVG создан: {output_path}")
-            else:
-                if callback:
-                    callback(False, f"❌ Ошибка Graphviz: {result.stderr or result.stdout}")
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                safe_callback(False, f"⏳ Graphviz завис (таймаут {timeout} сек)")
+                return
 
-        except subprocess.TimeoutExpired:
-            if callback:
-                callback(False, f"⏳ Graphviz завис (таймаут {timeout} сек)")
+            if proc.returncode == 0:
+                safe_callback(True, f"✅ SVG створено: {output_path}")
+            else:
+                msg = stderr.strip() or stdout.strip() or "Невідома помилка Graphviz"
+                safe_callback(False, f"❌ Graphviz помилка: {msg}")
 
         except Exception as e:
-            if callback:
-                callback(False, f"❌ Неожиданная ошибка: {e}")
+            safe_callback(False, f"❌ Неочікувана помилка: {e}")
 
-    # Запускаем рендер в отдельном потоке
-    threading.Thread(target=worker, daemon=True).start()
+    # Запуск у окремому потоці
+    threading.Thread(target=worker, daemon=True, name="DotRendererThread").start()

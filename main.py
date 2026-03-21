@@ -57,6 +57,8 @@ crawler_results = load_crawler_results()
 # ============================================================
 #  Импорты функциональных модулей
 # ============================================================
+from xss_security_gui.live_monitor import LiveAttackMonitor
+from xss_security_gui.threat_analysis.threat_connector import LIVE_MONITOR_QUEUE
 from xss_security_gui.crawler import save_outputs, build_final_dict
 from xss_security_gui.analyzer import XSSAnalyzerApp
 from xss_security_gui.honeypot_monitor import monitor_log_thread
@@ -94,6 +96,8 @@ from xss_security_gui.csrf_tab import CSRFTab
 from xss_security_gui.ssrf_tab import SSRFTab
 from xss_security_gui.gui.environment_tab import EnvironmentTab
 from xss_security_gui.gui.security_dashboard_panel import SecurityDashboardPanel
+#from xss_security_gui.payload_mutator import shutdown_mutator_executor
+
 # ============================================================
 #  AutoRecon
 # ============================================================
@@ -133,6 +137,12 @@ class XSSSecurityGUI(tk.Tk):
         super().__init__()
         self.title("🛡️ XSS Security GUI — Pro Edition")
         self.geometry("980x730")
+        # Реєструємо обробник закриття
+        #self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    # def on_close(self):
+    #     shutdown_mutator_executor()
+    #     self.destroy()
 
         self.status = tk.StringVar(value="Готов к запуску")
         self.tab_control = ttk.Notebook(self)
@@ -247,6 +257,10 @@ class XSSSecurityGUI(tk.Tk):
         live_log_tab.pack(fill="both", expand=True)
         self.tab_control.add(live_log_tab, text="📶 События")
 
+        live_tab = LiveAttackMonitor(self.tab_control, LIVE_MONITOR_QUEUE)
+        live_tab.pack(fill="both", expand=True)
+        self.tab_control.add(live_tab, text="📡 Live Monitor")
+
         # Attack Report
         attack_report_tab = AttackReportTab(self.tab_control)
         attack_report_tab.pack(fill="both", expand=True)
@@ -313,7 +327,6 @@ class XSSSecurityGUI(tk.Tk):
 
     def run_mutator(self):
         self.analyzer.run_mutator()
-
 
     # ============================================================
     #  Поле ввода URL
@@ -676,8 +689,10 @@ if __name__ == "__main__":
     # CLI режими: crawl / js / recon / fuzz
     # ========================================================
     elif cmd in ("crawl", "js", "recon", "fuzz"):
+        # Створюємо приховане Tk-вікно тільки для .after(), без GUI
+        # app = tk.Tk()
+        # app.withdraw()
         app = XSSSecurityGUI()
-
 
         def run_cli():
             def ui_log(msg: str):

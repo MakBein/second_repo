@@ -1,12 +1,6 @@
 # xss_security_gui/xss_attacker.py
 # ============================================================
 #  XSS Attacker ULTRA 6.5+
-#  • ULTRA Hybrid Settings
-#  • Auto‑mutation (Mutator ULTRA)
-#  • Threat Intel інтеграція
-#  • TokenBucket 2.0
-#  • Rotating User Agents PRO
-#  • RetrySession 7.0
 # ============================================================
 
 import threading
@@ -50,13 +44,8 @@ class XSSAttacker:
         self.token = token
         self.category = category
 
-        # Интервал между атаками
         self.interval: float = float(interval or settings.get("attack_engine.interval", 5.0))
-
-        # Таймаут запроса
         self.timeout: float = float(timeout or settings.get("attack_engine.timeout", 10.0))
-
-        # Requests per second
         self.rps: float = float(rps or settings.get("attack_engine.rps", 1.0))
 
         self.running = False
@@ -83,7 +72,7 @@ class XSSAttacker:
         if self.running:
             return
         self.running = True
-        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread = threading.Thread(target=self.run, daemon=True, name="XSSAttacker")
         self.thread.start()
 
     def stop(self) -> None:
@@ -93,7 +82,12 @@ class XSSAttacker:
     #  Основной цикл атаки
     # ============================================================
     def run(self) -> None:
-        payloads: List[str] = get_payloads(self.category)
+        try:
+            payloads: List[str] = get_payloads(self.category)
+        except Exception as e:
+            self._log(f"[⚠️] Ошибка загрузки payload’ов: {e}")
+            self.running = False
+            return
 
         if not payloads:
             self._log("[⚠️] Нет доступных payload’ов. Атака не запущена.")
@@ -117,7 +111,9 @@ class XSSAttacker:
             msg = self._attack_single(payload)
             self._log(msg)
             index += 1
-            time.sleep(self.interval)
+
+            # Защита от слишком маленького интервала
+            time.sleep(max(0.05, self.interval))
 
     def _attack_single(self, payload: str) -> str:
         data = {"input": payload}
@@ -138,7 +134,7 @@ class XSSAttacker:
             else:
                 r = self.session.get(self.url, params=data, headers=headers, timeout=self.timeout)
 
-            body = r.text
+            body = r.text or ""
             reflected = payload in body or payload in html.unescape(body)
             length = len(body)
 
@@ -168,6 +164,7 @@ class XSSAttacker:
         self.thread = threading.Thread(
             target=lambda: self.run_custom(custom_list),
             daemon=True,
+            name="XSSAttackerCustom",
         )
         self.thread.start()
 
@@ -183,7 +180,7 @@ class XSSAttacker:
                     break
                 msg = self._attack_single(payload)
                 self._log(msg)
-                time.sleep(self.interval)
+                time.sleep(max(0.05, self.interval))
 
     # ============================================================
     #  Логирование

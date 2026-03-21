@@ -1,5 +1,4 @@
 # xss_security_gui/auto_recon/xss_flooder.py
-
 """
 XSS Flooder ULTRA 6.1 — многопоточный движок
 --------------------------------------------
@@ -8,7 +7,7 @@ XSS Flooder ULTRA 6.1 — многопоточный движок
 - Очередь задач (Queue)
 - Rate limiting
 - Callback для GUI
-- Логи в logs/xss_flood_log.txt
+- Логи в logs/xss_flood_log.txt (с расширенным содержимым)
 - Интеграция с settings.py и ThreatConnector
 """
 
@@ -33,8 +32,11 @@ LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 # Тип callback
 FloodCallback = Callable[[str, str, str], None]
 
+# 💣 Список целей (загружается из файла)
+payload_urls: list[str] = []
 
-# 📝 Логирование ответа
+
+# 📝 Логирование ответа (локальный файл)
 def log_response(url: str, status: str, snippet: str) -> None:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
@@ -62,11 +64,11 @@ def load_targets_from_file(path: Path) -> list[str]:
         return []
 
 
-# 💣 Список целей
-payload_urls: list[str] = load_targets_from_file(TARGETS_FILE)
+# Инициализация списка целей
+payload_urls = load_targets_from_file(TARGETS_FILE)
 
 
-# 🚀 Отправка одного payload
+# 🚀 Отправка одного пейлоада (с повтором)
 def send_payload(
     url: str,
     callback: Optional[FloodCallback],
@@ -134,7 +136,7 @@ def start_flood(
     repeat_each: int = None,
     delay_each: float = None,
 ) -> None:
-
+    # Централизованные настройки
     urls = list(target_urls or payload_urls)
     if not urls:
         print(f"[XSSFlooder] Нет целевых URL. Проверь файл {TARGETS_FILE}")
@@ -148,12 +150,9 @@ def start_flood(
     delay_each = delay_each or settings.get("flood.delay_each", 0.0)
 
     total_requests = len(urls) * repeat_each * flood_count
-    print(
-        f"[XSSFlooder] Starting flood: {len(urls)} URLs, cycles={flood_count}, "
-        f"workers={max_workers}, total_requests={total_requests}"
-    )
+    print(f"[XSSFlooder] Starting flood: {len(urls)} URLs, cycles={flood_count}, workers={max_workers}, total_requests={total_requests}")
 
-    task_queue: queue.Queue[tuple[Optional[str], int, float]] = queue.Queue()
+    task_queue: queue.Queue[tuple[str, int, float]] = queue.Queue()
 
     # Создаём worker-потоки
     workers = []
@@ -168,14 +167,12 @@ def start_flood(
         for url in urls:
             task_queue.put((url, repeat_each, delay_each))
         task_queue.join()
-
         if cycle < flood_count - 1:
             time.sleep(flood_interval)
 
     # Завершаем worker-потоки
     for _ in workers:
-        task_queue.put((None, 0, 0.0))
-
+        task_queue.put((None, 0, 0))
     for t in workers:
         t.join()
 

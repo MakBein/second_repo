@@ -1,6 +1,6 @@
 {
   "StateChange": [
-    "/change_email?email=hacker@example.com",
+    "/change_email?email=hacker@gazprombank.ru",
     "/delete_account",
     "/update_password?new=123456",
     "/change_username?name=attacker",

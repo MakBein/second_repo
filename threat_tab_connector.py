@@ -4,10 +4,8 @@
 # ============================================================
 
 from __future__ import annotations
-
-import hashlib
 from datetime import datetime, UTC
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from xss_security_gui.threat_analysis.threat_connector import (
     ThreatConnector,
@@ -21,8 +19,11 @@ class ThreatIntelConnector:
     Используется XSSAttacker, AutoRecon, DeepCrawler, Analyzer, GUI.
     """
 
-    def __init__(self) -> None:
-        backend = SQLiteBackend("threat_intel.db")
+    def __init__(self, backend: Optional[Any] = None) -> None:
+        """
+        backend — опциональный DI. Если не передан — создаётся SQLite backend.
+        """
+        backend = backend or SQLiteBackend("threat_intel.db")
         self.tc = ThreatConnector(backend=backend)
 
     # ============================================================
@@ -41,37 +42,51 @@ class ThreatIntelConnector:
     #  Internal unified sender
     # ============================================================
     def _send(self, module: str, target: str, result: Any) -> None:
+        """
+        Унифицированная отправка события в ThreatConnector.
+        ThreatConnector сам:
+            • добавляет timestamp
+            • добавляет module/target
+            • хеширует артефакт
+            • выполняет дедупликацию
+        """
         result = self._normalize(result)
 
-        raw = f"{module}:{target}:{str(result)}"
-        h = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        # Добавляем timestamp на уровне high-level API
+        result.setdefault("timestamp", datetime.now(UTC).isoformat())
 
-        artifact = {
-            "_hash": h,
-            "timestamp": datetime.now(UTC).isoformat(),
-            "module": module,
-            "target": target,
-            "result": result,
-        }
-
-        # ThreatConnector 6.0 expects: add_artifact(module, target, [artifact])
-        self.tc.add_artifact(module, target, [artifact])
+        try:
+            # Современный API ThreatConnector 6.0
+            self.tc.emit(module, target, result)
+        except AttributeError:
+            # Fallback для старых версий
+            self.tc.add_artifact(module, target, [result])
 
     # ============================================================
-    #  NEW: Generic event emitter (GUI → Threat Intel)
+    #  Generic event emitter (GUI → Threat Intel)
     # ============================================================
     def emit(self, module: str, target: str, data: Any) -> None:
+        """
+        Универсальный emitter для GUI/модулей.
+        Пример:
+            tic.emit("gui", "main_window", {"event": "button_click"})
+        """
         self._send(module, target, data)
 
     # ============================================================
-    #  NEW: Bulk event emitter (AutoRecon)
+    #  Bulk event emitter (AutoRecon, массовые результаты)
     # ============================================================
     def bulk(self, module: str, target: str, items: List[Any]) -> None:
+        """
+        Массовая отправка событий.
+        Каждый элемент отправляется отдельно, чтобы ThreatConnector
+        мог корректно дедуплицировать.
+        """
         for item in items:
             self._send(module, target, item)
 
     # ============================================================
-    #  NEW: Summary generator (GUI → Threat Intel)
+    #  Summary generator (GUI → Threat Intel)
     # ============================================================
     def generate_report(self) -> Dict[str, Any]:
         """
@@ -167,6 +182,11 @@ class ThreatIntelConnector:
     #  Generic summary
     # ============================================================
     def report_summary(self, module: str, target: str, summary: Dict[str, Any]) -> None:
+        """
+        Универсальный summary‑репорт для GUI/модулей.
+        Пример:
+            tic.report_summary("tokens", "session", {"high": 3, "medium": 5})
+        """
         self._send(
             module,
             target,
@@ -177,3 +197,15 @@ class ThreatIntelConnector:
                 "source": "gui",
             },
         )
+
+    # ============================================================
+    #  Shutdown (важно для корректного завершения воркера)
+    # ============================================================
+    def shutdown(self) -> None:
+        """
+        Корректно завершает ThreatConnector worker thread.
+        """
+        try:
+            self.tc.shutdown()
+        except Exception:
+            pass

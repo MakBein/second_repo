@@ -4,10 +4,10 @@ XSSTester (ULTRA Hybrid 6.5)
 ----------------------------
 • Проверяет отражение XSS payload'ов
 • Определяет контекст (HTML, JS, Attribute, URL)
-• Использует гибридные настройки из settings.py
+• Работает через универсальный TesterBase
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
 import requests
@@ -29,12 +29,13 @@ class XSSTester(TesterBase):
         timeout: Optional[int] = None,
         headers: Optional[Dict[str, str]] = None,
     ):
+        # Оборачиваем payloads в категорию "default"
         super().__init__("XSS", base_url, param, base_value, {"default": payloads}, output_callback)
 
-        # Таймаут из гибридных настроек (http.request_timeout) или fallback
+        # Таймаут
         self.timeout: int = timeout or int(settings.get("http.request_timeout", 7))
 
-        # User-Agent и заголовки из настроек
+        # Заголовки
         default_ua = settings.get("http.default_user_agent", "XSS-Security-GUI/6.5")
         base_headers = {"User-Agent": default_ua}
 
@@ -43,85 +44,86 @@ class XSSTester(TesterBase):
 
         self.headers: Dict[str, str] = base_headers
 
-    def _test_single(self, category: str, payload: str, full_value: str) -> Dict[str, Any]:
-        """Тестирует один XSS payload."""
+    # ---------------------------------------------------------
+    # HTTP-запрос (контракт TesterBase.send_request)
+    # ---------------------------------------------------------
+    def send_request(self, full_value: str):
         try:
-            r = requests.get(
+            response = requests.get(
                 self.base_url,
                 params={self.param: full_value},
                 timeout=self.timeout,
                 headers=self.headers,
                 allow_redirects=True,
             )
-
-            text = r.text
-            reflected = payload.lower() in text.lower()
-
-            # === Контекст отображения ===
-            context_snippet = None
-            index = text.lower().find(payload.lower())
-            if index != -1:
-                start = max(0, index - 80)
-                end = min(len(text), index + len(payload) + 80)
-                context_snippet = text[start:end]
-
-            # === Тип контекста ===
-            context_type = self._detect_context(text, payload)
-
-            status = "reflected" if reflected else "not reflected"
-            severity = self._assess_severity(reflected, context_type)
-
-            result = self._format_result(
-                category=category,
-                payload=payload,
-                severity=severity,
-                details={
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "status": status,
-                    "http_status": r.status_code,
-                    "response_length": len(text),
-                    "context_type": context_type,
-                    "context_snippet": context_snippet,
-                    "headers": dict(r.headers),
-                    "final_url": r.url,
-                },
-            )
-
-            self.logger.debug(
-                f"[XSSTester] {self.base_url} param={self.param} "
-                f"payload={payload} status={status} context={context_type}"
-            )
-            return result
-
+            return response
         except Exception as e:
-            result = self._format_result(
-                category=category,
-                payload=payload,
-                severity="ERROR",
-                details={
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "status": "error",
-                    "error": str(e),
-                    "response_length": 0,
-                },
-            )
-            self.logger.error(f"[XSSTester] Ошибка при тестировании {self.base_url}: {e}")
-            return result
+            return {"status": "blocked", "reason": str(e)}
 
-    def _detect_context(self, html: str, payload: str) -> str:
+    # ---------------------------------------------------------
+    # Анализ ответа (контракт TesterBase._analyze_response)
+    # ---------------------------------------------------------
+    def _analyze_response(
+        self,
+        text: str,
+        headers_lower: Dict[str, str],
+        response,
+    ) -> Dict[str, Any]:
+
+        # === Проверка отражения ===
+        reflected = self._is_reflected(text, response.request.url)
+
+        # === Контекст ===
+        context_type, context_snippet = self._detect_context(text, reflected)
+
+        # === Оценка риска ===
+        severity = self._assess_severity(reflected, context_type)
+
+        return {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "http_status": response.status_code,
+            "response_length": len(text),
+            "headers": dict(response.headers),
+            "final_url": response.url,
+            "reflected": reflected,
+            "context_type": context_type,
+            "context_snippet": context_snippet,
+            "severity": severity,
+        }
+
+    # ---------------------------------------------------------
+    # Вспомогательные методы
+    # ---------------------------------------------------------
+    def _is_reflected(self, html: str, url: str) -> bool:
+        """Проверяет, отражён ли payload в HTML."""
+        return self.base_value.lower() in html.lower() or self.base_value.lower() in url.lower()
+
+    def _detect_context(self, html: str, reflected: bool):
         """Определяет контекст инъекции: HTML, JS, Attribute, URL."""
-        lower = html.lower()
-        p = payload.lower()
+        if not reflected:
+            return "Not Reflected", None
 
+        lower = html.lower()
+        p = self.base_value.lower()
+
+        index = lower.find(p)
+        snippet = None
+        if index != -1:
+            start = max(0, index - 80)
+            end = min(len(html), index + len(p) + 80)
+            snippet = html[start:end]
+
+        # Контекст
         if "<script" in lower and p in lower:
-            return "JS Context"
+            return "JS Context", snippet
         if f"=\"{p}\"" in lower or f"='{p}'" in lower:
-            return "Attribute Injection"
+            return "Attribute Injection", snippet
         if f">{p}<" in lower:
-            return "HTML Body"
+            return "HTML Body", snippet
         if f"url={p}" in lower or f"href={p}" in lower:
-            return "URL Parameter"
-        return "Unknown"
+            return "URL Parameter", snippet
+
+        return "Unknown", snippet
 
     @staticmethod
     def _assess_severity(reflected: bool, context_type: str) -> str:

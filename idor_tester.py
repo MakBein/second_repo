@@ -187,7 +187,7 @@ def fuzz_id_parameter(
 # Test run
 # ---------------------------------------------------------
 if __name__ == "__main__":
-    test_url = "https://example.com/profile?user_id=1"
+    test_url = "https://gazprombank.ru/profile?user_id=1"
     param = "user_id"
 
     res = fuzz_id_parameter(

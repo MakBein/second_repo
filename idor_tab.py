@@ -14,14 +14,16 @@ class IDORTab(ttk.Frame):
     IDORTab ULTRA 6.x
     • Потокобезпечний лог
     • Уніфікований формат результатів
-    • Чистий, структурований код
-    • Threat Intel інтеграція у стандартному форматі
+    • Threat Intel інтеграція
+    • Стабільність GUI навіть при помилках
     """
 
     def __init__(self, parent, threat_tab=None):
         super().__init__(parent)
         self.threat_tab = threat_tab
         self.results: List[Dict[str, Any]] = []
+        self.active_tests = 0
+        self.max_workers = 3
         self._build_ui()
 
     # ---------------------------------------------------------
@@ -59,21 +61,32 @@ class IDORTab(ttk.Frame):
         self.result_box = tk.Text(
             self,
             bg="black",
-            fg="lime",
+            fg="white",
             height=25,
             wrap="none",
             insertbackground="white",
         )
         self.result_box.pack(fill="both", expand=True, padx=10, pady=5)
 
+        # Кольорові теги
+        self.result_box.tag_config("HIGH", foreground="lime")
+        self.result_box.tag_config("MEDIUM", foreground="yellow")
+        self.result_box.tag_config("LOW", foreground="cyan")
+        self.result_box.tag_config("INFO", foreground="white")
+        self.result_box.tag_config("ERROR", foreground="red")
+
     # ---------------------------------------------------------
     # Thread-safe log
     # ---------------------------------------------------------
-    def _safe_log(self, text: str) -> None:
-        self.after(0, lambda: self._append(text))
+    def _safe_log(self, data: Any) -> None:
+        self.after(0, lambda: self._append(data))
 
-    def _append(self, text: str) -> None:
-        self.result_box.insert("end", text)
+    def _append(self, data: Any) -> None:
+        if isinstance(data, tuple):
+            text, tag = data
+            self.result_box.insert("end", text, tag)
+        else:
+            self.result_box.insert("end", data)
         self.result_box.see("end")
 
     # ---------------------------------------------------------
@@ -103,6 +116,10 @@ class IDORTab(ttk.Frame):
     # Start test
     # ---------------------------------------------------------
     def start_test(self):
+        if self.active_tests >= self.max_workers:
+            self._safe_log("⚠️ Досягнуто ліміт потоків, зачекай завершення.\n")
+            return
+
         validated = self.validate_inputs()
         if not validated:
             return
@@ -111,6 +128,8 @@ class IDORTab(ttk.Frame):
         agent = self.agent_entry.get().strip()
 
         self._safe_log(f"\n🧬 Запуск IDOR-тесту: {url} [param={param}, method={method}]\n")
+
+        self.active_tests += 1
 
         threading.Thread(
             target=lambda: self._run_idor(url, param, method, token, start, stop, delay, agent),
@@ -145,28 +164,33 @@ class IDORTab(ttk.Frame):
                 hash_ = r.get("hash", "?")
                 full_url = r.get("url", "?")
 
+                severity = "HIGH" if differs else "INFO"
+
                 line = f"{mark} | {full_url} | [{status}] | len={length} | hash={hash_}\n"
+                self._safe_log((line, severity))
 
                 if "error" in r:
-                    line += f"   ❌ Помилка: {r['error']}\n"
-
-                self._safe_log(line)
+                    self._safe_log((f"   ❌ Помилка: {r['error']}\n", "ERROR"))
 
                 # Threat Intel
                 if self.threat_tab:
                     self.threat_tab.add_threat({
                         "type": "IDOR",
                         "url": full_url,
-                        "payload": r.get("value", None),
+                        "payload": r.get("value"),
                         "status": status,
                         "length": length,
                         "differs": differs,
                         "hash": hash_,
+                        "severity": severity,
                         "source": "IDOR Scanner",
                     })
 
         except Exception as e:
-            self._safe_log(f"❌ Помилка: {e}\n")
+            self._safe_log((f"❌ Помилка: {e}\n", "ERROR"))
+
+        finally:
+            self.active_tests = max(0, self.active_tests - 1)
 
     # ---------------------------------------------------------
     # Clear

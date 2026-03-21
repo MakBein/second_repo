@@ -87,5 +87,14 @@
     "artifact_path": "LOG_DIR/threat_intel_artifact.json",
     "log_path": "LOG_DIR/threat_intel.log",
     "max_size_mb": 20
+  },
+
+  "threat_intel": {
+    "enable": false,
+    "elk_url": "",
+    "splunk_url": "",
+    "splunk_token": "",
+    "send_full_results": true,
+    "send_summary": true
   }
 }

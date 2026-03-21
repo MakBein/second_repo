@@ -28,8 +28,7 @@ class TokenViewTab(ttk.Frame):
     # ============================================================
     #  UI
     # ============================================================
-
-    def build_ui(self):
+    def build_ui(self) -> None:
         ttk.Label(self, text="🔐 Найденные токены:").pack(anchor="w", padx=10, pady=5)
 
         columns = ("linked_url", "value", "type", "exp", "aud", "alg", "risk_level", "risks")
@@ -55,63 +54,76 @@ class TokenViewTab(ttk.Frame):
         btn_frame = ttk.Frame(self)
         btn_frame.pack(pady=5)
 
-        ttk.Button(btn_frame, text="📂 Загрузить лог", command=self.load_log).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="🧪 Сгенерировать тестовые токены", command=self.generate_and_display_tokens).pack(
+        ttk.Button(btn_frame, text="📂 Загрузить лог", command=self._ask_and_load_log).pack(
             side="left", padx=5
         )
+        ttk.Button(
+            btn_frame,
+            text="🧪 Сгенерировать тестовые токены",
+            command=self.generate_and_display_tokens,
+        ).pack(side="left", padx=5)
+
+        # Подсветка high_risk
+        self.tree.tag_configure("high_risk", background="#ffdddd")
 
     # ============================================================
     #  Helpers
     # ============================================================
-
-    def clear_tree(self):
+    def clear_tree(self) -> None:
         for row in self.tree.get_children():
             self.tree.delete(row)
 
-    def _safe_insert(self, values: tuple, high_risk: bool = False):
+    def _safe_insert(self, values: tuple, high_risk: bool = False) -> None:
         """Потокобезпечне вставлення рядка."""
         self.after(0, lambda: self._insert(values, high_risk))
 
-    def _insert(self, values: tuple, high_risk: bool):
+    def _insert(self, values: tuple, high_risk: bool) -> None:
         self.tree.insert(
             "",
             tk.END,
             values=values,
             tags=("high_risk",) if high_risk else (),
         )
-        self.tree.tag_configure("high_risk", background="#ffdddd")
 
     # ============================================================
     #  Token classification
     # ============================================================
-
     def classify_token(self, value: str) -> Dict[str, Any]:
         """Визначає тип токена та базові ризики."""
-        if "." in value and value.count(".") == 2:
+        v = value.strip()
+
+        # Примитивная JWT-эвристика
+        if "." in v and v.count(".") == 2:
             return {"type": "jwt", "alg": "?", "aud": "?", "exp": "?", "risks": ["possible JWT"]}
 
-        if value.startswith("AKIA") and len(value) > 16:
+        # AWS-like ключ
+        if v.startswith("AKIA") and len(v) > 16:
             return {"type": "api_key", "alg": "", "aud": "cloud", "exp": "", "risks": ["possible cloud key"]}
 
-        if len(value) > 30:
+        # Длинный непрозрачный токен
+        if len(v) > 30:
             return {"type": "opaque", "alg": "", "aud": "session", "exp": "", "risks": ["opaque token"]}
 
         return {"type": "unknown", "alg": "", "aud": "", "exp": "", "risks": ["unclassified"]}
 
     def compute_risk_level(self, risks: List[str]) -> str:
-        if any("admin" in r.lower() for r in risks):
+        text = " ".join(risks).lower()
+        if "admin" in text or "root" in text:
             return "high"
-        if any("cloud" in r.lower() for r in risks):
+        if "cloud" in text:
             return "medium"
-        if any("session" in r.lower() for r in risks):
+        if "session" in text:
             return "medium"
         return "low"
 
     # ============================================================
     #  Load tokens from log
     # ============================================================
+    def _ask_and_load_log(self) -> None:
+        # Можно позже заменить на filedialog, сейчас — дефолтный путь
+        self.load_log("logs/token_risks.json")
 
-    def load_log(self, report_path: str = "logs/token_risks.json"):
+    def load_log(self, report_path: str = "logs/token_risks.json") -> None:
         try:
             if not os.path.exists(report_path):
                 raise FileNotFoundError(f"Файл не найден: {report_path}")
@@ -125,7 +137,7 @@ class TokenViewTab(ttk.Frame):
             self.clear_tree()
 
             for item in data:
-                value = item.get("value", "")
+                value = item.get("value", "") or ""
                 short = value[:80] + "..." if len(value) > 80 else value
 
                 # Автокласифікація, якщо лог не містить типу
@@ -159,9 +171,8 @@ class TokenViewTab(ttk.Frame):
     # ============================================================
     #  Test token generator (ULTRA)
     # ============================================================
-
-    def _generate_test_tokens(self, count: int = 20) -> List[Dict]:
-        tokens: List[Dict] = []
+    def _generate_test_tokens(self, count: int = 20) -> List[Dict[str, Any]]:
+        tokens: List[Dict[str, Any]] = []
 
         for _ in range(count):
             token_type = secrets.choice(["jwt", "opaque", "api_key"])
@@ -207,7 +218,7 @@ class TokenViewTab(ttk.Frame):
 
         return tokens
 
-    def generate_and_display_tokens(self):
+    def generate_and_display_tokens(self) -> None:
         try:
             self.clear_tree()
 

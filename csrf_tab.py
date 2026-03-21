@@ -13,26 +13,36 @@ class CSRFTab(tk.Frame):
         super().__init__(parent)
 
         self.url = url
+        self.active_tests = 0
+        self.max_workers = 5
 
         # === Путь к payload-файлу ===
-        if payload_file is None:
-            self.payload_file = PAYLOADS_DIR / "csrf.json"
-        else:
-            self.payload_file = Path(payload_file)
+        self.payload_file = Path(payload_file) if payload_file else PAYLOADS_DIR / "csrf.json"
 
         # === Загрузка payload-ов ===
-        self.payloads: Dict[str, list] = {}
+        self.payloads: Dict[str, list] = self._load_payloads()
+
+        # === UI ===
+        self._build_ui()
+
+    # ============================================================
+    #  Загрузка payload-ов
+    # ============================================================
+    def _load_payloads(self) -> Dict[str, list]:
         try:
             with open(self.payload_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, dict):
-                    self.payloads = data
-                else:
-                    print(f"[CSRF] Ожидался dict в {self.payload_file}, получено {type(data).__name__}")
+                    return data
+                print(f"[CSRF] Ожидался dict в {self.payload_file}, получено {type(data).__name__}")
         except Exception as e:
             print(f"[CSRF] Ошибка загрузки payload-файла: {e}")
+        return {}
 
-        # === UI ===
+    # ============================================================
+    #  UI
+    # ============================================================
+    def _build_ui(self) -> None:
         tk.Label(self, text="Параметр:").pack()
         self.param_entry = tk.Entry(self)
         self.param_entry.insert(0, "action")
@@ -54,13 +64,24 @@ class CSRFTab(tk.Frame):
         tk.Button(self, text="🧹 Очистить вывод", command=self.clear_output).pack()
         tk.Button(self, text="🗑 Очистить лог артефактов", command=self.clear_artifact_log).pack()
 
-        self.output = tk.Text(self, height=20)
+        self.output = tk.Text(self, height=20, bg="black", fg="white", insertbackground="white")
         self.output.pack(fill="both", expand=True)
+
+        # Цветовые теги
+        self.output.tag_config("HIGH", foreground="lime")
+        self.output.tag_config("MEDIUM", foreground="yellow")
+        self.output.tag_config("LOW", foreground="cyan")
+        self.output.tag_config("INFO", foreground="white")
+        self.output.tag_config("ERROR", foreground="red")
 
     # ============================================================
     #  Запуск тестов
     # ============================================================
     def run_tests(self) -> None:
+        if self.active_tests >= self.max_workers:
+            self._safe_log("⚠️ Достигнут лимит потоков, дождитесь завершения.\n")
+            return
+
         param = self.param_entry.get().strip()
         base_value = self.value_entry.get()
         category = self.category_var.get()
@@ -82,40 +103,51 @@ class CSRFTab(tk.Frame):
             output_callback=self.display_result,
         )
         tester.start()
+        self.active_tests += 1
+
+        self._safe_log(f"🚀 Запущено CSRF-тестирование для {self.url} (param={param})\n")
 
     # ============================================================
     #  Потокобезопасный логгер в Text
     # ============================================================
-    def _safe_log(self, text: str) -> None:
-        # Викликати тільки з будь-якого потоку — оновлення піде в mainloop
-        self.after(0, lambda: self._append_text(text))
+    def _safe_log(self, data: Any) -> None:
+        self.after(0, lambda: self._append_text(data))
 
-    def _append_text(self, text: str) -> None:
-        self.output.insert("end", text)
+    def _append_text(self, data: Any) -> None:
+        if isinstance(data, tuple):
+            text, tag = data
+            self.output.insert("end", text, tag)
+        else:
+            self.output.insert("end", data)
         self.output.see("end")
 
     # ============================================================
     #  Вывод результата
     # ============================================================
     def display_result(self, result: Dict[str, Any]) -> None:
-        """
-        Гнучкий вивід результатів:
-        - не падає, якщо немає ключів
-        - акуратно показує тільки те, що є
-        """
+        self.active_tests = max(0, self.active_tests - 1)
+
+        if not result:
+            self._safe_log("⚠️ Пустой результат от CSRFTester\n")
+            return
+
+        details = result.get("details", {})
+        severity = result.get("severity") or details.get("severity") or "INFO"
+
         category = result.get("category", "unknown")
         payload = result.get("payload", "<no payload>")
-        status = result.get("status", "unknown")
 
-        # response_length може бути відсутнім — не крешимося
-        resp_len = result.get("response_length")
-        if isinstance(resp_len, (int, float)):
-            len_part = f"(len={resp_len})"
-        else:
-            len_part = ""
+        http_status = details.get("http_status", "?")
+        resp_len = details.get("response_length")
+        len_part = f"(len={resp_len})" if isinstance(resp_len, (int, float)) else ""
 
-        line = f"[{category}] {payload} → {status} {len_part}\n"
-        self._safe_log(line)
+        line = (
+            f"[{category}] {payload} → {severity} "
+            f"(HTTP {http_status}) {len_part}\n"
+        )
+
+        tag = severity if severity in ("HIGH", "MEDIUM", "LOW", "ERROR", "INFO") else "INFO"
+        self._safe_log((line, tag))
 
     # ============================================================
     #  Очистка вывода

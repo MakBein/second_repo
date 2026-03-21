@@ -16,6 +16,7 @@ import ssl
 import subprocess
 import threading
 from datetime import datetime
+import time
 
 import requests
 from pythonping import ping
@@ -46,6 +47,41 @@ WAF_SIGNATURES = {
     "mod_security": ["mod_security", "modsecurity"],
     "sucuri": ["sucuri", "x-sucuri-id"],
 }
+
+
+def check_url_alive(url: str):
+    try:
+        r = requests.head(url, timeout=5, allow_redirects=True)
+        return True, r.status_code
+    except Exception:
+        return False, None
+
+
+def check_ssl_valid(url: str):
+    try:
+        r = requests.get(url, timeout=5, verify=True)
+        cert = r.raw.connection.sock.getpeercert()
+        return True, cert.get("subject", "OK")
+    except Exception as e:
+        return False, str(e)
+
+
+def resolve_redirects(url: str):
+    try:
+        r = requests.get(url, timeout=5, allow_redirects=True)
+        return r.url
+    except Exception:
+        return url
+
+
+def measure_latency(url: str):
+    try:
+        start = time.time()
+        requests.get(url, timeout=5)
+        return (time.time() - start) * 1000
+    except Exception:
+        return -1
+
 
 
 class NetworkChecker:
@@ -346,23 +382,83 @@ class NetworkChecker:
     def check_asn_geoip(self):
         try:
             ip = socket.gethostbyname(self.domain)
-            r = requests.get(f"https://ipinfo.io/{ip}/json", timeout=5).json()
+            r = requests.get(f"https://ipwho.is/{ip}", timeout=5).json()
 
-            asn = r.get("org", "Unknown")
-            city = r.get("city", "Unknown")
-            country = r.get("country", "Unknown")
-            provider = r.get("org", "Unknown")
+            if not r.get("success", False):
+                status = f"⚠️ GeoIP: сервис ipwho.is не смог обработать IP {ip}"
+            else:
+                country = r.get("country", "Unknown")
+                city = r.get("city", "Unknown")
 
-            status = f"🌍 GeoIP: IP={ip}, ASN={asn}, Country={country}, City={city}, Provider={provider}"
+                # Coordinates + accuracy
+                latitude = r.get("latitude")
+                longitude = r.get("longitude")
+                accuracy = r.get("location", {}).get("accuracy")
+
+                # ASN / ISP
+                conn = r.get("connection", {})
+                asn = conn.get("asn", "Unknown")
+                isp = conn.get("isp") or conn.get("org") or "Unknown"
+
+                # Security flags (best way to detect datacenter / vpn / tor)
+                sec = r.get("security", {})
+                is_hosting = sec.get("hosting")
+                is_vpn = sec.get("vpn")
+                is_tor = sec.get("tor")
+                is_proxy = sec.get("proxy")
+
+                # Network type logic
+                if is_hosting:
+                    net_type = "hosting"
+                elif is_vpn:
+                    net_type = "vpn"
+                elif is_tor:
+                    net_type = "tor"
+                elif is_proxy:
+                    net_type = "proxy"
+                else:
+                    # fallback heuristic
+                    org_lower = (isp or "").lower()
+                    if any(x in org_lower for x in ("cloud", "datacenter", "colo", "llc", "gmbh")):
+                        net_type = "hosting"
+                    elif any(x in org_lower for x in ("mobile", "cellular", "wireless")):
+                        net_type = "mobile"
+                    else:
+                        net_type = "residential"
+
+                # Формируем красивый лог
+                status = (
+                    f"🌍 GeoIP: IP={ip}, ASN={asn}, Country={country}, City={city}, "
+                    f"Provider={isp}, NetworkType={net_type}, "
+                    f"Lat={latitude}, Lon={longitude}, Accuracy={accuracy}km, "
+                    f"Datacenter={is_hosting}"
+                )
 
         except Exception as e:
             status = f"❌ Ошибка GeoIP/ASN: {e}"
 
         self._log(status)
-        THREAT_CONNECTOR.emit(module="NetworkChecker", target=self.domain,
-                              result={"check": "asn_geoip", "status": status})
+        THREAT_CONNECTOR.emit(
+            module="NetworkChecker",
+            target=self.domain,
+            result={"check": "asn_geoip", "status": status},
+        )
 
 
-
-
-
+        # try:
+        #     ip = socket.gethostbyname(self.domain)
+        #     r = requests.get(f"https://ipinfo.io/{ip}/json", timeout=5).json()
+        #
+        #     asn = r.get("org", "Unknown")
+        #     city = r.get("city", "Unknown")
+        #     country = r.get("country", "Unknown")
+        #     provider = r.get("org", "Unknown")
+        #
+        #     status = f"🌍 GeoIP: IP={ip}, ASN={asn}, Country={country}, City={city}, Provider={provider}"
+        #
+        # except Exception as e:
+        #     status = f"❌ Ошибка GeoIP/ASN: {e}"
+        #
+        # self._log(status)
+        # THREAT_CONNECTOR.emit(module="NetworkChecker", target=self.domain,
+        #                       result={"check": "asn_geoip", "status": status})

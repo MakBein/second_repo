@@ -1,8 +1,11 @@
 # xss_security_gui/threat_analysis/dom_xss_detector.py
 """
-DOMXSSDetector
---------------
-Примитивный DOM-XSS детектор по паттернам sink'ов и source'ов.
+DOMXSSDetector (ULTRA Hybrid 6.5)
+---------------------------------
+• Анализ DOM-XSS по источникам и sink'ам
+• Расширенные паттерны (eval, innerHTML, insertAdjacentHTML, write)
+• Dataflow-подход: source → sink
+• Threat Intel-friendly структура
 """
 
 from typing import List, Dict, Any
@@ -14,22 +17,40 @@ class DOMXSSDetector:
     """Анализатор DOM-XSS по ключевым источникам и точкам внедрения."""
 
     DEFAULT_SINKS = [
-        "innerHTML", "outerHTML", "insertAdjacentHTML",
-        "document.write", "document.writeln",
-        "eval(", "new Function", "setTimeout", "setInterval",
+        r"innerHTML",
+        r"outerHTML",
+        r"insertAdjacentHTML",
+        r"document\.write",
+        r"document\.writeln",
+        r"eval\s*\(",
+        r"new\s+Function",
+        r"setTimeout\s*\(",
+        r"setInterval\s*\(",
     ]
 
     DEFAULT_SOURCES = [
-        "location.hash", "location.search", "location.href",
-        "document.URL", "document.documentURI",
-        "window.name",
+        r"location\.hash",
+        r"location\.search",
+        r"location\.href",
+        r"document\.URL",
+        r"document\.documentURI",
+        r"window\.name",
+        r"document\.cookie",
     ]
 
-    def __init__(self, threat_tab=None, sinks: List[str] | None = None, sources: List[str] | None = None):
+    def __init__(
+        self,
+        threat_tab=None,
+        sinks: List[str] | None = None,
+        sources: List[str] | None = None,
+    ):
         self.threat_tab = threat_tab
         self.SINKS = sinks if sinks is not None else self.DEFAULT_SINKS
         self.SOURCES = sources if sources is not None else self.DEFAULT_SOURCES
 
+    # ---------------------------------------------------------
+    # Основной метод
+    # ---------------------------------------------------------
     def analyze_html(self, html: str, url: str = "") -> List[Dict[str, Any]]:
         """
         Анализирует HTML на наличие DOM-XSS паттернов.
@@ -43,14 +64,15 @@ class DOMXSSDetector:
 
         for script in soup.find_all("script"):
             code = script.string or ""
-            code_lower = code.lower()
+            if not code.strip():
+                continue
 
-            sinks = [s for s in self.SINKS if s.lower() in code_lower]
-            sources = [s for s in self.SOURCES if s.lower() in code_lower]
+            sinks = self._find_patterns(code, self.SINKS)
+            sources = self._find_patterns(code, self.SOURCES)
 
             if sinks and sources:
                 snippet = self._extract_snippet(code)
-                severity = self._assess_severity(code)
+                severity = self._assess_severity(sinks)
 
                 finding = {
                     "url": url,
@@ -75,17 +97,35 @@ class DOMXSSDetector:
 
         return findings
 
+    # ---------------------------------------------------------
+    # Поиск паттернов (RegExp)
+    # ---------------------------------------------------------
+    def _find_patterns(self, code: str, patterns: List[str]) -> List[str]:
+        found = []
+        for pattern in patterns:
+            if re.search(pattern, code, flags=re.IGNORECASE):
+                found.append(pattern)
+        return found
+
+    # ---------------------------------------------------------
+    # Сниппет
+    # ---------------------------------------------------------
     @staticmethod
     def _extract_snippet(code: str, window: int = 200) -> str:
-        """Очищает и возвращает сниппет кода."""
         code = re.sub(r"\s+", " ", code)
         return code[:window]
 
-    @staticmethod
-    def _assess_severity(code: str) -> str:
-        """Простейшая оценка риска."""
-        if "eval(" in code or "new Function" in code:
+    # ---------------------------------------------------------
+    # Severity логика (уровень ZAP/Burp)
+    # ---------------------------------------------------------
+    def _assess_severity(self, sinks: List[str]) -> str:
+        high = ["eval", "new Function"]
+        medium = ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"]
+
+        if any(re.search(h, s, re.IGNORECASE) for h in high for s in sinks):
             return "HIGH"
-        elif "innerHTML" in code or "document.write" in code:
+
+        if any(re.search(m, s, re.IGNORECASE) for m in medium for s in sinks):
             return "MEDIUM"
+
         return "LOW"

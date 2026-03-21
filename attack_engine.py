@@ -24,7 +24,7 @@ from xss_security_gui.auto_modules.dom_and_endpoints import (
 
 from xss_security_gui.auto_modules.auto_modules import brute_force_tokens
 
-from xss_security_gui.settings import settings
+import xss_security_gui.settings as settings
 
 class AttackEngine:
     """AttackEngine 6.0 — единый движок атак для GUI и CLI."""
@@ -67,6 +67,7 @@ class AttackEngine:
             "Forms & Inputs",
             "Error Pages & Stacktraces",
             "CSRF Actions",
+            "SSRF Scan",
         ]
 
         # Обработчики модулей для модульной автоатаки
@@ -85,6 +86,7 @@ class AttackEngine:
             "Forms & Inputs": self._run_forms,
             "Error Pages & Stacktraces": self._run_errors,
             "CSRF Actions": self._run_csrf,
+            "SSRF Scan": self._run_ssrf,
         }
 
     # ===================== API для GUI (модульные вызовы) =====================
@@ -142,6 +144,20 @@ class AttackEngine:
         return self.results
 
     # ===================== Вспомогательные =====================
+    def _check_allowed(self, ctx):
+        base_url = ctx.get("base_url", "")
+        return self._is_target_allowed(base_url)
+
+    def _get_setting(self, path: str, default: Any = None) -> Any:
+        """
+        Достаёт значение из SETTINGS_JSON по пути вида 'http.request_timeout'.
+        """
+        node = settings.SETTINGS_JSON
+        for part in path.split("."):
+            if not isinstance(node, dict):
+                return default
+            node = node.get(part, default)
+        return node if node is not None else default
 
     def _log(self, msg: str, level: str = "info") -> None:
         timestamp = time.strftime("%H:%M:%S")
@@ -162,11 +178,17 @@ class AttackEngine:
         except Exception as e:
             self._log(f"⚠️ Ошибка Threat Intel: {e}", level="error")
 
-    def _send_intel(self, attack_type: str, result: dict) -> None:
-        try:
-            self.threat_sender(module=attack_type, target=self.domain, result=result)
-        except Exception as e:
-            self._log(f"⚠️ Ошибка ThreatSender: {e}", level="warn")
+    # ELK і Splunk
+    def _send_intel(self, event_type: str, data: dict):
+        intel = settings.SETTINGS_JSON.get("threat_intel", {})
+
+        if intel.get("elk_url"):
+            requests.post(intel["elk_url"], json={"event_type": event_type, "data": data})
+
+        if intel.get("splunk_url") and intel.get("splunk_token"):
+            headers = {"Authorization": f"Splunk {intel['splunk_token']}"}
+            payload = {"event": {"type": event_type, "data": data}}
+            requests.post(intel["splunk_url"], headers=headers, json=payload)
 
     def _group_by_type(self) -> Dict[str, int]:
         return dict(Counter(r["attack_type"] for r in self.results))
@@ -185,6 +207,9 @@ class AttackEngine:
         return url
 
     def _build_request_context(self, url: str, payload: str) -> dict:
+        timeout = self._get_setting("http.request_timeout", 7)
+        ua = self._get_setting("http.default_user_agent", "XSS-Security-GUI/6.5")
+
         ctx = {
             "method": "GET",
             "url": url,
@@ -192,11 +217,11 @@ class AttackEngine:
             "data": None,
             "json": None,
             "headers": {
-                "User-Agent": "XSS-Security-GUI-AutoAttack/6.0",
+                "User-Agent": ua,
                 "Accept": "*/*",
             },
             "cookies": {},
-            "timeout": 10,
+            "timeout": timeout,
             "verify": False,
         }
         if "{payload}" in url:
@@ -207,6 +232,12 @@ class AttackEngine:
     def _send_payload(self, url: str, payload: str, method: str = "GET"):
         try:
             url = self._normalize_url(url)
+
+            if not self._is_target_allowed(url):
+                self._log(f"🚫 Реальные запросы к {url} запрещены политикой ALLOW_REAL_RUN/ALLOWED_TARGETS",
+                          level="warn")
+                return None
+
             ctx = self._build_request_context(url, payload)
             method = method.upper()
             resp = requests.request(method, **ctx)
@@ -215,13 +246,39 @@ class AttackEngine:
             self._log(f"❌ Ошибка _send_payload [{method}]: {e}", level="error")
             return None
 
+    def _is_target_allowed(self, url: str) -> bool:
+        """
+        Проверяет, разрешён ли реальный запрос к цели.
+        """
+        if not settings.ALLOW_REAL_RUN:
+            return False
+
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        # если домен явно указан при создании AttackEngine — тоже учитываем
+        domain = (self.domain or "").lower()
+
+        allowed = set(x.lower() for x in settings.ALLOWED_TARGETS)
+        return host.lower() in allowed or domain in allowed
+
     def _make_request(self, method: str, endpoint: str, payload=None, headers=None):
-        headers = headers or {"Content-Type": "application/json"}
+        # базовый заголовок из настроек
+        default_ua = self._get_setting("http.default_user_agent", "XSS-Security-GUI/6.5")
+        headers = headers or {"Content-Type": "application/json", "User-Agent": default_ua}
+
+        timeout = self._get_setting("http.request_timeout", 7)
         start = time.time()
 
         try:
+            endpoint = self._normalize_url(endpoint)
+
+            if not self._is_target_allowed(endpoint):
+                self._log(f"🚫 Реальные запросы к {endpoint} запрещены политикой ALLOW_REAL_RUN/ALLOWED_TARGETS",
+                          level="warn")
+                return None, None
+
             method = method.upper()
-            kwargs = {"headers": headers, "timeout": 5}
+            kwargs = {"headers": headers, "timeout": timeout}
 
             if method in ["POST", "PUT", "PATCH", "DELETE", "CONNECT"]:
                 kwargs["json"] = {"input": payload}
@@ -242,6 +299,14 @@ class AttackEngine:
     def attack_payload(self, url: str, payload: str) -> dict:
         try:
             response = self._send_payload(url, payload)
+            if response is None:
+                return {
+                    "status": "skipped",
+                    "reflected": False,
+                    "length": 0,
+                    "response": "",
+                }
+
             body = response.text if hasattr(response, "text") else str(response)
             reflected = payload in body
             return {
@@ -335,7 +400,9 @@ class AttackEngine:
                 "settings": settings,
                 "domain": self.domain,
                 "secrets": {"tokens": token_candidates},
+
             }
+            self._last_context = context  # ← сохранение единого еталонного контекста
 
             # Запуск модулей
             for module_name in self.modules:
@@ -385,87 +452,64 @@ class AttackEngine:
 
     # ===================== Реализация модулей =====================
 
-    def _run_api_endpoints(self, ctx: Dict[str, Any]) -> dict:
-        allow_real = ctx.get("settings", {}).get("allow_real_run", True)
-        if not allow_real:
-            return {"status": "skipped", "reason": "real-run-not-allowed"}
+    def _run_api_endpoints(self, ctx):
+        base_url = ctx["base_url"]
 
-        crawl = ctx["crawl"]
-        api_endpoints = crawl.get("api_endpoints", [])
+        if not self._is_target_allowed(base_url):
+            return {"status": "skipped", "reason": "target-not-allowed"}
+
+        api_endpoints = ctx["crawl"].get("api_endpoints", [])
         if not api_endpoints:
-            return {"status": "skipped", "items": [], "count": 0, "reason": "no api_endpoints"}
+            return {"status": "skipped", "reason": "no-api-endpoints"}
 
         results = attack_api_endpoints(
             ctx["session"],
-            ctx["base_url"],
+            base_url,
             api_endpoints,
             ctx["headers_list"],
             self._log,
         ) or []
 
-        return {
-            "status": "done",
-            "items": results,
-            "count": len(results),
-            "severity": "info",
-        }
+        return {"status": "done", "items": results, "count": len(results)}
 
-    def _run_token_bruteforce(self, ctx: Dict[str, Any]) -> dict:
-        domain = ctx.get("domain")
-        settings_ctx = ctx.get("settings", {})
-        allow_real = settings_ctx.get("allow_real_run", True)
+    def _run_token_bruteforce(self, ctx):
+        domain = ctx["domain"]
+        url = f"https://{domain}"
 
-        if not allow_real:
-            return {"status": "skipped", "reason": "real-run-not-allowed"}
+        if not self._is_target_allowed(url):
+            return {"status": "skipped", "reason": "target-not-allowed"}
 
-        if domain not in getattr(settings, "ALLOWED_TARGETS", []):
-            return {"status": "skipped", "reason": "domain-not-allowed"}
-
-        # список токенів
-        tokens = ctx.get("secrets", {}).get("tokens", [])
+        tokens = ctx["secrets"]["tokens"]
         if not tokens:
             return {"status": "skipped", "reason": "no-tokens"}
 
-        # базовий URL
-        base_url = f"https://{domain}"
-
-        # виклик реального brute-force
         results = brute_force_tokens(
             session=self._session,
-            base_url=base_url,
+            base_url=url,
             tokens=tokens,
             log=self._log_func,
         )
 
-        return {
-            "status": "done",
-            "count": len(results),
-            "items": results,
-        }
+        return {"status": "done", "items": results, "count": len(results)}
 
-    def _run_parameters(self, ctx: Dict[str, Any]) -> dict:
-        allow_real = ctx.get("settings", {}).get("allow_real_run", True)
-        if not allow_real:
-            return {"status": "skipped", "reason": "real-run-not-allowed"}
+    def _run_parameters(self, ctx):
+        base_url = ctx["base_url"]
 
-        crawl = ctx["crawl"]
-        parameters = crawl.get("parameters", [])
+        if not self._is_target_allowed(base_url):
+            return {"status": "skipped", "reason": "target-not-allowed"}
+
+        parameters = ctx["crawl"].get("parameters", [])
         if not parameters:
-            return {"status": "skipped", "items": [], "count": 0, "reason": "no parameters"}
+            return {"status": "skipped", "reason": "no-parameters"}
 
         results = attack_parameters(
             ctx["session"],
-            ctx["base_url"],
+            base_url,
             parameters,
             self._log,
         ) or []
 
-        return {
-            "status": "done",
-            "items": results,
-            "count": len(results),
-            "severity": "info",
-        }
+        return {"status": "done", "items": results, "count": len(results)}
 
     def _run_user_ids(self, ctx: Dict[str, Any]) -> dict:
         allow_real = ctx.get("settings", {}).get("allow_real_run", True)
@@ -529,13 +573,13 @@ class AttackEngine:
         }
 
     def _run_js_sensitive(self, ctx: Dict[str, Any]) -> dict:
-        crawl = ctx["crawl"]
-        scripts = crawl.get("scripts", [])
-        allow_real = ctx.get("settings", {}).get("allow_real_run", True)
-        if not allow_real:
-            return {"status": "skipped", "reason": "real-run-not-allowed"}
+        # Перевірка дозволу на реальні дії
+        if not self._is_target_allowed(ctx.get("base_url", "")):
+            return {"status": "skipped", "reason": "target-not-allowed"}
+
+        scripts = ctx["crawl"].get("scripts", [])
         if not scripts:
-            return {"status": "skipped", "items": [], "count": 0, "reason": "no scripts"}
+            return {"status": "skipped", "reason": "no-scripts"}
 
         findings: List[Dict[str, Any]] = []
 
@@ -553,12 +597,13 @@ class AttackEngine:
         except Exception as e:
             self._log(f"❌ Ошибка DOM Vector Attacks: {e}", level="error")
 
-        # Собираем уже записанные результаты по found_targets и dom_vectors
+        # Збираємо результати
         for r in self.results:
             if r.get("attack_type") in ("found_targets", "dom_vectors"):
                 findings.append(r)
 
         severity = "medium" if findings else "low"
+
         return {
             "status": "done",
             "items": findings,
@@ -567,12 +612,7 @@ class AttackEngine:
         }
 
     def _run_security_headers(self, ctx: Dict[str, Any]) -> dict:
-        allow_real = ctx.get("settings", {}).get("allow_real_run", True)
-        if not allow_real:
-            return {"status": "skipped", "reason": "real-run-not-allowed"}
-
-        crawl = ctx["crawl"]
-        headers_info = crawl.get("headers", [])
+        headers_info = ctx["crawl"].get("headers", [])
 
         return {
             "status": "done",
@@ -582,12 +622,7 @@ class AttackEngine:
         }
 
     def _run_csp(self, ctx: Dict[str, Any]) -> dict:
-        allow_real = ctx.get("settings", {}).get("allow_real_run", True)
-        if not allow_real:
-            return {"status": "skipped", "reason": "real-run-not-allowed"}
-
-        crawl = ctx["crawl"]
-        csp_info = crawl.get("csp_analysis", [])
+        csp_info = ctx["crawl"].get("csp_analysis", [])
 
         return {
             "status": "done",
@@ -597,10 +632,6 @@ class AttackEngine:
         }
 
     def _run_secrets(self, ctx: Dict[str, Any]) -> dict:
-        allow_real = ctx.get("settings", {}).get("allow_real_run", True)
-        if not allow_real:
-            return {"status": "skipped", "reason": "real-run-not-allowed"}
-
         crawl = ctx["crawl"]
         secrets = crawl.get("secrets", [])
         api_keys = crawl.get("api_keys", [])
@@ -616,31 +647,18 @@ class AttackEngine:
         }
 
     def _run_jwt(self, ctx: Dict[str, Any]) -> dict:
-        allow_real = ctx.get("settings", {}).get("allow_real_run", True)
-        if not allow_real:
-            return {"status": "skipped", "reason": "real-run-not-allowed"}
-
-        crawl = ctx["crawl"]
-        jwt_tokens = crawl.get("jwt_tokens", [])
-
+        jwt_tokens = ctx["crawl"].get("jwt_tokens", [])
         items = [{"token": t} for t in jwt_tokens]
-        severity = "medium" if jwt_tokens else "low"
 
         return {
             "status": "done",
             "items": items,
             "count": len(items),
-            "severity": severity,
+            "severity": "medium" if jwt_tokens else "low",
         }
 
     def _run_forms(self, ctx: Dict[str, Any]) -> dict:
-        allow_real = ctx.get("settings", {}).get("allow_real_run", True)
-        if not allow_real:
-            return {"status": "skipped", "reason": "real-run-not-allowed"}
-
-        crawl = ctx["crawl"]
-        forms = crawl.get("forms", [])
-
+        forms = ctx["crawl"].get("forms", [])
         items = [{"form": f} for f in forms]
 
         return {
@@ -651,61 +669,98 @@ class AttackEngine:
         }
 
     def _run_errors(self, ctx: Dict[str, Any]) -> dict:
-        allow_real = ctx.get("settings", {}).get("allow_real_run", True)
-        if not allow_real:
-            return {"status": "skipped", "reason": "real-run-not-allowed"}
-
-        crawl = ctx["crawl"]
-        errors = crawl.get("errors", [])
-
+        errors = ctx["crawl"].get("errors", [])
         items = [{"error": e} for e in errors]
-        severity = "warn" if errors else "info"
 
         return {
             "status": "done",
             "items": items,
             "count": len(items),
-            "severity": severity,
+            "severity": "warn" if errors else "info",
         }
 
     def _run_csrf(self, ctx: Dict[str, Any]) -> dict:
-        allow_real = ctx.get("settings", {}).get("allow_real_run", True)
-        if not allow_real:
-            return {"status": "skipped", "reason": "real-run-not-allowed"}
-        domain = ctx.get("domain")
-        if domain not in getattr(settings, "ALLOWED_TARGETS", []):
-            return {"status": "skipped", "reason": "domain-not-allowed"}
+        base_url = ctx.get("base_url", "")
+        if not self._is_target_allowed(base_url):
+            return {"status": "skipped", "reason": "target-not-allowed"}
 
         try:
-            csrf_file = ctx["crawl"].get("csrf_file") or settings.get("payloads.csrf_file")
+            csrf_file = (
+                    ctx["crawl"].get("csrf_file")
+                    or settings.SETTINGS_JSON.get("payloads", {}).get("csrf_file")
+            )
             with open(csrf_file, encoding="utf-8") as f:
                 csrf_payloads = json.load(f)
         except Exception as e:
-            return {"status": "error", "items": [], "count": 0, "error": str(e)}
+            return {
+                "status": "error",
+                "items": [],
+                "count": 0,
+                "error": str(e),
+            }
 
         findings = []
         for category, urls in csrf_payloads.items():
             for url in urls:
+                full_url = ctx["base_url"] + url
                 try:
-                    result = self.attack_payload(ctx["base_url"] + url, "csrf_test")
+                    result = self.attack_payload(full_url, "csrf_test")
                     findings.append({
                         "category": category,
-                        "url": url,
+                        "url": full_url,
                         "result": result
                     })
                 except Exception as e:
                     findings.append({
                         "category": category,
-                        "url": url,
+                        "url": full_url,
                         "error": str(e)
                     })
 
-        severity = "high" if findings else "low"
         return {
             "status": "done",
             "items": findings,
             "count": len(findings),
-            "severity": severity
+            "severity": "high" if findings else "low",
+        }
+
+    def _run_ssrf(self, ctx: Dict[str, Any]) -> dict:
+        base_url = ctx.get("base_url", "")
+        if not self._is_target_allowed(base_url):
+            return {"status": "skipped", "reason": "target-not-allowed"}
+
+        ssrf_targets = ctx["crawl"].get("ssrf", [])
+        if not ssrf_targets:
+            return {"status": "skipped", "reason": "no-ssrf-targets"}
+
+        findings = []
+
+        for entry in ssrf_targets:
+            url = entry.get("url")
+            param = entry.get("param")
+
+            if not url or not param:
+                continue
+
+            try:
+                result = self.attack_payload(url, f"ssrf_test_{param}")
+                findings.append({
+                    "url": url,
+                    "param": param,
+                    "result": result
+                })
+            except Exception as e:
+                findings.append({
+                    "url": url,
+                    "param": param,
+                    "error": str(e)
+                })
+
+        return {
+            "status": "done",
+            "items": findings,
+            "count": len(findings),
+            "severity": "high" if findings else "low",
         }
 
     # ===================== Атаки по найденным целям (совместимость) =====================
@@ -826,19 +881,13 @@ class AttackEngine:
             if path is None:
                 export_dir = os.path.join(os.getcwd(), "exports")
                 os.makedirs(export_dir, exist_ok=True)
-
                 filename = f"attack_results_{safe_domain}_{timestamp}.json"
                 path = os.path.join(export_dir, filename)
             else:
-                dir_name = os.path.dirname(path)
-                if dir_name:
-                    os.makedirs(dir_name, exist_ok=True)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
 
             summary = self.get_summary()
-            summary["results"] = sorted(
-                self.results,
-                key=lambda x: x.get("attack_type", "")
-            )
+            summary["results"] = sorted(self.results, key=lambda x: x.get("attack_type", ""))
 
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(summary, f, indent=2, ensure_ascii=False)
@@ -854,13 +903,17 @@ class AttackEngine:
         high = sum(1 for r in self.results if r.get("severity") == "high")
         errors = sum(1 for r in self.results if r.get("severity") == "error")
 
+        severity_dist = Counter(r.get("severity", "unknown") for r in self.results)
+
         return {
             "attack_id": self.attack_id,
             "domain": self.domain,
             "count": len(self.results),
             "high": high,
             "errors": errors,
+            "severity_distribution": dict(severity_dist),
             "by_type": self._group_by_type(),
+            "modules": list(self.modules),
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
 

@@ -3,12 +3,16 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import json
 import os
+from xss_security_gui.settings import SETTINGS_JSON_PATH
+
+
 
 class SettingsEditor(ttk.Frame):
-    def __init__(self, parent, json_path="settings.json"):
+    def __init__(self, parent):
         super().__init__(parent)
-        self.json_path = json_path
+        self.json_path = SETTINGS_JSON_PATH
         self.entries = {}
+
         self.readonly_keys = {
             "logging.success_path",
             "honeypot.log_path"

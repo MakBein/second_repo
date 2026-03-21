@@ -1,6 +1,7 @@
 # xss_security_gui/deep_crawler.py
 
 import os
+import queue
 import re
 import json
 import logging
@@ -8,7 +9,7 @@ import hashlib
 import threading
 import traceback
 import datetime as dt
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 from urllib.parse import urljoin, urlparse, parse_qs
 
 import requests
@@ -16,20 +17,28 @@ from playwright.sync_api import sync_playwright
 
 from xss_security_gui.js_inspector import extract_js_insights
 from xss_security_gui.crawler import extract_sensitive_data
+from xss_security_gui.settings import LOG_DIR, THREAT_INTEL_ARTIFACT_PATH
+from xss_security_gui.threat_analysis.threat_connector import ThreatConnector
+from xss_security_gui.auth.login_flow import perform_login
+# Глобальная очередь для Live Monitor
+LIVE_MONITOR_QUEUE: "queue.Queue[dict]" = queue.Queue()
+
+# Используем единую лог‑директорию из settings.py
+LOGS_DIR = str(LOG_DIR)
+os.makedirs(LOGS_DIR, exist_ok=True)
+
+logger = logging.getLogger("ThreatConnector6")
+logger.setLevel(logging.INFO)
+
 
 # ============================================================
-#  Логирование 6.0 — расширенная версия
+#  Логирование 6.0 — расширенная версия (без дублей директорий)
 # ============================================================
 
-# Абсолютный путь к директории xss_security_gui
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# logs всегда внутри xss_security_gui/
-LOGS_DIR = os.path.join(BASE_DIR, "logs")
-GUI_LOG_DIR = os.path.join(BASE_DIR, "xss_security_gui")
+# Используем единую лог-директорию из settings.py
+LOGS_DIR = str(LOG_DIR)
 
 os.makedirs(LOGS_DIR, exist_ok=True)
-os.makedirs(GUI_LOG_DIR, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,9 +50,10 @@ logger = logging.getLogger("DeepCrawler6")
 def _write_gui_log(filename: str, prefix: str, msg: str) -> None:
     """
     Вспомогательная функция для записи в GUI‑логи.
+    Все логи лежат в общей директории LOGS_DIR.
     """
     timestamp = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    path = os.path.join(GUI_LOG_DIR, filename)
+    path = os.path.join(LOGS_DIR, filename)
 
     with open(path, "a", encoding="utf-8") as f:
         f.write(f"[{timestamp}] {prefix} {msg}\n")
@@ -56,7 +66,7 @@ def log_info(msg: str) -> None:
     """
     Пишет информационное сообщение:
     • в стандартный логгер
-    • в xss_security_gui/info_log.txt
+    • в logs/info_log.txt
     """
     logger.info(msg)
     _write_gui_log("info_log.txt", "ℹ️ INFO:", msg)
@@ -69,7 +79,7 @@ def log_warn(msg: str) -> None:
     """
     Пишет предупреждение:
     • в стандартный логгер
-    • в xss_security_gui/warn_log.txt
+    • в logs/warn_log.txt
     """
     logger.warning(msg)
     _write_gui_log("warn_log.txt", "⚠️ WARNING:", msg)
@@ -82,13 +92,13 @@ def log_error(msg: str, exc: Exception | None = None) -> None:
     """
     Пишет ошибку:
     • в стандартный логгер
-    • в xss_security_gui/error_log.txt
+    • в logs/error_log.txt
     • сохраняет traceback, если есть Exception
     """
     logger.error(msg)
 
     timestamp = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    path = os.path.join(GUI_LOG_DIR, "error_log.txt")
+    path = os.path.join(LOGS_DIR, "error_log.txt")
 
     with open(path, "a", encoding="utf-8") as f:
         f.write(f"[{timestamp}] ❌ ERROR: {msg}\n")
@@ -117,11 +127,12 @@ class ThreatConnector:
     • інтеграція з Deep Crawler 6.0
     """
 
-    def __init__(self, log_file: str = os.path.join(LOGS_DIR, "threat_intel.ndjson")):
-        self.log_file = log_file
+    def __init__(self, log_file: str | None = None):
+        # Используем единый путь из settings.py, если не передан свой
+        self.log_file = log_file or str(THREAT_INTEL_ARTIFACT_PATH)
         self.lock = threading.Lock()
 
-        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
 
         self.log = logging.getLogger("ThreatConnector")
 
@@ -271,264 +282,254 @@ class ThreatConnector:
             cat = a["result"].get("category", "unknown")
             src = a["result"].get("source", "unknown")
 
-            report["by_module"].setdefault(mod, 0)
-            report["by_module"][mod] += 1
-
-            report["by_severity"].setdefault(sev, 0)
-            report["by_severity"][sev] += 1
-
-            report["by_category"].setdefault(cat, 0)
-            report["by_category"][cat] += 1
-
-            report["by_source"].setdefault(src, 0)
-            report["by_source"][src] += 1
+            report["by_module"][mod] = report["by_module"].get(mod, 0) + 1
+            report["by_severity"][sev] = report["by_severity"].get(sev, 0) + 1
+            report["by_category"][cat] = report["by_category"].get(cat, 0) + 1
+            report["by_source"][src] = report["by_source"].get(src, 0) + 1
 
             report["artifacts"].append(a)
 
         return report
 
+    # Глобальний конектор для всього модуля
+    THREAT_CONNECTOR = ThreatConnector()
 
-# Глобальний конектор для всього модуля
-THREAT_CONNECTOR = ThreatConnector()
-
-# ============================
-# 🔐 Авторизация (Ultimate PRO 5.0)
-# ============================
-
-def perform_login(page, login_config: dict) -> None:
-    """
-    Ультра‑расширенная авторизация:
-    - авто‑поиск login‑URL
-    - авто‑поиск login‑форм
-    - авто‑поиск username/password
-    - авто‑поиск submit
-    - поддержка SPA (React/Vue/Angular)
-    - поддержка AJAX‑логина
-    - определение успешного входа по 12 критериям
-    - определение неуспешного входа по 10 критериям
-    - определение CAPTCHA
-    - определение 2FA
-    - определение OAuth/SSO
-    - логирование каждого шага
-    - сохранение/восстановление сессии
-    """
-    try:
-        print(f"[🔐] Переход на страницу логина: {login_config['url']}")
-        page.goto(login_config["url"], timeout=20000)
-        page.wait_for_timeout(1500)
-
-        # 0) Попытка восстановить сессию
+    # ============================
+    # 🔐 Авторизация (Ultimate PRO 5.0)
+    # ============================
+    def perform_login(page, login_config: dict) -> None:
+        """
+        Ультра‑расширенная авторизация:
+        - авто‑поиск login‑URL
+        - авто‑поиск login‑форм
+        - авто‑поиск username/password
+        - авто‑поиск submit
+        - поддержка SPA (React/Vue/Angular)
+        - поддержка AJAX‑логина
+        - определение успешного входа по 12 критериям
+        - определение неуспешного входа по 10 критериям
+        - определение CAPTCHA
+        - определение 2FA
+        - определение OAuth/SSO
+        - логирование каждого шага
+        - сохранение/восстановление сессии
+        """
         try:
-            if load_session(page.context):
-                print("[🔄] Сессия восстановлена — проверяю авторизацию...")
-                page.reload()
-                page.wait_for_timeout(1500)
-        except Exception:
-            pass
-
-        # 1) Поиск login‑форм
-        forms = page.query_selector_all("form")
-
-        if forms:
-            print(f"[ℹ️] Найдено форм: {len(forms)}")
-
-            login_forms = []
-            for f in forms:
-                html_form = (f.inner_html() or "").lower()
-                if "password" in html_form or "pass" in html_form:
-                    login_forms.append(f)
-
-            if login_forms:
-                print(f"[✔️] Найдено login‑форм: {len(login_forms)}")
-            else:
-                print("[⚠️] Формы есть, но ни одна не похожа на login‑форму")
-        else:
-            print("[⚠️] Формы не найдены — возможно SPA или AJAX‑логин")
-
-            spa_keywords = ["login", "signin", "auth", "вход", "авторизация", "password", "username"]
-            html = page.content().lower()
-            if any(k in html for k in spa_keywords):
-                print("[ℹ️] Найдены признаки login‑формы в SPA")
-
-            hidden_forms = page.query_selector_all("form[style*='display:none'], form.hidden")
-            if hidden_forms:
-                print(f"[ℹ️] Найдено скрытых форм: {len(hidden_forms)}")
-
-            modal_forms = page.query_selector_all(".modal form, .dialog form, .popup form")
-            if modal_forms:
-                print(f"[ℹ️] Найдено форм в модальных окнах: {len(modal_forms)}")
-
+            print(f"[🔐] Переход на страницу логина: {login_config['url']}")
+            page.goto(login_config["url"], timeout=20000)
             page.wait_for_timeout(1500)
-            dynamic_forms = page.query_selector_all("form")
-            if dynamic_forms:
-                print(f"[ℹ️] После ожидания появились формы: {len(dynamic_forms)}")
 
-        # 2) Поиск username/password
-        username_selectors = [
-            login_config["selectors"].get("username"),
-            "input[name='username']",
-            "input[name='email']",
-            "input[type='email']",
-            "input[id*='user']",
-            "input[id*='login']",
-            "input[name*='user']",
-            "input[name*='login']",
-            "#username", "#login", "#email"
-        ]
+            # 0) Попытка восстановить сессию
+            try:
+                if load_session(page.context):
+                    print("[🔄] Сессия восстановлена — проверяю авторизацию...")
+                    page.reload()
+                    page.wait_for_timeout(1500)
+            except Exception:
+                pass
 
-        password_selectors = [
-            login_config["selectors"].get("password"),
-            "input[type='password']",
-            "input[name='password']",
-            "input[id*='pass']",
-            "#password", "#pass"
-        ]
+            # 1) Поиск login‑форм
+            forms = page.query_selector_all("form")
 
-        user_sel = next((sel for sel in username_selectors if sel and page.query_selector(sel)), None)
-        pass_sel = next((sel for sel in password_selectors if sel and page.query_selector(sel)), None)
+            if forms:
+                print(f"[ℹ️] Найдено форм: {len(forms)}")
 
-        if not user_sel:
-            print("[⚠️] Поле username не найдено")
-        if not pass_sel:
-            print("[⚠️] Поле password не найдено")
+                login_forms = []
+                for f in forms:
+                    html_form = (f.inner_html() or "").lower()
+                    if "password" in html_form or "pass" in html_form:
+                        login_forms.append(f)
 
-        # 3) Ввод логина и пароля
-        if user_sel:
-            page.fill(user_sel, login_config["username"])
-        if pass_sel:
-            page.fill(pass_sel, login_config["password"])
+                if login_forms:
+                    print(f"[✔️] Найдено login‑форм: {len(login_forms)}")
+                else:
+                    print("[⚠️] Формы есть, но ни одна не похожа на login‑форму")
+            else:
+                print("[⚠️] Формы не найдены — возможно SPA или AJAX‑логин")
 
-        # 4) Поиск submit
-        submit_selectors = [
-            login_config["selectors"].get("submit"),
-            "button[type='submit']",
-            "input[type='submit']",
-            "button[id*='login']",
-            "button[name*='login']",
-            "button[class*='login']",
-            "button"
-        ]
+                spa_keywords = ["login", "signin", "auth", "вход", "авторизация", "password", "username"]
+                html = page.content().lower()
+                if any(k in html for k in spa_keywords):
+                    print("[ℹ️] Найдены признаки login‑формы в SPA")
 
-        submit_sel = next((sel for sel in submit_selectors if sel and page.query_selector(sel)), None)
+                hidden_forms = page.query_selector_all("form[style*='display:none'], form.hidden")
+                if hidden_forms:
+                    print(f"[ℹ️] Найдено скрытых форм: {len(hidden_forms)}")
 
-        if submit_sel:
-            print(f"[ℹ️] Использую submit: {submit_sel}")
-            page.click(submit_sel)
-        else:
-            print("[⚠️] Submit не найден — нажимаю Enter")
+                modal_forms = page.query_selector_all(".modal form, .dialog form, .popup form")
+                if modal_forms:
+                    print(f"[ℹ️] Найдено форм в модальных окнах: {len(modal_forms)}")
+
+                page.wait_for_timeout(1500)
+                dynamic_forms = page.query_selector_all("form")
+                if dynamic_forms:
+                    print(f"[ℹ️] После ожидания появились формы: {len(dynamic_forms)}")
+
+            # 2) Поиск username/password
+            username_selectors = [
+                login_config["selectors"].get("username"),
+                "input[name='username']",
+                "input[name='email']",
+                "input[type='email']",
+                "input[id*='user']",
+                "input[id*='login']",
+                "input[name*='user']",
+                "input[name*='login']",
+                "#username", "#login", "#email"
+            ]
+
+            password_selectors = [
+                login_config["selectors"].get("password"),
+                "input[type='password']",
+                "input[name='password']",
+                "input[id*='pass']",
+                "#password", "#pass"
+            ]
+
+            user_sel = next((sel for sel in username_selectors if sel and page.query_selector(sel)), None)
+            pass_sel = next((sel for sel in password_selectors if sel and page.query_selector(sel)), None)
+
+            if not user_sel:
+                print("[⚠️] Поле username не найдено")
+            if not pass_sel:
+                print("[⚠️] Поле password не найдено")
+
+            # 3) Ввод логина и пароля
             if user_sel:
-                page.press(user_sel, "Enter")
+                page.fill(user_sel, login_config["username"])
+            if pass_sel:
+                page.fill(pass_sel, login_config["password"])
 
-        page.wait_for_timeout(2000)
+            # 4) Поиск submit
+            submit_selectors = [
+                login_config["selectors"].get("submit"),
+                "button[type='submit']",
+                "input[type='submit']",
+                "button[id*='login']",
+                "button[name*='login']",
+                "button[class*='login']",
+                "button"
+            ]
 
-        # 5) CAPTCHA детектор
+            submit_sel = next((sel for sel in submit_selectors if sel and page.query_selector(sel)), None)
+
+            if submit_sel:
+                print(f"[ℹ️] Использую submit: {submit_sel}")
+                page.click(submit_sel)
+            else:
+                print("[⚠️] Submit не найден — нажимаю Enter")
+                if user_sel:
+                    page.press(user_sel, "Enter")
+
+            page.wait_for_timeout(2000)
+
+            # 5) CAPTCHA детектор
+            html = page.content().lower()
+            captcha_keywords = ["captcha", "recaptcha", "h-captcha", "g-recaptcha"]
+            if any(k in html for k in captcha_keywords):
+                print("[⚠️] Обнаружена CAPTCHA — автоматический логин невозможен.")
+
+            # 6) 2FA детектор
+            twofa_keywords = ["2fa", "two-factor", "otp", "one-time", "authenticator"]
+            if any(k in html for k in twofa_keywords):
+                print("[ℹ️] Обнаружена 2FA — требуется ручное подтверждение.")
+
+            # 7) OAuth/SSO детектор
+            oauth = detect_oauth(html)
+            if oauth:
+                print(f"[ℹ️] Обнаружены OAuth/SSO провайдеры: {oauth}")
+
+            # 8) AJAX‑логин детектор
+            if detect_ajax_login(page):
+                print("[✔️] AJAX‑логин подтверждён")
+                success = True
+            else:
+                success = False
+
+            # 9) Проверка успешного входа
+            cookies = page.context.cookies()
+
+            success_checks = [
+                page.url != login_config["url"],
+                any("session" in c["name"].lower() for c in cookies),
+                not page.query_selector("form"),
+                "logout" in html,
+                "profile" in html,
+                "account" in html,
+                "dashboard" in page.url,
+                "home" in page.url,
+            ]
+
+            try:
+                jwt = page.evaluate("() => localStorage.getItem('token')")
+                if jwt:
+                    success_checks.append(True)
+            except Exception:
+                pass
+
+            if any(success_checks) or success:
+                print("[🔐] Авторизация успешна.")
+                save_session(page.context)
+            else:
+                print("[⚠️] Авторизация, вероятно, не удалась.")
+
+        except Exception as e:
+            print(f"[❌] Ошибка авторизации: {e}")
+
+    # === Часть 3: login/logout/ajax/oauth детекторы ===
+
+    def detect_login_url(page, base_url: str):
+        """
+        Расширенный детектор login‑URL уровня Burp Suite / Detectify.
+        """
+        from urllib.parse import urljoin as _urljoin
+
+        candidates: set[str] = set()
         html = page.content().lower()
-        captcha_keywords = ["captcha", "recaptcha", "h-captcha", "g-recaptcha"]
-        if any(k in html for k in captcha_keywords):
-            print("[⚠️] Обнаружена CAPTCHA — автоматический логин невозможен.")
 
-        # 6) 2FA детектор
-        twofa_keywords = ["2fa", "two-factor", "otp", "one-time", "authenticator"]
-        if any(k in html for k in twofa_keywords):
-            print("[ℹ️] Обнаружена 2FA — требуется ручное подтверждение.")
+        # 1) Ссылки <a>
+        for a in page.query_selector_all("a[href]"):
+            href = a.get_attribute("href") or ""
+            text = (a.inner_text() or "").lower()
 
-        # 7) OAuth/SSO детектор
-        oauth = detect_oauth(html)
-        if oauth:
-            print(f"[ℹ️] Обнаружены OAuth/SSO провайдеры: {oauth}")
+            if any(k in text for k in ["login", "sign in", "auth", "вход", "авторизация"]):
+                candidates.add(_urljoin(base_url, href))
 
-        # 8) AJAX‑логин детектор
-        if detect_ajax_login(page):
-            print("[✔️] AJAX‑логин подтверждён")
-            success = True
-        else:
-            success = False
+            if any(k in href.lower() for k in ["/login", "/auth", "/signin"]):
+                candidates.add(_urljoin(base_url, href))
 
-        # 9) Проверка успешного входа
-        cookies = page.context.cookies()
+        # 2) Кнопки <button>
+        for b in page.query_selector_all("button"):
+            text = (b.inner_text() or "").lower()
+            onclick = (b.get_attribute("onclick") or "").lower()
 
-        success_checks = [
-            page.url != login_config["url"],
-            any("session" in c["name"].lower() for c in cookies),
-            not page.query_selector("form"),
-            "logout" in html,
-            "profile" in html,
-            "account" in html,
-            "dashboard" in page.url,
-            "home" in page.url,
-        ]
+            if any(k in text for k in ["login", "sign in", "auth", "вход"]):
+                candidates.add(page.url)
 
-        try:
-            jwt = page.evaluate("() => localStorage.getItem('token')")
-            if jwt:
-                success_checks.append(True)
-        except Exception:
-            pass
+            if "login" in onclick or "auth" in onclick:
+                candidates.add(page.url)
 
-        if any(success_checks) or success:
-            print("[🔐] Авторизация успешна.")
-            save_session(page.context)
-        else:
-            print("[⚠️] Авторизация, вероятно, не удалась.")
+        # 3) Формы <form>
+        for f in page.query_selector_all("form"):
+            f_html = (f.inner_html() or "").lower()
 
-    except Exception as e:
-        print(f"[❌] Ошибка авторизации: {e}")
+            if "password" in f_html or 'type="email"' in f_html:
+                candidates.add(page.url)
 
+            if any(x in f_html for x in ["ng-submit", "v-on:submit", "@submit", "react"]):
+                candidates.add(page.url)
 
-# === Часть 3: login/logout/ajax/oauth детекторы ===
+        # 4) SPA маршруты
+        spa_patterns = ["#/login", "#/auth", "/#/login", "/#/auth"]
+        for p in spa_patterns:
+            if p in html:
+                candidates.add(_urljoin(base_url, p.replace("#", "")))
 
-def detect_login_url(page, base_url: str):
-    """
-    Расширенный детектор login‑URL уровня Burp Suite / Detectify.
-    """
-    from urllib.parse import urljoin as _urljoin
-
-    candidates: set[str] = set()
-    html = page.content().lower()
-
-    # 1) Ссылки <a>
-    for a in page.query_selector_all("a[href]"):
-        href = a.get_attribute("href") or ""
-        text = (a.inner_text() or "").lower()
-
-        if any(k in text for k in ["login", "sign in", "auth", "вход", "авторизация"]):
-            candidates.add(_urljoin(base_url, href))
-
-        if any(k in href.lower() for k in ["/login", "/auth", "/signin"]):
-            candidates.add(_urljoin(base_url, href))
-
-    # 2) Кнопки <button>
-    for b in page.query_selector_all("button"):
-        text = (b.inner_text() or "").lower()
-        onclick = (b.get_attribute("onclick") or "").lower()
-
-        if any(k in text for k in ["login", "sign in", "auth", "вход"]):
+        # 5) JS‑логин
+        if "login(" in html or "signin(" in html:
             candidates.add(page.url)
 
-        if "login" in onclick or "auth" in onclick:
-            candidates.add(page.url)
-
-    # 3) Формы <form>
-    for f in page.query_selector_all("form"):
-        f_html = (f.inner_html() or "").lower()
-
-        if "password" in f_html or 'type="email"' in f_html:
-            candidates.add(page.url)
-
-        if any(x in f_html for x in ["ng-submit", "v-on:submit", "@submit", "react"]):
-            candidates.add(page.url)
-
-    # 4) SPA маршруты
-    spa_patterns = ["#/login", "#/auth", "/#/login", "/#/auth"]
-    for p in spa_patterns:
-        if p in html:
-            candidates.add(_urljoin(base_url, p.replace("#", "")))
-
-    # 5) JS‑логин
-    if "login(" in html or "signin(" in html:
-        candidates.add(page.url)
-
-    return list(candidates) or None
+        return list(candidates) or None
 
 
 def detect_logout_url(page):

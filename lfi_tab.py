@@ -1,10 +1,10 @@
 # xss_security_gui/lfi_tab.py
 
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox
 import threading
 import json
-from typing import Any, Dict, List
+
 
 from xss_security_gui.settings import settings
 from xss_security_gui.lfi_tester import test_lfi_payloads

