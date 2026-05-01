@@ -5,21 +5,18 @@ import queue
 import re
 import json
 import logging
-import hashlib
-import threading
 import traceback
 import datetime as dt
-from typing import Dict, Any, List
+from typing import Any, List
 from urllib.parse import urljoin, urlparse, parse_qs
+from datetime import datetime, UTC
 
 import requests
 from playwright.sync_api import sync_playwright
 
 from xss_security_gui.js_inspector import extract_js_insights
 from xss_security_gui.crawler import extract_sensitive_data
-from xss_security_gui.settings import LOG_DIR, THREAT_INTEL_ARTIFACT_PATH
-from xss_security_gui.threat_analysis.threat_connector import ThreatConnector
-from xss_security_gui.auth.login_flow import perform_login
+from xss_security_gui.settings import LOG_DIR
 # Глобальная очередь для Live Monitor
 LIVE_MONITOR_QUEUE: "queue.Queue[dict]" = queue.Queue()
 
@@ -29,6 +26,10 @@ os.makedirs(LOGS_DIR, exist_ok=True)
 
 logger = logging.getLogger("ThreatConnector6")
 logger.setLevel(logging.INFO)
+
+from xss_security_gui.auth.login_flow import (
+    perform_login,
+)
 
 
 # ============================================================
@@ -52,12 +53,13 @@ def _write_gui_log(filename: str, prefix: str, msg: str) -> None:
     Вспомогательная функция для записи в GUI‑логи.
     Все логи лежат в общей директории LOGS_DIR.
     """
-    timestamp = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    from datetime import datetime, UTC
+
+    timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
     path = os.path.join(LOGS_DIR, filename)
 
     with open(path, "a", encoding="utf-8") as f:
         f.write(f"[{timestamp}] {prefix} {msg}\n")
-
 
 # ============================================================
 #  INFO
@@ -95,9 +97,11 @@ def log_error(msg: str, exc: Exception | None = None) -> None:
     • в logs/error_log.txt
     • сохраняет traceback, если есть Exception
     """
+    from datetime import datetime, UTC
+
     logger.error(msg)
 
-    timestamp = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
     path = os.path.join(LOGS_DIR, "error_log.txt")
 
     with open(path, "a", encoding="utf-8") as f:
@@ -105,431 +109,6 @@ def log_error(msg: str, exc: Exception | None = None) -> None:
         if exc:
             f.write(f"{type(exc).__name__}: {str(exc)}\n")
             f.write(traceback.format_exc() + "\n")
-
-
-# ============================================================
-#  ThreatConnector 3.0
-# ============================================================
-
-class ThreatConnector:
-    """
-    ThreatConnector 3.0
-    --------------------
-    Централізований збирач артефактів з усіх модулів:
-    XSS, DOM-XSS, SQLi, CSRF, SSRF, CSP, Tokens, Headers, Crawler.
-
-    Особливості:
-    • NDJSON append-only лог
-    • потокобезпечний запис
-    • дедуплікація module + target + hash(result)
-    • уніфікований формат артефактів
-    • підтримка severity, category, tags
-    • інтеграція з Deep Crawler 6.0
-    """
-
-    def __init__(self, log_file: str | None = None):
-        # Используем единый путь из settings.py, если не передан свой
-        self.log_file = log_file or str(THREAT_INTEL_ARTIFACT_PATH)
-        self.lock = threading.Lock()
-
-        os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
-
-        self.log = logging.getLogger("ThreatConnector")
-
-    # ---------------------------------------------------------
-    # Генерація унікального хешу
-    # ---------------------------------------------------------
-    def _hash_artifact(self, module: str, target: str, result: Dict[str, Any]) -> str:
-        h = hashlib.sha256()
-        h.update(module.encode())
-        h.update(target.encode())
-        h.update(json.dumps(result, sort_keys=True).encode())
-        return h.hexdigest()
-
-    # ---------------------------------------------------------
-    # Запис у NDJSON
-    # ---------------------------------------------------------
-    def _write_ndjson(self, artifact: Dict[str, Any]) -> None:
-        with open(self.log_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(artifact, ensure_ascii=False) + "\n")
-
-    # ---------------------------------------------------------
-    # Завантаження існуючих хешів
-    # ---------------------------------------------------------
-    def _load_existing_hashes(self) -> set:
-        hashes: set[str] = set()
-        try:
-            with open(self.log_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        entry = json.loads(line)
-                        h = entry.get("_hash")
-                        if h:
-                            hashes.add(h)
-                    except json.JSONDecodeError:
-                        continue
-        except FileNotFoundError:
-            pass
-        return hashes
-
-    # ---------------------------------------------------------
-    # Emit — одиночний артефакт
-    # ---------------------------------------------------------
-    def emit(self, module: str, target: str, result: Dict[str, Any]) -> None:
-        self.add_artifact(module, target, [result])
-
-    # ---------------------------------------------------------
-    # Bulk — масове додавання
-    # ---------------------------------------------------------
-    def bulk(self, module: str, target: str, results: List[Dict[str, Any]]) -> None:
-        self.add_artifact(module, target, results)
-
-    # ---------------------------------------------------------
-    # Публічний метод додавання артефактів
-    # ---------------------------------------------------------
-    def add_artifact(self, module_name: str, target: str, results: List[Dict[str, Any]]) -> None:
-        timestamp = dt.datetime.utcnow().isoformat() + "Z"
-
-        with self.lock:
-            existing_hashes = self._load_existing_hashes()
-
-            for result in results:
-                # Дефолтні поля
-                result.setdefault("severity", "info")
-                result.setdefault("category", module_name.lower())
-                result.setdefault("tags", [])
-
-                h = self._hash_artifact(module_name, target, result)
-
-                if h in existing_hashes:
-                    continue
-
-                artifact = {
-                    "_hash": h,
-                    "timestamp": timestamp,
-                    "module": module_name,
-                    "target": target,
-                    "result": result
-                }
-
-                self._write_ndjson(artifact)
-                existing_hashes.add(h)
-
-                self.log.info(f"[ThreatIntel] {module_name} → {target}")
-
-    # ---------------------------------------------------------
-    # Завантаження всіх артефактів
-    # ---------------------------------------------------------
-    def load_all(self) -> List[Dict[str, Any]]:
-        items: List[Dict[str, Any]] = []
-        try:
-            with open(self.log_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        items.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue
-        except FileNotFoundError:
-            pass
-        return items
-
-    # ---------------------------------------------------------
-    # Фільтрація
-    # ---------------------------------------------------------
-    def filter_by_module(self, module: str) -> List[Dict[str, Any]]:
-        return [a for a in self.load_all() if a.get("module") == module]
-
-    def filter_by_severity(self, severity: str) -> List[Dict[str, Any]]:
-        return [a for a in self.load_all() if a["result"].get("severity") == severity]
-
-    def filter_by_target(self, target: str) -> List[Dict[str, Any]]:
-        return [a for a in self.load_all() if a.get("target") == target]
-
-    # ---------------------------------------------------------
-    # Summary
-    # ---------------------------------------------------------
-    def summary(self) -> Dict[str, Any]:
-        data = self.load_all()
-        summary: Dict[str, int] = {}
-
-        for a in data:
-            mod = a.get("module", "unknown")
-            summary.setdefault(mod, 0)
-            summary[mod] += 1
-
-        return {
-            "total": len(data),
-            "by_module": summary
-        }
-
-    # ---------------------------------------------------------
-    # Повний звіт
-    # ---------------------------------------------------------
-    def generate_report(self) -> Dict[str, Any]:
-        data = self.load_all()
-        report: Dict[str, Any] = {
-            "total": len(data),
-            "by_module": {},
-            "by_severity": {},
-            "by_category": {},
-            "by_source": {},
-            "artifacts": []
-        }
-
-        for a in data:
-            mod = a.get("module", "unknown")
-            sev = a["result"].get("severity", "info")
-            cat = a["result"].get("category", "unknown")
-            src = a["result"].get("source", "unknown")
-
-            report["by_module"][mod] = report["by_module"].get(mod, 0) + 1
-            report["by_severity"][sev] = report["by_severity"].get(sev, 0) + 1
-            report["by_category"][cat] = report["by_category"].get(cat, 0) + 1
-            report["by_source"][src] = report["by_source"].get(src, 0) + 1
-
-            report["artifacts"].append(a)
-
-        return report
-
-    # Глобальний конектор для всього модуля
-    THREAT_CONNECTOR = ThreatConnector()
-
-    # ============================
-    # 🔐 Авторизация (Ultimate PRO 5.0)
-    # ============================
-    def perform_login(page, login_config: dict) -> None:
-        """
-        Ультра‑расширенная авторизация:
-        - авто‑поиск login‑URL
-        - авто‑поиск login‑форм
-        - авто‑поиск username/password
-        - авто‑поиск submit
-        - поддержка SPA (React/Vue/Angular)
-        - поддержка AJAX‑логина
-        - определение успешного входа по 12 критериям
-        - определение неуспешного входа по 10 критериям
-        - определение CAPTCHA
-        - определение 2FA
-        - определение OAuth/SSO
-        - логирование каждого шага
-        - сохранение/восстановление сессии
-        """
-        try:
-            print(f"[🔐] Переход на страницу логина: {login_config['url']}")
-            page.goto(login_config["url"], timeout=20000)
-            page.wait_for_timeout(1500)
-
-            # 0) Попытка восстановить сессию
-            try:
-                if load_session(page.context):
-                    print("[🔄] Сессия восстановлена — проверяю авторизацию...")
-                    page.reload()
-                    page.wait_for_timeout(1500)
-            except Exception:
-                pass
-
-            # 1) Поиск login‑форм
-            forms = page.query_selector_all("form")
-
-            if forms:
-                print(f"[ℹ️] Найдено форм: {len(forms)}")
-
-                login_forms = []
-                for f in forms:
-                    html_form = (f.inner_html() or "").lower()
-                    if "password" in html_form or "pass" in html_form:
-                        login_forms.append(f)
-
-                if login_forms:
-                    print(f"[✔️] Найдено login‑форм: {len(login_forms)}")
-                else:
-                    print("[⚠️] Формы есть, но ни одна не похожа на login‑форму")
-            else:
-                print("[⚠️] Формы не найдены — возможно SPA или AJAX‑логин")
-
-                spa_keywords = ["login", "signin", "auth", "вход", "авторизация", "password", "username"]
-                html = page.content().lower()
-                if any(k in html for k in spa_keywords):
-                    print("[ℹ️] Найдены признаки login‑формы в SPA")
-
-                hidden_forms = page.query_selector_all("form[style*='display:none'], form.hidden")
-                if hidden_forms:
-                    print(f"[ℹ️] Найдено скрытых форм: {len(hidden_forms)}")
-
-                modal_forms = page.query_selector_all(".modal form, .dialog form, .popup form")
-                if modal_forms:
-                    print(f"[ℹ️] Найдено форм в модальных окнах: {len(modal_forms)}")
-
-                page.wait_for_timeout(1500)
-                dynamic_forms = page.query_selector_all("form")
-                if dynamic_forms:
-                    print(f"[ℹ️] После ожидания появились формы: {len(dynamic_forms)}")
-
-            # 2) Поиск username/password
-            username_selectors = [
-                login_config["selectors"].get("username"),
-                "input[name='username']",
-                "input[name='email']",
-                "input[type='email']",
-                "input[id*='user']",
-                "input[id*='login']",
-                "input[name*='user']",
-                "input[name*='login']",
-                "#username", "#login", "#email"
-            ]
-
-            password_selectors = [
-                login_config["selectors"].get("password"),
-                "input[type='password']",
-                "input[name='password']",
-                "input[id*='pass']",
-                "#password", "#pass"
-            ]
-
-            user_sel = next((sel for sel in username_selectors if sel and page.query_selector(sel)), None)
-            pass_sel = next((sel for sel in password_selectors if sel and page.query_selector(sel)), None)
-
-            if not user_sel:
-                print("[⚠️] Поле username не найдено")
-            if not pass_sel:
-                print("[⚠️] Поле password не найдено")
-
-            # 3) Ввод логина и пароля
-            if user_sel:
-                page.fill(user_sel, login_config["username"])
-            if pass_sel:
-                page.fill(pass_sel, login_config["password"])
-
-            # 4) Поиск submit
-            submit_selectors = [
-                login_config["selectors"].get("submit"),
-                "button[type='submit']",
-                "input[type='submit']",
-                "button[id*='login']",
-                "button[name*='login']",
-                "button[class*='login']",
-                "button"
-            ]
-
-            submit_sel = next((sel for sel in submit_selectors if sel and page.query_selector(sel)), None)
-
-            if submit_sel:
-                print(f"[ℹ️] Использую submit: {submit_sel}")
-                page.click(submit_sel)
-            else:
-                print("[⚠️] Submit не найден — нажимаю Enter")
-                if user_sel:
-                    page.press(user_sel, "Enter")
-
-            page.wait_for_timeout(2000)
-
-            # 5) CAPTCHA детектор
-            html = page.content().lower()
-            captcha_keywords = ["captcha", "recaptcha", "h-captcha", "g-recaptcha"]
-            if any(k in html for k in captcha_keywords):
-                print("[⚠️] Обнаружена CAPTCHA — автоматический логин невозможен.")
-
-            # 6) 2FA детектор
-            twofa_keywords = ["2fa", "two-factor", "otp", "one-time", "authenticator"]
-            if any(k in html for k in twofa_keywords):
-                print("[ℹ️] Обнаружена 2FA — требуется ручное подтверждение.")
-
-            # 7) OAuth/SSO детектор
-            oauth = detect_oauth(html)
-            if oauth:
-                print(f"[ℹ️] Обнаружены OAuth/SSO провайдеры: {oauth}")
-
-            # 8) AJAX‑логин детектор
-            if detect_ajax_login(page):
-                print("[✔️] AJAX‑логин подтверждён")
-                success = True
-            else:
-                success = False
-
-            # 9) Проверка успешного входа
-            cookies = page.context.cookies()
-
-            success_checks = [
-                page.url != login_config["url"],
-                any("session" in c["name"].lower() for c in cookies),
-                not page.query_selector("form"),
-                "logout" in html,
-                "profile" in html,
-                "account" in html,
-                "dashboard" in page.url,
-                "home" in page.url,
-            ]
-
-            try:
-                jwt = page.evaluate("() => localStorage.getItem('token')")
-                if jwt:
-                    success_checks.append(True)
-            except Exception:
-                pass
-
-            if any(success_checks) or success:
-                print("[🔐] Авторизация успешна.")
-                save_session(page.context)
-            else:
-                print("[⚠️] Авторизация, вероятно, не удалась.")
-
-        except Exception as e:
-            print(f"[❌] Ошибка авторизации: {e}")
-
-    # === Часть 3: login/logout/ajax/oauth детекторы ===
-
-    def detect_login_url(page, base_url: str):
-        """
-        Расширенный детектор login‑URL уровня Burp Suite / Detectify.
-        """
-        from urllib.parse import urljoin as _urljoin
-
-        candidates: set[str] = set()
-        html = page.content().lower()
-
-        # 1) Ссылки <a>
-        for a in page.query_selector_all("a[href]"):
-            href = a.get_attribute("href") or ""
-            text = (a.inner_text() or "").lower()
-
-            if any(k in text for k in ["login", "sign in", "auth", "вход", "авторизация"]):
-                candidates.add(_urljoin(base_url, href))
-
-            if any(k in href.lower() for k in ["/login", "/auth", "/signin"]):
-                candidates.add(_urljoin(base_url, href))
-
-        # 2) Кнопки <button>
-        for b in page.query_selector_all("button"):
-            text = (b.inner_text() or "").lower()
-            onclick = (b.get_attribute("onclick") or "").lower()
-
-            if any(k in text for k in ["login", "sign in", "auth", "вход"]):
-                candidates.add(page.url)
-
-            if "login" in onclick or "auth" in onclick:
-                candidates.add(page.url)
-
-        # 3) Формы <form>
-        for f in page.query_selector_all("form"):
-            f_html = (f.inner_html() or "").lower()
-
-            if "password" in f_html or 'type="email"' in f_html:
-                candidates.add(page.url)
-
-            if any(x in f_html for x in ["ng-submit", "v-on:submit", "@submit", "react"]):
-                candidates.add(page.url)
-
-        # 4) SPA маршруты
-        spa_patterns = ["#/login", "#/auth", "/#/login", "/#/auth"]
-        for p in spa_patterns:
-            if p in html:
-                candidates.add(_urljoin(base_url, p.replace("#", "")))
-
-        # 5) JS‑логин
-        if "login(" in html or "signin(" in html:
-            candidates.add(page.url)
-
-        return list(candidates) or None
 
 
 def detect_logout_url(page):
@@ -574,68 +153,6 @@ def detect_logout_url(page):
             candidates.add(p.replace("#", ""))
 
     return list(candidates) or None
-
-
-def detect_ajax_login(page, before_url=None, before_cookies=None, before_dom=None) -> bool:
-    """
-    Определяет AJAX‑логин.
-    """
-    after_url = page.url
-    after_cookies = page.context.cookies()
-    after_dom = page.content()
-
-    url_static = (before_url == after_url)
-
-    new_session = False
-    if before_cookies:
-        before_names = {c["name"] for c in before_cookies}
-        after_names = {c["name"] for c in after_cookies}
-        diff = after_names - before_names
-        new_session = any("session" in n.lower() for n in diff)
-
-    dom_changed = before_dom != after_dom if before_dom else False
-
-    ls = page.evaluate("Object.keys(localStorage)")
-    ss = page.evaluate("Object.keys(sessionStorage)")
-    storage_tokens = any(k.lower() in ["token", "auth", "jwt"] for k in ls + ss)
-
-    xhr_detected = "fetch(" in after_dom or "xhr" in after_dom
-
-    if url_static and (new_session or dom_changed or storage_tokens or xhr_detected):
-        return True
-
-    return False
-
-
-def detect_oauth(html: str):
-    """
-    Расширенный детектор OAuth/SAML/OpenID/SSO.
-    """
-    html = html.lower()
-
-    providers = {
-        "Google OAuth": ["accounts.google.com", "oauth2", "google-signin"],
-        "Facebook Login": ["facebook.com/login", "fb-login"],
-        "GitHub OAuth": ["github.com/login/oauth"],
-        "Microsoft OAuth": ["login.microsoftonline.com", "azuread"],
-        "Okta": ["okta.com", "okta"],
-        "Auth0": ["auth0.com", "auth0"],
-        "Apple OAuth": ["appleid.apple.com/auth"],
-        "GitLab OAuth": ["gitlab.com/oauth"],
-        "Yandex OAuth": ["oauth.yandex.ru"],
-        "Keycloak": ["/auth/realms/", "keycloak"],
-        "OpenID Connect": ["openid-connect", "/.well-known/openid"],
-        "SAML": ["saml/login", "samlp", "saml2"],
-    }
-
-    detected: List[str] = []
-
-    for name, signs in providers.items():
-        if any(s in html for s in signs):
-            detected.append(name)
-
-    return detected or None
-
 
 # === Часть 4: CMS / Framework detection ===
 
@@ -1305,7 +822,12 @@ def deep_crawl_site(url: str) -> dict:
         else:
             page_js_insights = {}
 
-        cms = detect_cms(html)
+        cms = detect_cms(
+            html,
+            headers=headers,
+            cookies=list(resp.cookies.get_dict().items()) if resp else [],
+            url=u
+        )
         frameworks = detect_frameworks(html)
         adaptive = is_adaptive(html)
         csp_info = analyze_csp(headers)
@@ -1563,30 +1085,6 @@ def analyze_csp(headers: dict) -> dict:
         }
     }
 
-
-# ============================
-# 💾 Сессии
-# ============================
-
-def save_session(context, path: str = "session.json") -> None:
-    cookies = context.cookies()
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(cookies, f, indent=2)
-    print(f"[💾] Сессия сохранена: {path}")
-
-
-def load_session(context, path: str = "session.json") -> bool:
-    if not os.path.exists(path):
-        return False
-
-    with open(path, "r", encoding="utf-8") as f:
-        cookies = json.load(f)
-
-    context.add_cookies(cookies)
-    print(f"[🔄] Сессия восстановлена: {path}")
-    return True
-
-
 # ============================
 # OpenGraph / JSON-LD / Meta
 # ============================
@@ -1670,4 +1168,3 @@ def is_adaptive(html: str) -> bool:
     ]
 
     return any(keyword in html_lower for keyword in keywords)
-

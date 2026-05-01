@@ -24,6 +24,7 @@ from xss_security_gui.auto_modules.dom_and_endpoints import (
 
 from xss_security_gui.auto_modules.auto_modules import brute_force_tokens
 
+
 import xss_security_gui.settings as settings
 
 class AttackEngine:

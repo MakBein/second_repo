@@ -29,7 +29,20 @@
 🧱 Структура проекта xss_security_gui
 
 xss_security_gui/
-├── assets/                          # Статические ресурсы (иконки, изображения)
+├── assets/                                 # Статические ресурсы (иконки, изображения)
+│
+├── ai_core/
+│        __init__.py                        # єдина точка входу в AI-ядро
+│        train_nn_model.py                  # твій повний пайплайн тренування (XGBoost + synthetic)
+│        synthetic_xss.py                   # бібліотека синтетичних XSS-патернів
+│        features.py                        # побудова фіч
+│        js_inspector.py                    # розбір JS / XSS-поведінки
+│        ml_model.py                        # (опційно) обгортка для завантаження/інференсу
+│        model_store/
+│            nn_model_trained.joblib
+│            training_report.json
+│            ai_training.log
+│
 │
 ├── auto_recon/                      # Автоматизированное сканирование
 │   ├── assets/

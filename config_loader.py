@@ -104,3 +104,17 @@ def load_json(path: Union[str, Path], default: T) -> T:
 def save_json(path: Union[str, Path], data: Any) -> bool:
     """Универсальное безопасное сохранение JSON."""
     return _safe_save_json(Path(path), data)
+
+def ensure_network_defaults(config: Dict[str, Any]) -> Dict[str, Any]:
+    if "network" not in config:
+        config["network"] = {
+            "retry_total": 3,
+            "retry_backoff": 0.5,
+            "timeout": 10
+        }
+    else:
+        config["network"].setdefault("retry_total", 3)
+        config["network"].setdefault("retry_backoff", 0.5)
+        config["network"].setdefault("timeout", 10)
+
+    return config

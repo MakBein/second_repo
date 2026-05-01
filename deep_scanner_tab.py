@@ -15,12 +15,12 @@ from tkinter import ttk, messagebox, filedialog
 import threading
 import subprocess
 import json, os, sys
-from pathlib import Path
 from datetime import datetime
 import re
 
 from xss_security_gui.deep_crawler import deep_crawl
 from xss_security_gui.utils.threat_sender import ThreatSenderMixin
+
 
 
 class GraphView(tk.Frame):
@@ -102,6 +102,11 @@ class DeepScannerTab(ttk.Frame, ThreatSenderMixin):
         # Авторизация
         login_frame = ttk.LabelFrame(self, text="🔐 Авторизация")
         login_frame.pack(fill="x", padx=10, pady=5)
+        ttk.Button(login_frame, text="🤖 Авто‑определить логин‑форму",
+                   command=self.auto_detect_login_form).grid(row=4,
+                                                             column=0,
+                                                             columnspan=4,
+                                                             pady=5)
 
         ttk.Label(login_frame, text="URL входа:").grid(row=0, column=0)
         self.login_url = ttk.Entry(login_frame, width=60)
@@ -190,9 +195,102 @@ class DeepScannerTab(ttk.Frame, ThreatSenderMixin):
                 config["login"] = login_cfg
 
             self.result_box.insert("end", f"\n🛰️ Сканирование: {url}\n")
+            # === AI‑детектор login‑формы ===
+            try:
+                from playwright.sync_api import sync_playwright
+                from xss_security_gui.auth.login_flow import detect_login_form_ai
+
+                print("[🤖] Анализ страницы для автоматического определения login‑формы...")
+
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(headless=True)
+                    page = browser.new_page()
+                    page.goto(url, timeout=8000)
+
+                    form_info = detect_login_form_ai(page)
+
+                    if form_info:
+                        print("[🤖] Найдена login‑форма:", form_info)
+
+                        # Автоматически заполняем GUI‑поля
+                        self.login_url.delete(0, "end")
+                        self.login_url.insert(0, url)
+
+                        self.selector_user.delete(0, "end")
+                        self.selector_user.insert(0, form_info.get("username") or "")
+
+                        self.selector_pass.delete(0, "end")
+                        self.selector_pass.insert(0, form_info.get("password") or "")
+
+                        self.selector_submit.delete(0, "end")
+                        self.selector_submit.insert(0, form_info.get("submit") or "")
+
+                        # Если логин/пароль пустые — ставим дефолт
+                        if not self.login_user.get().strip():
+                            self.login_user.insert(0, "admin")
+                        if not self.login_pass.get().strip():
+                            self.login_pass.insert(0, "admin123")
+
+                    else:
+                        print("[ℹ️] Login‑форма не найдена — GUI оставляет поля пустыми.")
+
+                    browser.close()
+
+            except Exception as e:
+                print("[⚠️] Ошибка авто‑детектора login‑формы:", e)
             threading.Thread(target=lambda: self.run_scan(url, config), daemon=True).start()
         except Exception as e:
             messagebox.showerror("Ошибка", f"Неверные параметры:\n{e}")
+
+    def auto_detect_login_form(self):
+        try:
+            from playwright.sync_api import sync_playwright
+            from xss_security_gui.auth.login_flow import detect_login_form_ai
+
+            url = self.url_entry.get().strip()
+            if not url.startswith("http"):
+                messagebox.showerror("Ошибка", "Укажи корректный URL для анализа.")
+                return
+
+            self.result_box.insert("end", "\n🤖 Авто‑анализ login‑формы...\n")
+
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page()
+                page.goto(url, timeout=8000)
+
+                form_info = detect_login_form_ai(page)
+
+                if not form_info:
+                    self.result_box.insert("end", "ℹ️ Login‑форма не найдена.\n")
+                    browser.close()
+                    return
+
+                self.result_box.insert("end", f"🤖 Найдена login‑форма: {form_info}\n")
+
+                # === Автозаполнение GUI ===
+                self.login_url.delete(0, "end")
+                self.login_url.insert(0, url)
+
+                self.selector_user.delete(0, "end")
+                self.selector_user.insert(0, form_info.get("username") or "")
+
+                self.selector_pass.delete(0, "end")
+                self.selector_pass.insert(0, form_info.get("password") or "")
+
+                self.selector_submit.delete(0, "end")
+                self.selector_submit.insert(0, form_info.get("submit") or "")
+
+                # Если логин/пароль пустые — ставим дефолт
+                if not self.login_user.get().strip():
+                    self.login_user.insert(0, "admin")
+                if not self.login_pass.get().strip():
+                    self.login_pass.insert(0, "admin123")
+
+                browser.close()
+
+        except Exception as e:
+            self.result_box.insert("end", f"⚠️ Ошибка авто‑детектора: {e}\n")
 
     def load_data(self, path):
         self.graph_view.load_dot_file(path)
@@ -237,44 +335,60 @@ class DeepScannerTab(ttk.Frame, ThreatSenderMixin):
 
     def check_proxy(self):
         import requests
+        from datetime import datetime, UTC
+        from pathlib import Path
+
         proxy = self.proxy_entry.get().strip()
         if not proxy:
             messagebox.showwarning("Пустой прокси", "Сначала укажи адрес прокси")
             return
 
         proxies = {"http": proxy, "https": proxy}
+
+        # Готуємо timestamp
+        now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
         try:
             ip = requests.get("https://api.ipify.org", proxies=proxies, timeout=7).text
             messagebox.showinfo("✅ Прокси работает", f"Внешний IP: {ip}")
+
             entry = {
-                "time": datetime.utcnow().isoformat(),
+                "time": now,
                 "proxy": proxy,
                 "ip": ip,
                 "status": "success"
             }
+
         except Exception as e:
             messagebox.showerror("❌ Прокси не работает", f"Ошибка:\n{e}")
+
             entry = {
-                "time": datetime.utcnow().isoformat(),
+                "time": now,
                 "proxy": proxy,
                 "error": str(e),
                 "status": "error"
             }
 
+        # ---------- ЛОГИ ----------
         try:
             Path("logs").mkdir(exist_ok=True)
             log_path = os.path.join("logs", "proxy_check_log.json")
+
             if os.path.exists(log_path):
                 with open(log_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
             else:
                 data = []
+
             data.append(entry)
+
             with open(log_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
+
         except Exception as log_error:
             print(f"[⚠️] Ошибка записи в лог: {log_error}")
 
+        # ---------- Threat Intel ----------
         self.send_to_threat_intel("proxy_check", entry)
 
     def display_result(self, result):

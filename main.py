@@ -1,6 +1,6 @@
 # xss_security_gui/main.py
 """
-main.py — точка входа XSS Security Suite 5.0
+main.py — точка входа XSS Security Suite 6.0
 Автор: Aleksandr + Copilot
 """
 import sys
@@ -11,6 +11,7 @@ import json
 import logging
 import tkinter as tk
 from tkinter import ttk
+from typing import Optional
 
 from XSStrike.core.fuzzer import fuzzer
 from XSStrike.core.config import xsschecker
@@ -39,24 +40,12 @@ from xss_security_gui.settings import (
 CRAWLER_RESULTS_PATH = crawler_results_path()
 _logger = logging.getLogger(__name__)
 
-
-# ============================================================
-#  Загрузка результатов предыдущего краулинга
-# ============================================================
-def load_crawler_results() -> dict:
-    if not CRAWLER_RESULTS_PATH.exists():
-        return {}
-    try:
-        return json.loads(CRAWLER_RESULTS_PATH.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
-        _logger.warning("Ошибка чтения crawler_results: %s", e)
-        return {}
-
-
-crawler_results = load_crawler_results()
 # ============================================================
 #  Импорты функциональных модулей
 # ============================================================
+from xss_security_gui.tabs.ai_verdict_tab import AIVerdictTab
+from xss_security_gui.tabs.ai_training_tab import AITrainingTab
+from xss_security_gui.ai_core.nn_model import load_trained_model
 from xss_security_gui.live_monitor import LiveAttackMonitor
 from xss_security_gui.threat_analysis.threat_connector import LIVE_MONITOR_QUEUE
 from xss_security_gui.crawler import save_outputs, build_final_dict
@@ -69,7 +58,9 @@ from xss_security_gui.visualizer import render_dot_to_svg
 from xss_security_gui.js_inspector import analyze_js_file
 from xss_security_gui.network_tab import NetworkTab
 from xss_security_gui.utils.disable_ssl_warnings import disable_ssl_warnings
+
 disable_ssl_warnings()
+
 # ============================================================
 #  GUI вкладки
 # ============================================================
@@ -86,7 +77,6 @@ from xss_security_gui.exploit_tab import ExploitTab
 from xss_security_gui.idor_tab import IDORTab
 from xss_security_gui.lfi_tab import LFITab
 from xss_security_gui.site_map_tab import SiteMapTab
-from xss_security_gui.attack_report_tab import AttackReportTab
 from xss_security_gui.full_analysis_tab import FullAnalysisTab
 from xss_security_gui.threat_tab import ThreatAnalysisTab
 from xss_security_gui.token_view_tab import TokenViewTab
@@ -96,7 +86,6 @@ from xss_security_gui.csrf_tab import CSRFTab
 from xss_security_gui.ssrf_tab import SSRFTab
 from xss_security_gui.gui.environment_tab import EnvironmentTab
 from xss_security_gui.gui.security_dashboard_panel import SecurityDashboardPanel
-#from xss_security_gui.payload_mutator import shutdown_mutator_executor
 
 # ============================================================
 #  AutoRecon
@@ -120,10 +109,12 @@ from xss_security_gui.gui.attack_gui import AttackGUI
 #  Deep Crawler 5.0
 # ============================================================
 from xss_security_gui.deep_crawler import deep_crawl_site
+
 # ============================================================
 #  Версия приложения
 # ============================================================
-__version__ = "5.0"
+__version__ = "6.0"
+
 # ============================================================
 #  Основной Tkinter GUI
 # ============================================================
@@ -137,37 +128,40 @@ class XSSSecurityGUI(tk.Tk):
         super().__init__()
         self.title("🛡️ XSS Security GUI — Pro Edition")
         self.geometry("980x730")
-        # Реєструємо обробник закриття
-        #self.protocol("WM_DELETE_WINDOW", self.on_close)
-
-    # def on_close(self):
-    #     shutdown_mutator_executor()
-    #     self.destroy()
 
         self.status = tk.StringVar(value="Готов к запуску")
-        self.tab_control = ttk.Notebook(self)
-        self.tab_control.pack(fill="both", expand=True)
+
+        # Sidebar + Content Area вместо Notebook
+        self.sidebar = None
+        self.content_area = None
+        self.tabs = {}
 
         self.honeypot_log = None
         self.log_view = None
         self.url_var = tk.StringVar(value="https://gazprombank.ru")
+        self.url_frame: Optional[ttk.Frame] = None
 
-        # Построение интерфейса
+        # Построение интерфейса (новая версия)
         self.build_tabs()
 
-        # Security Dashboard
-        dashboard_panel = SecurityDashboardPanel(self.tab_control)
-        self.tab_control.add(dashboard_panel, text="🛡️ Security Dashboard")
+        # ============================================================
+        #  AI Core — загрузка NN модели
+        # ============================================================
+        try:
+            load_trained_model("models/nn_model_trained.joblib")
+            print("[AI] NN Model loaded")
+        except Exception as e:
+            print("[AI] NN Model not loaded:", e)
 
+            # URL input + dynamic tabs
         self.add_url_entry()
         self.load_dynamic_tabs()
 
-        # XSS Detector + Threat Intel
+        # Threat Intel + Detector
         self.threat_connector = ThreatIntelConnector()
         self.detector = XSSDetector(threat_tab=self.threat_tab)
 
-        # Восстановление состояния GUI
-        self.load_gui_state()
+        # UI elements
         self.create_status_bar()
         self.add_visualizer_button()
         self.add_deep_crawl_button()
@@ -175,7 +169,7 @@ class XSSSecurityGUI(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        # Проверка окружения
+        # Environment check
         env_status = run_env_check()
         print(env_status)
         self.log(env_status)
@@ -183,150 +177,112 @@ class XSSSecurityGUI(tk.Tk):
         print(f"[📦 Версия GUI] {__version__}")
         print(f"[AutoTrap] {'Включены' if ENABLE_AUTO_TRAPS else 'Отключены'}")
 
-        # Тема интерфейса из ULTRA Hybrid Settings
         current_theme = settings.get("gui.theme")
         print(f"[GUI] Тема интерфейса: {current_theme}")
 
     # ============================================================
-    #  Построение вкладок GUI
+    #  Построение вкладок GUI — Burp Suite Sidebar Edition
     # ============================================================
     def build_tabs(self):
-        self._add_threat_tab()
-        self._add_analyzer_tab()
-        self._add_full_analysis_tab()
-        self._add_overview_tab()
-        self._add_dynamic_tabs()
-        self._add_misc_tabs()
 
-    def _add_threat_tab(self):
-        self.threat_tab = ThreatAnalysisTab(self.tab_control)
-        self.tab_control.add(self.threat_tab, text="📦 Threat Intel")
+        # === Основной контейнер ===
+        container = ttk.Frame(self)
+        container.pack(fill="both", expand=True)
 
-    def _add_analyzer_tab(self):
-        self.analyzer = XSSAnalyzerApp(
-            self.tab_control,
-            status_var=self.status,
-            threat_tab=self.threat_tab,
-        )
-        self.tab_control.add(self.analyzer, text="🕷️ Анализатор")
+        # === Sidebar ===
+        self.sidebar = ttk.Frame(container, width=220)
+        self.sidebar.pack(side="left", fill="y")
+        self.sidebar.pack_propagate(False)
 
-    def _add_full_analysis_tab(self):
-        self.full_analysis_tab = FullAnalysisTab(
-            self.tab_control,
-            threat_tab=self.threat_tab,
-        )
-        self.tab_control.add(self.full_analysis_tab, text="📶 Full Analysis")
+        # === Content Area ===
+        self.content_area = ttk.Frame(container)
+        self.content_area.pack(side="right", fill="both", expand=True)
 
-    def _add_overview_tab(self):
-        self.overview_tab = OverviewTab(
-            self.tab_control,
-            app=self,
-            threat_tab=self.threat_tab
-        )
-        self.overview_tab.pack(fill="both", expand=True)
-        self.tab_control.add(self.overview_tab, text="📊 Обзор")
+        # === Группы вкладок ===
+        self.tabs = {}
 
-    def _add_dynamic_tabs(self):
-        tabs_with_threat = [
-            (DeepAnalysisTab, "🧬 Deep Crawl"),
-            (DeepScannerTab, "🛰️ Deep Scanner"),
-            (ExploitTab, "💥 Эксплойты"),
-            (FormFuzzerTab, "🧪 Формы"),
-            (IDORTab, "🔓 IDOR Тест"),
-            (LFITab, "📂 LFI Тест"),
-            (SiteMapTab, "🗺️ Карта сайта"),
-            (NetworkTab, "🌐 Network Scanner"),
-        ]
-        self.dynamic_tabs = []
-        for cls, label in tabs_with_threat:
-            tab = cls(self.tab_control, threat_tab=self.threat_tab)
-            tab.pack(fill="both", expand=True)
-            self.tab_control.add(tab, text=label)
-            self.dynamic_tabs.append(tab)
+        # ------------------------------------------------------------
+        # 1. Основные инструменты
+        # ------------------------------------------------------------
+        self._add_sidebar_group("Основные")
+        self._add_sidebar_tab("📦 Threat Intel", lambda p: ThreatAnalysisTab(p))
+        self._add_sidebar_tab("🕷️ Анализатор", lambda p: XSSAnalyzerApp(p, status_var=self.status, threat_tab=self.threat_tab))
+        self._add_sidebar_tab("📶 Full Analysis", lambda p: FullAnalysisTab(p, threat_tab=self.threat_tab))
+        self._add_sidebar_tab("📊 Обзор", lambda p: OverviewTab(p, app=self, threat_tab=self.threat_tab))
+        self._add_sidebar_tab("🤖 AI Verdict", lambda p: AIVerdictTab(p))
 
-    def _add_misc_tabs(self):
-        batch_tab = BatchReportTab(self.tab_control)
-        batch_tab.pack(fill="both", expand=True)
-        self.tab_control.add(batch_tab, text="📊 Batch Report")
+        # ------------------------------------------------------------
+        # 2. Deep Tools
+        # ------------------------------------------------------------
+        self._add_sidebar_group("Deep Tools")
+        self._add_sidebar_tab("🧬 Deep Crawl", lambda p: DeepAnalysisTab(p, threat_tab=self.threat_tab))
+        self._add_sidebar_tab("🛰️ Deep Scanner", lambda p: DeepScannerTab(p, threat_tab=self.threat_tab))
+        self._add_sidebar_tab("💥 Эксплойты", lambda p: ExploitTab(p, threat_tab=self.threat_tab))
+        self._add_sidebar_tab("🧪 Формы", lambda p: FormFuzzerTab(p, threat_tab=self.threat_tab))
+        self._add_sidebar_tab("🔓 IDOR Тест", lambda p: IDORTab(p, threat_tab=self.threat_tab))
+        self._add_sidebar_tab("📂 LFI Тест", lambda p: LFITab(p, threat_tab=self.threat_tab))
+        self._add_sidebar_tab("🗺️ Карта сайта", lambda p: SiteMapTab(p, threat_tab=self.threat_tab))
+        self._add_sidebar_tab("🌐 Network Scanner", lambda p: NetworkTab(p, threat_tab=self.threat_tab))
 
-        settings_editor = SettingsEditor(self.tab_control)
-        settings_editor.pack(fill="both", expand=True)
-        self.tab_control.add(settings_editor, text="🛠️ Настройки JSON")
+        # ------------------------------------------------------------
+        # 3. AI / ML
+        # ------------------------------------------------------------
+        self._add_sidebar_group("AI / ML")
+        self._add_sidebar_tab("🤖 AI Training", lambda p: AITrainingTab(p))
+        self._add_sidebar_tab("🛡️ Security Dashboard", lambda p: SecurityDashboardPanel(p))
 
-        live_log_tab = LiveLogTab(self.tab_control)
-        live_log_tab.pack(fill="both", expand=True)
-        self.tab_control.add(live_log_tab, text="📶 События")
+        # ------------------------------------------------------------
+        # 4. Логи и отчеты
+        # ------------------------------------------------------------
+        self._add_sidebar_group("Логи и отчеты")
+        self._add_sidebar_tab("📊 Batch Report", lambda p: BatchReportTab(p))
+        self._add_sidebar_tab("📶 События", lambda p: LiveLogTab(p))
+        self._add_sidebar_tab("📁 Логи", lambda p: self._create_logs_tab(p))
+        self._add_sidebar_tab("🎣 Honeypot", lambda p: self._create_honeypot_tab(p))
 
-        live_tab = LiveAttackMonitor(self.tab_control, LIVE_MONITOR_QUEUE)
-        live_tab.pack(fill="both", expand=True)
-        self.tab_control.add(live_tab, text="📡 Live Monitor")
+        # ------------------------------------------------------------
+        # 5. Инструменты
+        # ------------------------------------------------------------
+        self._add_sidebar_group("Инструменты")
+        self._add_sidebar_tab("🔐 Token Inspector", lambda p: TokenViewTab(p))
+        self._add_sidebar_tab("🛠️ Настройки JSON", lambda p: SettingsEditor(p))
+        self._add_sidebar_tab("⚙️ Настройки", lambda p: SettingsTab(p))
+        self._add_sidebar_tab("🌍 Environment", lambda p: EnvironmentTab(p, env_path=BASE_DIR / ".env"))
+        self._add_sidebar_tab("📡 AutoRecon Dashboard", lambda p: AutoReconDashboardTab(p))
 
-        # Attack Report
-        attack_report_tab = AttackReportTab(self.tab_control)
-        attack_report_tab.pack(fill="both", expand=True)
-        self.tab_control.add(attack_report_tab, text="📊 Отчёт по атаке")
+        # Открыть первую вкладку
+        self._open_tab("📦 Threat Intel")
 
-        # Token Inspector
-        token_tab = TokenViewTab(self.tab_control)
-        token_tab.pack(fill="both", expand=True)
-        self.tab_control.add(token_tab, text="🔐 Token Inspector")
 
-        # Settings
-        settings_tab = SettingsTab(self.tab_control)
-        settings_tab.pack(fill="both", expand=True)
-        self.tab_control.add(settings_tab, text="⚙️ Настройки")
+    # ============================================================
+    #  Sidebar helpers
+    # ============================================================
+    # ============================================================
+    #  Sidebar helpers
+    # ============================================================
+    def _add_sidebar_group(self, title):
+        lbl = ttk.Label(self.sidebar, text=title, font=("Segoe UI", 10, "bold"))
+        lbl.pack(anchor="w", padx=12, pady=(15, 5))
 
-        # Environment Viewer
-        env_tab = EnvironmentTab(self.tab_control, env_path=BASE_DIR / ".env")
-        env_tab.pack(fill="both", expand=True)
-        self.tab_control.add(env_tab, text="🌍 Environment")
+    def _add_sidebar_tab(self, label, factory):
+        btn = ttk.Button(self.sidebar, text=label, command=lambda: self._open_tab(label))
+        btn.pack(fill="x", padx=12, pady=2)
+        self.tabs[label] = factory
 
-        # AutoRecon Dashboard
-        dashboard_tab = AutoReconDashboardTab(self.tab_control)
-        dashboard_tab.pack(fill="both", expand=True)
-        self.tab_control.add(dashboard_tab, text="📡 AutoRecon Dashboard")
+    def _open_tab(self, label):
+        for child in self.content_area.winfo_children():
+            child.destroy()
 
-        # Honeypot
-        honeypot_tab = ttk.Frame(self.tab_control)
-        self.honeypot_log = tk.Text(honeypot_tab, bg="#111", fg="cyan", height=30)
-        self.honeypot_log.pack(fill="both", expand=True)
-        self.tab_control.add(honeypot_tab, text="🎣 Honeypot")
+        tab = self.tabs[label](self.content_area)
+        tab.pack(fill="both", expand=True)
 
-        threading.Thread(
-            target=lambda: monitor_log_thread(self.honeypot_log),
-            daemon=True,
-        ).start()
-
-        # Logs
-        logs_tab = ttk.Frame(self.tab_control)
-        self.log_view = tk.Text(logs_tab, bg="#222", fg="white")
-        self.log_view.pack(fill="both", expand=True)
-        self.load_logs()
-        self.tab_control.add(logs_tab, text="📁 Логи")
-
-    def load_logs(self):
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        log_content = load_file(
-            LOG_SUCCESS_PATH,  # передаємо повний шлях
-            default="Файл логів не знайдено.",
-        )
-        self.log_view.insert("1.0", log_content)
-
-    def add_threat_reload_button(self):
-        frame = ttk.Frame(self)
-        frame.pack(side="bottom", fill="x")
-        ttk.Button(
-            frame,
-            text="📊 Оновити Threat Intel",
-            command=self.threat_tab.reload_summary,
-        ).pack(side="left")
-
-    def add_mutate_button(self):
-        btn = ttk.Button(self, text="🧬 Mutate Payloads", command=self.run_mutator)
-        btn.pack()
-
-    def run_mutator(self):
-        self.analyzer.run_mutator()
+        # Save references for important tabs
+        if label == "📦 Threat Intel":
+            self.threat_tab = tab
+        elif label == "🕷️ Анализатор":
+            self.analyzer = tab
+        elif label == "📶 Full Analysis":
+            self.full_analysis_tab = tab
 
     # ============================================================
     #  Поле ввода URL
@@ -348,16 +304,23 @@ class XSSSecurityGUI(tk.Tk):
         self.url_frame = frame
 
     # ============================================================
-    #  Кнопка Deep Crawl
+    #  Динамическая загрузка вкладок (XSS/SQLi/CSRF/SSRF)
     # ============================================================
-    def add_deep_crawl_button(self):
-        btn = ttk.Button(
-            self.url_frame,
-            text="🧬 Deep Crawl",
-            command=self.run_deep_crawl_threaded,
-        )
-        btn.pack(side="left", padx=5)
+    def load_dynamic_tabs(self):
+        url = self.url_var.get().strip()
+        if not url:
+            self.log("⚠️ Введіть цільовий URL перед запуском вкладок.")
+            return
 
+        # Register dynamic tabs
+        self.tabs["🛡️ SQLi"] = lambda p: SQLiTab(p, url, payload_file=str(SQLI_PAYLOAD_FILE))
+        self.tabs["🛡️ XSS"] = lambda p: XSSTab(p, url, payload_file=str(XSS_PAYLOAD_FILE))
+        self.tabs["🛡️ CSRF"] = lambda p: CSRFTab(p, url, payload_file=str(CSRF_PAYLOAD_FILE))
+        self.tabs["🛡️ SSRF"] = lambda p: SSRFTab(p, url, payload_file=str(SSRF_PAYLOAD_FILE))
+
+    # ============================================================
+    #  Attack GUI
+    # ============================================================
     def add_attack_gui_button(self):
         btn = ttk.Button(
             self.url_frame,
@@ -367,7 +330,6 @@ class XSSSecurityGUI(tk.Tk):
         btn.pack(side="left", padx=5)
 
     def launch_attack_gui(self):
-        """Запускает AttackGUI для указанного URL в отдельном окне Tkinter."""
         url = self.url_var.get().strip()
         if not url:
             self.log("⚠️ Введіть цільовий URL перед запуском Attack GUI.")
@@ -382,63 +344,16 @@ class XSSSecurityGUI(tk.Tk):
         attack_frame.pack(fill="both", expand=True)
 
     # ============================================================
-    #  Динамическая загрузка вкладок (XSS/SQLi/CSRF/SSRF)
-    # ============================================================
-    def load_dynamic_tabs(self):
-        url = self.url_var.get().strip()
-        if not url:
-            self.log("⚠️ Введіть цільовий URL перед запуском вкладок.")
-            return
-
-        existing = [self.tab_control.tab(i, "text") for i in range(self.tab_control.index("end"))]
-
-        if "🛡️ SQLi" not in existing:
-            tab = SQLiTab(self.tab_control, url, payload_file=str(SQLI_PAYLOAD_FILE))
-            tab.pack(fill="both", expand=True)
-            self.tab_control.add(tab, text="🛡️ SQLi")
-
-        if "🛡️ XSS" not in existing:
-            tab = XSSTab(self.tab_control, url, payload_file=str(XSS_PAYLOAD_FILE))
-            tab.pack(fill="both", expand=True)
-            self.tab_control.add(tab, text="🛡️ XSS")
-
-        if "🛡️ CSRF" not in existing:
-            tab = CSRFTab(self.tab_control, url, payload_file=str(CSRF_PAYLOAD_FILE))
-            tab.pack(fill="both", expand=True)
-            self.tab_control.add(tab, text="🛡️ CSRF")
-
-        if "🛡️ SSRF" not in existing:
-            tab = SSRFTab(self.tab_control, url, payload_file=str(SSRF_PAYLOAD_FILE))
-            tab.pack(fill="both", expand=True)
-            self.tab_control.add(tab, text="🛡️ SSRF")
-
-
-    # ============================================================
-    #  Рендеринг Graphviz
-    # ============================================================
-    def render_graph(self, dot_path, svg_path):
-        self.log(f"🖼️ Рендеринг графа: {dot_path}")
-        self.status.set("Рендеринг Graphviz…")
-
-        def callback(success, message):
-            self.after(0, self._on_graph_render_done, success, message)
-
-        render_dot_to_svg(dot_path, svg_path, callback=callback)
-
-    def _on_graph_render_done(self, success, message):
-        self.log(message)
-        self.status.set("Готово" if success else "Ошибка рендера")
-
-        if success:
-            try:
-                import webbrowser
-                webbrowser.open(message.split(": ", 1)[1])
-            except Exception:
-                pass
-
-    # ============================================================
     #  Deep Crawl (потокобезопасный)
     # ============================================================
+    def add_deep_crawl_button(self):
+        btn = ttk.Button(
+            self.url_frame,
+            text="🧬 Deep Crawl",
+            command=self.run_deep_crawl_threaded,
+        )
+        btn.pack(side="left", padx=5)
+
     def run_deep_crawl_threaded(self):
         threading.Thread(target=self._deep_crawl_worker, daemon=True).start()
 
@@ -458,6 +373,7 @@ class XSSSecurityGUI(tk.Tk):
                 save_json(CRAWLER_RESULTS_PATH, result)
                 self.log(f"[✅] Deep Crawl завершён. Результаты сохранены в {CRAWLER_RESULTS_PATH}")
                 self.status.set("Deep Crawl завершён")
+
                 self.propagate_crawler_results(result)
 
             self.after(0, apply_results)
@@ -479,52 +395,45 @@ class XSSSecurityGUI(tk.Tk):
     #  Передача результатов Deep Crawl во вкладки
     # ============================================================
     def propagate_crawler_results(self, result):
-        for tab in self.dynamic_tabs:
-            if hasattr(tab, "reload_from_crawler"):
-                try:
-                    tab.reload_from_crawler(result)
-                except Exception as e:
-                    self.log(f"[⚠️] Ошибка обновления вкладки {tab}: {e}")
-
-        if hasattr(self.full_analysis_tab, "reload_from_crawler"):
+        if self.full_analysis_tab and hasattr(self.full_analysis_tab, "reload_from_crawler"):
             try:
                 self.full_analysis_tab.reload_from_crawler(result)
             except Exception as e:
                 self.log(f"[⚠️] Ошибка обновления FullAnalysisTab: {e}")
 
-        if hasattr(self.threat_tab, "ingest_crawl_result"):
+        if self.threat_tab and hasattr(self.threat_tab, "ingest_crawl_result"):
             try:
                 self.threat_tab.ingest_crawl_result(result)
             except Exception as e:
                 self.log(f"[⚠️] Ошибка передачи данных в ThreatTab: {e}")
 
     # ============================================================
-    #  Сохранение состояния GUI
+    #  Honeypot + Logs
     # ============================================================
-    def save_gui_state(self):
-        try:
-            index = self.tab_control.index(self.tab_control.select())
-            save_json(GUI_STATE_PATH, {"last_tab": index})
-        except Exception as e:
-            self.log(f"⚠️ Не удалось сохранить состояние GUI: {e}")
+    def _create_honeypot_tab(self, parent):
+        frame = ttk.Frame(parent)
+        self.honeypot_log = tk.Text(frame, bg="#111", fg="cyan")
+        self.honeypot_log.pack(fill="both", expand=True)
 
-    def load_gui_state(self):
-        try:
-            data = load_json(GUI_STATE_PATH, default={})
-            last_index = data.get("last_tab", 0)
+        threading.Thread(
+            target=lambda: monitor_log_thread(self.honeypot_log),
+            daemon=True,
+        ).start()
 
-            if 0 <= last_index < self.tab_control.index("end"):
-                self.tab_control.select(last_index)
-        except Exception as e:
-            self.log(f"⚠️ Не удалось загрузить состояние GUI: {e}")
+        return frame
 
-    def on_close(self):
-        self.save_gui_state()
-        try:
-            self.quit()
-        except Exception:
-            pass
-        self.destroy()
+    def _create_logs_tab(self, parent):
+        frame = ttk.Frame(parent)
+        self.log_view = tk.Text(frame, bg="#222", fg="white")
+        self.log_view.pack(fill="both", expand=True)
+        self.load_logs()
+        return frame
+
+    def load_logs(self):
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        log_content = load_file(LOG_SUCCESS_PATH, default="Файл логів не знайдено.")
+        if self.log_view:
+            self.log_view.insert("1.0", log_content)
 
     # ============================================================
     #  Статус бар
@@ -564,11 +473,10 @@ class XSSSecurityGUI(tk.Tk):
                 summary = engine.get_summary()
                 self.log("📤 Сводка атак отправлена:")
                 self.log(json.dumps(summary, indent=2, ensure_ascii=False))
-                self.activate_logs_tab()
             else:
-                self.log("⚠️ Attack Engine недоступен для отправки сводки.")
+                self.log("⚠️ Attack Engine недоступен.")
         except Exception as e:
-            self.log(f"❌ Ошибка отправки сводки: {type(e).__name__}: {e}")
+            self.log(f"❌ Ошибка отправки сводки: {e}")
 
     def run_visualizer(self):
         dot_file = LOG_DIR / "threat_graph.dot"
@@ -582,15 +490,12 @@ class XSSSecurityGUI(tk.Tk):
             self.log(message)
 
             if success:
-                try:
-                    import webbrowser
-                    webbrowser.open(str(svg_file))
-                except Exception as e:
-                    self.log(f"⚠️ Не удалось открыть SVG: {e}")
+                import webbrowser
+                webbrowser.open(str(svg_file))
             else:
                 self.status.set("Ошибка рендера")
         except Exception as e:
-            self.log(f"❌ Ошибка визуализации: {type(e).__name__}: {e}")
+            self.log(f"❌ Ошибка визуализации: {e}")
             self.status.set("Ошибка Graphviz")
 
     # ============================================================
@@ -601,22 +506,23 @@ class XSSSecurityGUI(tk.Tk):
         line = f"[{ts}] {text}"
         print(line)
 
-        if getattr(self, "log_view", None):
+        if self.log_view:
             try:
                 self.log_view.insert("end", line + "\n")
                 self.log_view.see("end")
             except Exception:
                 pass
 
-    def activate_logs_tab(self):
+    # ============================================================
+    #  Закрытие GUI
+    # ============================================================
+    def on_close(self):
         try:
-            for i in range(self.tab_control.index("end")):
-                if self.tab_control.tab(i, "text") == "📁 Логи":
-                    self.tab_control.select(i)
-                    return
-            self.log("⚠️ Вкладка '📁 Логи' не найдена")
-        except Exception as e:
-            self.log(f"⚠️ Не удалось активировать вкладку логов: {e}")
+            self.quit()
+        except Exception:
+            pass
+        self.destroy()
+
 
 def check_dependencies():
     if not SETTINGS_JSON_PATH.exists():
@@ -689,9 +595,6 @@ if __name__ == "__main__":
     # CLI режими: crawl / js / recon / fuzz
     # ========================================================
     elif cmd in ("crawl", "js", "recon", "fuzz"):
-        # Створюємо приховане Tk-вікно тільки для .after(), без GUI
-        # app = tk.Tk()
-        # app.withdraw()
         app = XSSSecurityGUI()
 
         def run_cli():
@@ -744,7 +647,7 @@ if __name__ == "__main__":
                 # ----------------- AUTORECON -----------------
                 elif cmd == "recon" and len(args) == 3:
                     url = args[2]
-                    ui_log(f"🔁 Авторазвідка: {url}")
+                    ui_log(f"🔁 Авторозвідка: {url}")
 
                     endpoints = EndpointScanner(url).scan()
                     payloads = PayloadGenerator(endpoints).generate()

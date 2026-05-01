@@ -35,13 +35,17 @@ ALLOWED_TARGETS = [
 # ============================================================
 #  Базовые директории
 # ============================================================
+# Корінь проєкту
+BASE_DIR = Path(__file__).resolve().parent
 
-BASE_DIR: Path = Path(__file__).parent.resolve()
 LOG_DIR: Path = BASE_DIR / "logs"
 EXPORT_DIR: Path = BASE_DIR / "exports"
 PDF_DIR: Path = EXPORT_DIR / "reports"
 PAYLOADS_DIR: Path = BASE_DIR / "payloads"
 CONFIG_DIR: Path = BASE_DIR / "configs"
+# Папки
+AI_CORE_DIR: Path = BASE_DIR / "ai_core"
+MODEL_STORE_DIR: Path =  AI_CORE_DIR / "model_store"
 
 
 for d in (LOG_DIR, EXPORT_DIR, PDF_DIR, PAYLOADS_DIR, CONFIG_DIR):
@@ -72,6 +76,23 @@ if SETTINGS_JSON_PATH.exists():
     except Exception as e:
         print(f"[Settings] Ошибка загрузки settings.json: {e}")
         SETTINGS_JSON = {}
+
+# ============================================================
+#  AI Core Safe Mode (запобігає падінню GUI)
+# ============================================================
+
+
+
+# Шлях до моделі
+AI_MODEL_PATH = MODEL_STORE_DIR / "nn_model_trained.joblib"
+
+
+# SAFE MODE
+AI_SAFE_MODE = True
+AI_FALLBACK_ON_ERROR = True
+AI_DISABLE_ML = False
+AI_DISABLE_NN = False
+AI_DISABLE_LLM = False
 
 # ============================================================
 #  Автоопределение окружения
@@ -218,6 +239,15 @@ class Settings:
                 "http.default_user_agent": "XSS-Security-GUI/6.5",
                 "http.aggressive_headers": True,
                 "http.proxies": None,
+                "http.verify_ssl": False,
+                # Auto-modules (auto_modules.auto_modules — Ultra HTTP)
+                "attack.auto_module_delay": None,
+                "attack.max_body_sample": 400_000,
+                "attack.request_retries": 2,
+                "attack.max_auto_endpoints": 500,
+                "attack.max_token_attempts": 80,
+                "attack.max_auth_header_variants": 3,
+                "attack.user_id_param_names": None,
                 # IDOR
                 "idor.delay": 0.5,
                 # LFI
@@ -265,7 +295,17 @@ class Settings:
                     "access denied",
                     "firewall",
                     "request rejected",
+                    "cloudflare",
+                    "incapsula",
+                    "akamai",
+                    "perimeterx",
+                    "captcha",
+                    "rate limit",
                 ],
+                "sqli.waf_evasion_default": True,
+                "sqli.try_post_default": True,
+                "sqli.inter_attempt_delay": 0.05,
+                "sqli.max_workers": 5,
                 # SSRF
                 "ssrf.body_indicators": [
                     "169.254.",
@@ -429,8 +469,6 @@ ATTACK_LOGS_PATH = LOG_DIR / "attack_logs.md"
 HONEYPOT_EVENTS_JSONL = LOG_DIR / "honeypot_events.jsonl"
 NETWORK_LOG_PATH = LOG_DIR / "network_checks.log"
 GUI_STATE_PATH = LOG_DIR / "gui_state.json"
-
-
 
 # ============================================================
 #  Функции для универсальных путей

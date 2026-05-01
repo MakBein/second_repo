@@ -573,24 +573,66 @@ def estimate_risk(mutant: str, family: str) -> int:
 def build_structured_mutants(base_payload: str, framework: str) -> List[Dict[str, Any]]:
     """
     Возвращает структурированные мутанты:
-    {
-        "payload": "...",
-        "family": "...",
-        "risk": 8,
-        "tags": [...]
-    }
+    [
+        {
+            "payload": "...",
+            "family": "...",
+            "risk": 8,
+            "tags": [...],
+            "family_score": 0–10,
+            "base": "...",
+            "framework": "..."
+        }
+    ]
+    Усиленная версия: безопасная, устойчивая, сортированная.
     """
-    options = MutationOptions(framework=framework)
-    results = _ENGINE.generate(base_payload, options)
+    if not isinstance(base_payload, str) or not base_payload.strip():
+        log.warning("[MutatorULTRA] build_structured_mutants: пустой base_payload")
+        return []
+
+    try:
+        options = MutationOptions(framework=framework)
+        results = _ENGINE.generate(base_payload, options)
+    except Exception as e:
+        log.error(f"[MutatorULTRA] ошибка генерации мутантов: {e}")
+        return []
 
     structured = []
+    seen = set()  # защита от дубликатов
+
     for m in results:
+        # защита от повреждённых объектов
+        if not m or not isinstance(m.payload, str):
+            log.warning("[MutatorULTRA] пропуск повреждённого мутанта")
+            continue
+
+        p = m.payload.strip()
+        if not p or p in seen:
+            continue
+        seen.add(p)
+
+        # дополнительный family-score (усиление анализа)
+        family_score = {
+            "polyglot": 10,
+            "csp_aware": 9,
+            "dom_aware": 8,
+            "waf_bypass": 7,
+            "framework": 6,
+            "base": 5,
+        }.get(m.family, 3)
+
         structured.append({
-            "payload": m.payload,
+            "payload": p,
             "family": m.family,
             "risk": m.risk,
             "tags": m.tags,
+            "family_score": family_score,
+            "base": base_payload,
+            "framework": framework,
         })
+
+    # сортировка: сначала по risk, потом по family_score
+    structured.sort(key=lambda x: (x["risk"], x["family_score"]), reverse=True)
 
     return structured
 
@@ -600,35 +642,63 @@ def build_structured_mutants(base_payload: str, framework: str) -> List[Dict[str
 # ============================================================
 
 def _mutate_task(category: str, payload: str, framework: str) -> Dict[str, int]:
-    log.info(f"[MutatorULTRA] Генерация мутантов для {payload} ({framework})")
+    log.info(f"[MutatorULTRA] Генерация мутантов для {payload!r} ({framework})")
 
-    options = MutationOptions(framework=framework)
-    mutants = _ENGINE.generate(payload, options)
+    if "xss" not in category.lower():
+        log.info(f"[MutatorULTRA] Пропуск категории {category!r} — не XSS, мутатор не запускается")
+        return {"generated": 0, "total_mutants": 0}
 
+    try:
+        options = MutationOptions(framework=framework)
+        mutants = _ENGINE.generate(payload, options)
+    except Exception as e:
+        log.error(f"[MutatorULTRA] Ошибка генерации мутантов: {e}")
+        return {"generated": 0, "total_mutants": 0}
+
+    # === Базовая статистика ===
+    total_mutants = len(mutants)
     added = 0
     families = set()
     max_risk = 0
 
+    if total_mutants == 0:
+        log.warning(f"[MutatorULTRA] Мутанты не сгенерированы для {payload!r}")
+        return {"generated": 0, "total_mutants": 0}
+
+    # === Основной цикл ===
     for m in mutants:
+        # Защита от повреждённых объектов
+        if not m or not isinstance(m.payload, str):
+            log.warning("[MutatorULTRA] Пропуск повреждённого мутанта")
+            continue
+
         families.add(m.family)
         max_risk = max(max_risk, m.risk)
 
-        if PAYLOADS.add(category, m.payload):
-            added += 1
+        try:
+            # Добавляем в PayloadManager
+            if PAYLOADS.add(category, m.payload):
+                added += 1
 
-            MUTATION_ATTACK_QUEUE.put((
-                -m.risk,
-                {
-                    "category": category,
-                    "payload": m.payload,
-                    "framework": framework,
-                    "family": m.family,
-                    "risk": m.risk,
-                    "tags": m.tags,
-                }
-            ))
+                # === Кладём задачу в очередь автоатак ===
+                MUTATION_ATTACK_QUEUE.put((
+                    -m.risk,  # приоритет: высокий риск → выше в очереди
+                    {
+                        "category": category,
+                        "payload": m.payload,
+                        "framework": framework,
+                        "family": m.family,
+                        "risk": m.risk,
+                        "tags": m.tags,
+                        "generated": total_mutants,
+                        "total_mutants": total_mutants,
+                    }
+                ))
 
-    # ThreatConnector
+        except Exception as e:
+            log.error(f"[MutatorULTRA] Ошибка при добавлении мутанта: {e}")
+
+    # === ThreatConnector (безопасный режим) ===
     try:
         THREAT_CONNECTOR.emit(
             module="PayloadMutatorULTRA",
@@ -640,7 +710,7 @@ def _mutate_task(category: str, payload: str, framework: str) -> Dict[str, int]:
                 "framework": framework,
                 "base_payload": payload,
                 "generated": added,
-                "total_mutants": len(mutants),
+                "total_mutants": total_mutants,
                 "unique_families": list(families),
                 "max_risk": max_risk,
                 "mutants_preview": [m.payload for m in mutants[:5]],
@@ -649,11 +719,15 @@ def _mutate_task(category: str, payload: str, framework: str) -> Dict[str, int]:
     except Exception as e:
         log.warning(f"[MutatorULTRA] Ошибка ThreatConnector.emit: {e}")
 
-    log.info(f"[MutatorULTRA] добавлено {added} мутантов (из {len(mutants)})")
+    # === Финальный лог ===
+    log.info(
+        f"[MutatorULTRA] добавлено {added} мутантов "
+        f"(из {total_mutants}), семейства={list(families)}, max_risk={max_risk}"
+    )
 
     return {
         "generated": added,
-        "total_mutants": len(mutants),
+        "total_mutants": total_mutants,
     }
 
 
@@ -672,14 +746,27 @@ def mutate_async(category: str, payload: str, framework: str = "generic") -> Fut
 def mutate_payload(base: str, framework: str = "generic") -> List[str]:
     """
     Синхронный API: возвращает список payload-строк.
+    Усиленная версия: безопасная, устойчивая, фильтрует мусор.
     """
-    if not base or not isinstance(base, str):
+    if not isinstance(base, str) or not base.strip():
+        log.warning("[MutatorULTRA] mutate_payload: пустой или неверный base")
         return []
 
     try:
         options = MutationOptions(framework=framework)
         results = _ENGINE.generate(base, options)
-        return [m.payload for m in results]
+
+        payloads = []
+        for m in results:
+            if not m or not isinstance(m.payload, str):
+                log.warning("[MutatorULTRA] mutate_payload: пропуск повреждённого мутанта")
+                continue
+            if not m.payload.strip():
+                continue
+            payloads.append(m.payload)
+
+        return payloads
+
     except Exception as e:
         log.error(f"[MutatorULTRA] ошибка при генерации мутантов: {e}")
         return []

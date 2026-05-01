@@ -233,42 +233,57 @@ class NetworkChecker:
     def check_tls_and_alpn(self):
         try:
             ctx = ssl.create_default_context()
-            # ALPN: пытаемся договориться о h2 / http/1.1
+
+            # Попытка согласовать ALPN (h2 / http1.1)
             try:
                 ctx.set_alpn_protocols(["h2", "http/1.1"])
             except Exception:
-                # Не все OpenSSL/SSL сборки поддерживают ALPN
-                pass
+                pass  # ALPN может быть недоступен
 
             with socket.create_connection((self.domain, 443), timeout=5) as sock:
                 with ctx.wrap_socket(sock, server_hostname=self.domain) as ssock:
-                    cert = ssock.getpeercert()
-                    tls_version = ssock.version()
-                    alpn = None
+
+                    # --- TLS версия ---
+                    tls_version = ssock.version() or "unknown"
+
+                    # --- ALPN ---
                     try:
-                        alpn = ssock.selected_alpn_protocol()
+                        alpn = ssock.selected_alpn_protocol() or "unknown"
                     except Exception:
-                        alpn = None
+                        alpn = "unknown"
 
+                    # --- Сертификат ---
+                    cert = ssock.getpeercert() or {}
+
+                    # Expiry
                     not_after = cert.get("notAfter")
-                    expiry = (
-                        datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
-                        if not_after
-                        else None
-                    )
-                    exp_str = expiry.strftime("%Y-%m-%d") if expiry else "Unknown"
+                    try:
+                        expiry = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
+                        exp_str = expiry.strftime("%Y-%m-%d")
+                    except Exception:
+                        exp_str = "Unknown"
 
-                    subject = ", ".join("=".join(x) for x in cert.get("subject", []))
+                    # Subject (надёжный парсер)
+                    subject_parts = []
+                    for item in cert.get("subject", []):
+                        # item = [(("key","value"),)]
+                        for pair in item:
+                            if isinstance(pair, tuple) and len(pair) == 2:
+                                key, value = pair
+                                subject_parts.append(f"{key}={value}")
 
-                    alpn_str = alpn or "unknown"
+                    subject = ", ".join(subject_parts) if subject_parts else "Unknown"
+
+                    # --- Финальный вывод ---
                     details = (
-                        f"🧪 TLS={tls_version}, ALPN={alpn_str}, "
+                        f"🧪 TLS={tls_version}, ALPN={alpn}, "
                         f"CN={subject}, Expiry={exp_str}"
                     )
 
         except Exception as e:
             details = f"❌ Ошибка TLS/ALPN: {e}"
 
+        # Логирование и отправка в Threat Intel
         self._log(details)
         THREAT_CONNECTOR.emit(
             module="NetworkChecker",
@@ -354,27 +369,59 @@ class NetworkChecker:
     # ---------------------------------------------------------
 
     def check_whois(self):
+        # 1) Модуль може бути не встановлений
         if whois is None:
-            status = "⚠️ WHOIS недоступен: python-whois не установлен"
+            status = "⚠️ WHOIS недоступен: пакет python-whois не установлен"
             self._log(status)
+            THREAT_CONNECTOR.emit(
+                module="NetworkChecker",
+                target=self.domain,
+                result={"check": "whois", "status": status},
+            )
             return
 
         try:
+            # 2) Захист від зависань: WHOIS іноді може дуже довго відповідати
+            # Якщо у тебе є внешний timeout-обертка — краще викликати через неї
             data = whois.whois(self.domain)
 
-            registrar = data.registrar or "Unknown"
-            country = data.country or "Unknown"
-            created = str(data.creation_date) if data.creation_date else "Unknown"
-            expires = str(data.expiration_date) if data.expiration_date else "Unknown"
+            # 3) WHOIS іноді повертає dict, іноді об’єкт
+            def _get(field):
+                try:
+                    if isinstance(data, dict):
+                        return data.get(field)
+                    return getattr(data, field, None)
+                except Exception:
+                    return None
 
-            status = f"📄 WHOIS: Registrar={registrar}, Country={country}, Created={created}, Expires={expires}"
+            def _normalize_date(value):
+                # Може бути datetime, список, str, None
+                try:
+                    if isinstance(value, (list, tuple)) and value:
+                        value = value[0]
+                    return str(value) if value else "Unknown"
+                except Exception:
+                    return "Unknown"
+
+            registrar = _get("registrar") or "Unknown"
+            country = _get("country") or "Unknown"
+            created = _normalize_date(_get("creation_date"))
+            expires = _normalize_date(_get("expiration_date"))
+
+            status = (
+                f"📄 WHOIS: Registrar={registrar}, Country={country}, "
+                f"Created={created}, Expires={expires}"
+            )
 
         except Exception as e:
             status = f"❌ Ошибка WHOIS: {e}"
 
         self._log(status)
-        THREAT_CONNECTOR.emit(module="NetworkChecker", target=self.domain,
-                              result={"check": "whois", "status": status})
+        THREAT_CONNECTOR.emit(
+            module="NetworkChecker",
+            target=self.domain,
+            result={"check": "whois", "status": status},
+        )
 
     # ---------------------------------------------------------
     # ASN / GeoIP
@@ -443,22 +490,3 @@ class NetworkChecker:
             target=self.domain,
             result={"check": "asn_geoip", "status": status},
         )
-
-
-        # try:
-        #     ip = socket.gethostbyname(self.domain)
-        #     r = requests.get(f"https://ipinfo.io/{ip}/json", timeout=5).json()
-        #
-        #     asn = r.get("org", "Unknown")
-        #     city = r.get("city", "Unknown")
-        #     country = r.get("country", "Unknown")
-        #     provider = r.get("org", "Unknown")
-        #
-        #     status = f"🌍 GeoIP: IP={ip}, ASN={asn}, Country={country}, City={city}, Provider={provider}"
-        #
-        # except Exception as e:
-        #     status = f"❌ Ошибка GeoIP/ASN: {e}"
-        #
-        # self._log(status)
-        # THREAT_CONNECTOR.emit(module="NetworkChecker", target=self.domain,
-        #                       result={"check": "asn_geoip", "status": status})

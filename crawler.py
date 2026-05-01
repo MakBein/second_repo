@@ -9,7 +9,7 @@ import tempfile
 import subprocess
 from urllib.parse import urljoin, urlparse
 from hashlib import sha1
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Set, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -48,28 +48,19 @@ logger.setLevel(logging.INFO)
 
 
 def log_error(msg: str) -> None:
-    """
-    Append an error line to the crawler error log and emit logger.error.
-    Best-effort only: failures to write the file are logged but do not raise.
-    """
     try:
         logger.error(msg)
         if CRAWLER_ERROR_LOG:
+            os.makedirs(os.path.dirname(CRAWLER_ERROR_LOG) or "logs", exist_ok=True)
             with open(CRAWLER_ERROR_LOG, "a", encoding="utf-8") as f:
                 f.write(f"[{datetime.utcnow().isoformat()}] {msg}\n")
     except Exception:
         logger.exception("Failed to write to CRAWLER_ERROR_LOG")
 
-
-
 # ---------------------------------------------------------------------
 # Rate limiter
 # ---------------------------------------------------------------------
 def rate_limit() -> None:
-    """
-    Simple global rate limiter (process-wide). Uses seconds between requests = 1 / RATE_LIMIT.
-    Safe against RATE_LIMIT == 0 or None.
-    """
     global _last_request
     with _rate_lock:
         try:
@@ -78,7 +69,7 @@ def rate_limit() -> None:
             r = 1.0
         min_interval = 1.0 / max(r, 0.0001)
         now = time.time()
-        delta = now - _last_request
+        delta = max(0.0, now - _last_request)
         if delta < min_interval:
             time.sleep(min_interval - delta)
         _last_request = time.time()
@@ -225,32 +216,39 @@ def hash_url_no_query(u: str) -> str:
     return sha1(parsed.geturl().encode()).hexdigest()
 
 def normalize_scheme(url: str) -> str:
-    """
-    Ensure URL has a scheme. If missing, prepend https://.
-    Return full URL string (parsed.geturl()) to preserve normalization.
-    """
     if not url:
-        return url
+        return ""
     parsed = urlparse(url)
     if not parsed.scheme:
+        # якщо це вже щось типу //host/path
+        if url.startswith("//"):
+            return "https:" + url
         return "https://" + url.lstrip("/")
     return parsed.geturl()
 
 
 def is_same_domain(url: str, base_netloc: str) -> bool:
-    """
-    Check whether `url` belongs to the same domain as `base_netloc`.
-    Honors CRAWL_DOMAINS_WHITELIST if configured.
-    """
     try:
         parsed = urlparse(url)
-        netloc = parsed.netloc
+        netloc = parsed.netloc.lower()
         if not netloc:
             return False
+
+        base = (base_netloc or "").lower()
+        if not base:
+            return False
+
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        if base.startswith("www."):
+            base = base[4:]
+
         if CRAWL_DOMAINS_WHITELIST:
-            if netloc not in CRAWL_DOMAINS_WHITELIST and not any(netloc.endswith("." + d) for d in CRAWL_DOMAINS_WHITELIST):
+            wl = [d.lower() for d in CRAWL_DOMAINS_WHITELIST]
+            if netloc not in wl and not any(netloc.endswith("." + d) for d in wl):
                 return False
-        return netloc == base_netloc or netloc.endswith("." + base_netloc)
+
+        return netloc == base or netloc.endswith("." + base)
     except Exception:
         return False
 
@@ -258,7 +256,7 @@ def is_same_domain(url: str, base_netloc: str) -> bool:
 def is_real_link(href: str) -> bool:
     if not href:
         return False
-    href = href.strip()
+    href = href.strip().lower()
     if href.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
         return False
     return True
@@ -389,15 +387,40 @@ CREDIT_CARD_RE = re.compile(
 
 
 # ============================================================
-#  Sensitive Data Extraction
+#  Sensitive Data Extraction (Burp-style, safe & bounded)
 # ============================================================
 
+def _safe_trim_value(value: Any, max_len: int = 5000) -> str:
+    """Нормалізує значення до str, обрізає надто довгі, гарантує безпечний тип."""
+    try:
+        s = str(value)
+    except Exception:
+        s = repr(value)
+    s = s.strip()
+    if not s:
+        return ""
+    if len(s) > max_len:
+        return s[:max_len] + "…"
+    return s
+
+
+def _append_limited_unique(
+    bucket: List[str],
+    value: Any,
+    limit: int = MAX_MATCHES_PER_KEY,
+) -> None:
+    """Додає значення в список, якщо воно не пусте, ще не зустрічалось і не перевищено ліміт."""
+    if len(bucket) >= limit:
+        return
+    s = _safe_trim_value(value)
+    if not s:
+        return
+    if s in bucket:
+        return
+    bucket.append(s)
+
+
 def extract_sensitive_data(text: str) -> Dict[str, List[str]]:
-    """
-    Aggressive but bounded extraction of sensitive artifacts from `text`.
-    Preserves original logic while adding safety, limits and deduplication.
-    Returns a dict with lists for each category.
-    """
     data: Dict[str, List[str]] = {
         "emails": [],
         "phones": [],
@@ -423,19 +446,18 @@ def extract_sensitive_data(text: str) -> Dict[str, List[str]]:
     if not text:
         return data
 
-    def _append_limited(lst: List[str], value: str, limit: int = MAX_MATCHES_PER_KEY) -> None:
-        if value and len(lst) < limit:
-            lst.append(value)
+    if len(text) > 2_000_000:
+        text = text[:2_000_000]
 
     try:
         # Emails
         for m in EMAIL_RE.finditer(text):
-            _append_limited(data["emails"], m.group(0))
+            _append_limited_unique(data["emails"], m.group(0))
 
         # Phones
         for p in PHONE_RE_LIST:
             for m in p.finditer(text):
-                _append_limited(data["phones"], m.group(0))
+                _append_limited_unique(data["phones"], m.group(0))
                 if len(data["phones"]) >= MAX_MATCHES_PER_KEY:
                     break
             if len(data["phones"]) >= MAX_MATCHES_PER_KEY:
@@ -445,133 +467,97 @@ def extract_sensitive_data(text: str) -> Dict[str, List[str]]:
         for p in TOKEN_PATTERNS_COMPILED:
             for m in p.finditer(text):
                 token = m.group(1) if m.groups() else m.group(0)
-                _append_limited(data["tokens"], token)
+                _append_limited_unique(data["tokens"], token)
                 if len(data["tokens"]) >= MAX_MATCHES_PER_KEY:
                     break
             if len(data["tokens"]) >= MAX_MATCHES_PER_KEY:
                 break
 
-        # JWTs
+        # JWT
         for m in JWT_RE.finditer(text):
-            _append_limited(data["jwt_tokens"], m.group(0))
-            if len(data["jwt_tokens"]) >= MAX_MATCHES_PER_KEY:
-                break
+            _append_limited_unique(data["jwt_tokens"], m.group(0))
 
         # IPv4
         for m in IPV4_RE.finditer(text):
-            _append_limited(data["ipv4"], m.group(0))
-            _append_limited(data["ips"], m.group(0))
-            if len(data["ipv4"]) >= MAX_MATCHES_PER_KEY:
-                break
+            ip = m.group(0)
+            _append_limited_unique(data["ipv4"], ip)
+            _append_limited_unique(data["ips"], ip)
 
         # IPv6
         for m in IPV6_RE.finditer(text):
-            _append_limited(data["ipv6"], m.group(0))
-            if len(data["ipv6"]) >= MAX_MATCHES_PER_KEY:
-                break
+            _append_limited_unique(data["ipv6"], m.group(0))
 
         # MAC
         for m in MAC_RE.finditer(text):
-            _append_limited(data["mac"], m.group(0))
-            if len(data["mac"]) >= MAX_MATCHES_PER_KEY:
-                break
+            _append_limited_unique(data["mac"], m.group(0))
 
         # CIDR
         for m in CIDR_RE.finditer(text):
-            _append_limited(data["cidr"], m.group(0))
-            if len(data["cidr"]) >= MAX_MATCHES_PER_KEY:
-                break
+            _append_limited_unique(data["cidr"], m.group(0))
 
         # Hostnames
         for m in HOSTNAME_RE.finditer(text):
-            _append_limited(data["hostnames"], m.group(0))
-            if len(data["hostnames"]) >= MAX_MATCHES_PER_KEY:
-                break
+            _append_limited_unique(data["hostnames"], m.group(0))
 
         # Parameters
         for m in PARAM_RE.finditer(text):
-            _append_limited(data["parameters"], m.group(1))
-            if len(data["parameters"]) >= MAX_MATCHES_PER_KEY:
-                break
+            _append_limited_unique(data["parameters"], m.group(1))
 
-        # Base64-like strings
+        # Base64
         for m in BASE64_RE.finditer(text):
-            _append_limited(data["base64_strings"], m.group(0))
-            if len(data["base64_strings"]) >= MAX_MATCHES_PER_KEY:
-                break
+            _append_limited_unique(data["base64_strings"], m.group(0))
 
-        # UUIDs
+        # UUID
         for m in UUID_RE.finditer(text):
-            _append_limited(data["uuids"], m.group(0))
-            if len(data["uuids"]) >= MAX_MATCHES_PER_KEY:
-                break
+            _append_limited_unique(data["uuids"], m.group(0))
 
         # Hashes
         for p in HASH_PATTERNS:
             for m in p.finditer(text):
-                _append_limited(data["hashes"], m.group(0))
-                if len(data["hashes"]) >= MAX_MATCHES_PER_KEY:
-                    break
-            if len(data["hashes"]) >= MAX_MATCHES_PER_KEY:
-                break
+                _append_limited_unique(data["hashes"], m.group(0))
 
         # API keys
         for p in API_KEY_PATTERNS:
             for m in p.finditer(text):
                 key = m.group(1) if m.groups() else m.group(0)
-                _append_limited(data["api_keys"], key)
-                if len(data["api_keys"]) >= MAX_MATCHES_PER_KEY:
-                    break
-            if len(data["api_keys"]) >= MAX_MATCHES_PER_KEY:
-                break
+                _append_limited_unique(data["api_keys"], key)
 
-        # Credit cards (validate with Luhn)
-        raw_cards = [m.group(0) for m in CREDIT_CARD_RE.finditer(text)]
-        for card in raw_cards[:MAX_MATCHES_PER_KEY]:
-            digits = re.sub(r"\D", "", card)
+        # Credit cards
+        for m in CREDIT_CARD_RE.finditer(text):
+            raw = m.group(0)
+            digits = re.sub(r"\D", "", raw)
             if 13 <= len(digits) <= 19 and luhn_check(digits):
-                _append_limited(data["credit_cards"], digits)
+                _append_limited_unique(data["credit_cards"], digits)
 
         # SSN
         for m in SSN_RE.finditer(text):
-            _append_limited(data["ssn"], m.group(0))
-            if len(data["ssn"]) >= MAX_MATCHES_PER_KEY:
-                break
+            _append_limited_unique(data["ssn"], m.group(0))
 
-        # Password-like patterns (mask before storing)
+        # Passwords
         for p in PASSWORD_PATTERNS_COMPILED:
             for m in p.finditer(text):
                 pwd = m.group(1) if m.groups() else None
                 if pwd:
-                    _append_limited(data["passwords"], mask_secret(pwd, keep=2))
-                if len(data["passwords"]) >= MAX_MATCHES_PER_KEY:
-                    break
-            if len(data["passwords"]) >= MAX_MATCHES_PER_KEY:
-                break
+                    _append_limited_unique(data["passwords"], mask_secret(pwd, keep=2))
 
-        # Secrets (keys, PEM blocks)
+        # Secrets
         for p in SECRET_PATTERNS_COMPILED:
             for m in p.finditer(text):
-                if p.pattern.startswith("-----BEGIN"):
+                if "BEGIN" in p.pattern:
                     snippet = m.group(0)[:2000]
-                    _append_limited(data["secrets"], snippet)
+                    _append_limited_unique(data["secrets"], snippet)
                 else:
-                    secret_val = m.group(1) if m.groups() else m.group(0)
-                    _append_limited(data["secrets"], mask_secret(secret_val, keep=4))
-                if len(data["secrets"]) >= MAX_MATCHES_PER_KEY:
-                    break
-            if len(data["secrets"]) >= MAX_MATCHES_PER_KEY:
-                break
-
-
+                    val = m.group(1) if m.groups() else m.group(0)
+                    _append_limited_unique(data["secrets"], mask_secret(val, keep=4))
 
     except Exception as e:
-        data.setdefault("error", str(e))
-        # Deduplicate and trim each list
-    for key, val in list(data.items()):
-        if key == "error":
-            continue
-        data[key] = dedupe_preserve_order(safe_list(val))[:MAX_MATCHES_PER_KEY]
+        data["errors"] = [str(e)]
+
+    # Дедуплікація + обрізання
+    for key in data:
+        if isinstance(data[key], list):
+            data[key] = dedupe_preserve_order(data[key])[:MAX_MATCHES_PER_KEY]
+
     return data
 
 # ============================================================
@@ -938,22 +924,48 @@ def crawl_site(
         # ============================================================
 
         for form in soup.find_all("form"):
+
+            # --- normalize class attribute ---
+            cls = form.get("class")
+            if isinstance(cls, list):
+                form_classes = [str(c) for c in cls]
+            elif isinstance(cls, str):
+                form_classes = [cls]
+            else:
+                form_classes = []
+
             inputs = []
             for inp in form.find_all("input"):
+
+                # normalize input class
+                inp_cls = inp.get("class")
+                if isinstance(inp_cls, list):
+                    inp_classes = [str(c) for c in inp_cls]
+                elif isinstance(inp_cls, str):
+                    inp_classes = [inp_cls]
+                else:
+                    inp_classes = []
+
                 input_data = {
                     "name": inp.get("name"),
                     "type": inp.get("type", "text"),
                     "id": inp.get("id"),
-                    "class": inp.get("class", []),
+                    "class": inp_classes,
                     "placeholder": inp.get("placeholder"),
                     "value": (inp.get("value") or "")[:100],
                 }
+
                 if input_data["name"]:
                     inputs.append(input_data)
 
             textareas = [ta.get("name") for ta in form.find_all("textarea") if ta.get("name")]
             selects = [sel.get("name") for sel in form.find_all("select") if sel.get("name")]
-            handlers = {attr: form.attrs[attr] for attr in form.attrs if attr.startswith("on")}
+
+            handlers = {
+                attr: form.attrs[attr]
+                for attr in form.attrs
+                if attr.startswith("on")
+            }
 
             node["forms"].append({
                 "action": form.get("action", ""),
@@ -964,7 +976,7 @@ def crawl_site(
                 "selects": selects,
                 "js_events": handlers,
                 "id": form.get("id"),
-                "class": form.get("class", []),
+                "class": form_classes,
             })
 
         # ============================================================
@@ -1035,62 +1047,90 @@ def crawl_site(
         # 7) Посилання
         # ============================================================
 
-        hrefs = [a.get("href") for a in soup.find_all("a") if a.get("href")]
-        clean_links = []
+        hrefs = []
+        try:
+            hrefs = [a.get("href") for a in soup.find_all("a") if a.get("href")]
+        except Exception:
+            hrefs = []
 
+        clean_links = []
         for h in hrefs:
-            if not is_real_link(h):
+            try:
+                if not is_real_link(h):
+                    continue
+                candidate = h.split("#")[0].strip().strip('\'"')
+                if not candidate:
+                    continue
+                absolute = urljoin(safe_url, candidate)
+                parsed_cand = urlparse(absolute)
+                if parsed_cand.scheme not in ("http", "https"):
+                    continue
+                clean_links.append(absolute)
+            except Exception:
                 continue
-            candidate = h.split("#")[0].strip().strip('\'"')
-            if not candidate:
-                continue
-            absolute = urljoin(safe_url, candidate)
-            parsed_cand = urlparse(absolute)
-            if parsed_cand.scheme not in ("http", "https"):
-                continue
-            clean_links.append(absolute)
 
         unique_links = dedupe_preserve_order(clean_links)[:max_links]
-        node["links"] = unique_links
+        node["links"] = [str(x) for x in unique_links]
 
         # ============================================================
-        # 8) META
+        # 8) META (повністю безпечна версія)
         # ============================================================
 
+        safe_meta = []
         for meta in soup.find_all("meta"):
-            meta_data = {}
-            for attr in ("name", "property", "content", "http-equiv"):
-                v = meta.get(attr)
-                if v:
-                    meta_data[attr] = str(v)[:500]
-            if meta_data:
-                node["meta"].append(meta_data)
+            try:
+                meta_data = {}
+                for attr in ("name", "property", "content", "http-equiv"):
+                    v = meta.get(attr)
+                    if v:
+                        meta_data[attr] = str(v)[:500]
+                if meta_data:
+                    safe_meta.append(meta_data)
+            except Exception:
+                continue
+
+        node["meta"] = safe_meta
 
         # ============================================================
         # 9) Iframes
         # ============================================================
 
-        node["iframes"] = [
-            normalize_scheme(urljoin(safe_url, i.get("src")))
-            for i in soup.find_all("iframe")
-            if i.get("src")
-        ]
+        iframes = []
+        for i in soup.find_all("iframe"):
+            try:
+                src = i.get("src")
+                if src:
+                    iframes.append(normalize_scheme(urljoin(safe_url, src)))
+            except Exception:
+                continue
+
+        node["iframes"] = [str(x) for x in iframes]
 
         # ============================================================
         # 10) WebSockets
         # ============================================================
 
         ws_patterns = [
-            r"new\s+WebSocket\s*\(\s*['\"]([^'\"]+)['\"]",
-            r"(wss?://[^\s\"']+)",
+            re.compile(r"new\s+WebSocket\s*\(\s*['\"]([^'\"]+)['\"]", re.IGNORECASE),
+            re.compile(r"(wss?://[^\s\"']+)", re.IGNORECASE),
         ]
-        ws_matches = []
 
-        for pattern in ws_patterns:
-            for m in re.finditer(pattern, html, re.IGNORECASE):
-                ws = m.group(1) if m.groups() else m.group(0)
-                if ws:
-                    ws_matches.append(ws)
+        ws_matches: List[str] = []
+
+        for pat in ws_patterns:
+            try:
+                for m in pat.finditer(html or ""):
+                    # Якщо є групи – беремо першу, інакше весь матч
+                    if m.groups():
+                        ws = m.group(1)
+                    else:
+                        ws = m.group(0)
+                    ws = (ws or "").strip()
+                    if ws:
+                        ws_matches.append(ws)
+            except Exception:
+                # Не валимо весь crawl через один кривий патерн
+                continue
 
         node["websockets"] = dedupe_preserve_order(ws_matches)[:50]
 
@@ -1098,82 +1138,130 @@ def crawl_site(
         # 11) data-* атрибути
         # ============================================================
 
+        safe_data_attrs = []
         for tag in soup.find_all(True):
-            for attr, val in tag.attrs.items():
-                if attr.startswith("data-"):
-                    node["data_attributes"].append(
-                        f"{tag.name}.{attr}={str(val)[:100]}"
-                    )
+            try:
+                for attr, val in tag.attrs.items():
+                    if attr.startswith("data-"):
+                        safe_data_attrs.append(
+                            f"{tag.name}.{attr}={str(val)[:100]}"
+                        )
+            except Exception:
+                continue
+
+        node["data_attributes"] = safe_data_attrs[:200]
 
         # ============================================================
         # 12) Коментарі
         # ============================================================
 
         comments = []
-        for comment in soup.find_all(string=lambda t: isinstance(t, Comment)):
-            c = str(comment).strip()
-            if c:
-                comments.append(c[:500])
-                if len(comments) >= 50:
-                    break
+        try:
+            for comment in soup.find_all(string=lambda t: isinstance(t, Comment)):
+                c = str(comment).strip()
+                if c:
+                    comments.append(c[:500])
+                    if len(comments) >= 50:
+                        break
+        except Exception:
+            pass
+
         node["comments"] = comments
 
         # Sensitive data з коментарів
-        for c in node["comments"]:
-            _merge_sensitive_into_node(node, extract_sensitive_data(c))
+        for c in comments:
+            try:
+                _merge_sensitive_into_node(node, extract_sensitive_data(c))
+            except Exception:
+                continue
 
         # ============================================================
         # 13) Кнопки
         # ============================================================
 
+        safe_buttons = []
+
         for button in soup.find_all(["button", "input"]):
-            if button.get("type") == "button" or button.name == "button":
-                button_data = {
-                    "text": button.get_text(strip=True)[:50],
-                    "onclick": button.get("onclick", "")[:200],
-                    "id": button.get("id"),
-                    "class": button.get("class", []),
-                }
-                if button_data["onclick"] or button_data["id"] or button_data["class"]:
-                    node["buttons"].append(button_data)
+            try:
+                # Визначаємо, чи це кнопка
+                if button.get("type") == "button" or button.name == "button":
+
+                    # --- normalize class attribute ---
+                    cls = button.get("class")
+                    if isinstance(cls, list):
+                        btn_classes = [str(c) for c in cls]
+                    elif isinstance(cls, str):
+                        btn_classes = [cls]
+                    else:
+                        btn_classes = []
+
+                    safe_buttons.append({
+                        "text": button.get_text(strip=True)[:50],
+                        "onclick": str(button.get("onclick", ""))[:200],
+                        "id": button.get("id"),
+                        "class": btn_classes,
+                    })
+
+            except Exception:
+                continue
+
+        node["buttons"] = safe_buttons
 
         # ============================================================
         # 14) Select
         # ============================================================
 
+        safe_selects = []
         for select in soup.find_all("select"):
-            options = [
-                opt.get("value")
-                for opt in select.find_all("option")
-                if opt.get("value")
-            ]
-            if options:
-                node["selects"].append({
-                    "name": select.get("name"),
-                    "options": options[:20],
-                })
+            try:
+                options = [
+                    opt.get("value")
+                    for opt in select.find_all("option")
+                    if opt.get("value")
+                ]
+                if options:
+                    safe_selects.append({
+                        "name": select.get("name"),
+                        "options": [str(o) for o in options[:20]],
+                    })
+            except Exception:
+                continue
+
+        node["selects"] = safe_selects
 
         # ============================================================
         # 15) Textarea
         # ============================================================
 
+        safe_textareas = []
         for textarea in soup.find_all("textarea"):
-            node["textareas"].append({
-                "name": textarea.get("name"),
-                "placeholder": textarea.get("placeholder"),
-                "id": textarea.get("id"),
-            })
+            try:
+                safe_textareas.append({
+                    "name": textarea.get("name"),
+                    "placeholder": textarea.get("placeholder"),
+                    "id": textarea.get("id"),
+                })
+            except Exception:
+                continue
+
+        node["textareas"] = safe_textareas
 
         # ============================================================
         # 16) on* events
         # ============================================================
 
+        safe_events = []
         for tag in soup.find_all(True):
-            for attr in tag.attrs:
-                if attr.startswith("on"):
-                    node["events"].append(
-                        f"{tag.name}.{attr} → {str(tag.attrs[attr])[:200]}"
-                    )
+            try:
+                for attr in tag.attrs:
+                    if attr.startswith("on"):
+                        safe_events.append(
+                            f"{tag.name}.{attr} → {str(tag.attrs[attr])[:200]}"
+                        )
+            except Exception:
+                continue
+
+        node["events"] = safe_events[:200]
 
         # ============================================================
         # 17) Логи дерева та графа
@@ -1198,11 +1286,9 @@ def crawl_site(
         node["api_endpoints"] = dedupe_preserve_order(node["api_endpoints"])[:MAX_API_ENDPOINTS]
         _trim_node_list_fields(node)
 
-        # Запис у nodes_json
         with nodes_lock:
             nodes_json.append(node)
 
-        # ThreatIntel
         report_threatintel(node, gui_callback)
 
         # ============================================================
@@ -1281,19 +1367,59 @@ def crawl_site(
 
 
 def build_final_dict(nodes: List[Dict[str, Any]], max_items: int = 500) -> Dict[str, Any]:
-    try:
-        dedupe = globals().get("dedupe_preserve_order", None) or (lambda s: list(dict.fromkeys(s)))
-    except Exception:
-        dedupe = lambda s: list(dict.fromkeys(s))
+    """
+    Бойова версія build_final_dict():
+      • Гарантує правильні типи
+      • Нормалізує всі поля
+      • Маскує чутливі дані
+      • Не падає на кривих нодах
+      • Повертає чистий, JSON‑сумісний dict
+    """
+
+    # -----------------------------
+    # 0) Захисні утиліти
+    # -----------------------------
+    def _dedupe(seq):
+        try:
+            return list(dict.fromkeys(seq))
+        except Exception:
+            out = []
+            seen = set()
+            for x in seq:
+                sx = str(x)
+                if sx not in seen:
+                    seen.add(sx)
+                    out.append(x)
+            return out
+
+    def _safe_list(v):
+        return v if isinstance(v, (list, tuple)) else []
 
     def _safe_mask(s: str, keep: int = 4) -> str:
         try:
             return mask_secret(str(s), keep=keep)
         except Exception:
-            return "*" * min(len(str(s)), 8)
+            s = str(s)
+            return "*" * min(len(s), 8)
 
+    def _normalize_sensitive(v) -> List[str]:
+        """
+        Приводить чутливі поля до списку строк.
+        Підтримує:
+          - list/tuple
+          - dict {"count":..., "examples":[...]}
+        """
+        if isinstance(v, dict) and "examples" in v:
+            return [str(x) for x in v.get("examples", []) if x]
+        if isinstance(v, (list, tuple)):
+            return [str(x) for x in v if x]
+        return []
+
+    # -----------------------------
+    # 1) Якщо немає нод — повертаємо порожній шаблон
+    # -----------------------------
     if not nodes:
-        empty = {
+        return {
             "url": "",
             "forms": [],
             "scripts": [],
@@ -1330,13 +1456,18 @@ def build_final_dict(nodes: List[Dict[str, Any]], max_items: int = 500) -> Dict[
             "textareas": [],
             "error": None,
             "total_nodes": 0,
-            "merged_at": datetime.utcnow().isoformat(),
+            "merged_at": datetime.now(timezone.utc).isoformat(),
         }
-        return empty
 
-    root = nodes[0].copy()
+    # -----------------------------
+    # 2) Root — копія першої ноди, але нормалізована
+    # -----------------------------
+    root = dict(nodes[0]) if isinstance(nodes[0], dict) else {}
 
-    merge_list_fields = [
+    # -----------------------------
+    # 3) Поля, які треба зливати
+    # -----------------------------
+    merge_fields = [
         "forms", "scripts", "links", "meta", "iframes", "events",
         "api_endpoints", "emails", "phones", "tokens", "ips",
         "ipv6", "mac", "cidr", "hostnames", "comments",
@@ -1346,39 +1477,52 @@ def build_final_dict(nodes: List[Dict[str, Any]], max_items: int = 500) -> Dict[
         "data_attributes", "buttons", "selects", "textareas",
     ]
 
-    combined_map: Dict[str, List[Any]] = {f: [] for f in merge_list_fields}
-    for node in nodes:
-        for field in merge_list_fields:
-            val = node.get(field, [])
-            if isinstance(val, list):
-                combined_map[field].extend(val)
+    combined = {f: [] for f in merge_fields}
 
-    metas = combined_map.get("meta", [])
-    meta_seen = set()
+    # -----------------------------
+    # 4) Збір усіх значень
+    # -----------------------------
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        for f in merge_fields:
+            val = node.get(f)
+            if isinstance(val, (list, tuple)):
+                combined[f].extend(val)
+
+    # -----------------------------
+    # 5) META — унікальні dict
+    # -----------------------------
     merged_meta = []
-    for m in metas:
+    seen_meta = set()
+    for m in combined["meta"]:
         try:
             key = json.dumps(m, sort_keys=True, ensure_ascii=False)
         except Exception:
             key = str(m)
-        if key not in meta_seen:
-            meta_seen.add(key)
+        if key not in seen_meta:
+            seen_meta.add(key)
             merged_meta.append(m)
             if len(merged_meta) >= max_items:
                 break
     root["meta"] = merged_meta
 
-    ips = [
-        ip
-        for ip in combined_map.get("ips", [])
-        if isinstance(ip, str)
-        and re.match(
-            r"^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$",
-            ip,
-        )
-    ]
-    root["ips"] = dedupe(ips)[:max_items]
+    # -----------------------------
+    # 6) IPv4 — тільки валідні
+    # -----------------------------
+    ipv4_valid = []
+    ipv4_re = re.compile(
+        r"^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}"
+        r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$"
+    )
+    for ip in combined["ips"]:
+        if isinstance(ip, str) and ipv4_re.match(ip):
+            ipv4_valid.append(ip)
+    root["ips"] = _dedupe(ipv4_valid)[:max_items]
 
+    # -----------------------------
+    # 7) Простi спискові поля
+    # -----------------------------
     simple_fields = [
         "forms", "scripts", "links", "iframes", "events", "api_endpoints",
         "emails", "phones", "ipv6", "mac", "cidr", "hostnames",
@@ -1386,52 +1530,54 @@ def build_final_dict(nodes: List[Dict[str, Any]], max_items: int = 500) -> Dict[
         "credit_cards", "ssn", "cookies", "websockets", "data_attributes",
         "buttons", "selects", "textareas",
     ]
+
     for f in simple_fields:
-        vals = combined_map.get(f, [])
-        root[f] = dedupe(vals)[:max_items]
+        vals = combined.get(f, [])
+        root[f] = _dedupe(vals)[:max_items]
 
-    def _summarize_sensitive(items: List[Any], example_limit: int = 5):
+    # -----------------------------
+    # 8) Чутливі поля (уніфікований формат)
+    # -----------------------------
+    def _summarize(items: List[Any], keep: int) -> Dict[str, Any]:
         items = [str(i) for i in items if i]
-        items = dedupe(items)
-        count = len(items)
-        examples = [_safe_mask(it) for it in items[:example_limit]]
-        return {"count": count, "examples": examples}
+        items = _dedupe(items)
+        return {
+            "count": len(items),
+            "examples": [_safe_mask(x, keep=keep) for x in items[:5]],
+        }
 
-    root["tokens"] = _summarize_sensitive(combined_map.get("tokens", []))
-    root["api_keys"] = _summarize_sensitive(combined_map.get("api_keys", []))
-    root["jwt_tokens"] = _summarize_sensitive(combined_map.get("jwt_tokens", []))
+    root["tokens"] = _summarize(_normalize_sensitive(combined["tokens"]), keep=4)
+    root["api_keys"] = _summarize(_normalize_sensitive(combined["api_keys"]), keep=4)
+    root["jwt_tokens"] = _summarize(_normalize_sensitive(combined["jwt_tokens"]), keep=4)
+    root["passwords"] = _summarize(_normalize_sensitive(combined["passwords"]), keep=2)
+    root["secrets"] = _summarize(_normalize_sensitive(combined["secrets"]), keep=4)
 
-    root["passwords"] = {
-        "count": len(dedupe(combined_map.get("passwords", []))),
-        "examples": [_safe_mask(x, keep=2) for x in dedupe(combined_map.get("passwords", []))[:3]],
-    }
-    root["secrets"] = {
-        "count": len(dedupe(combined_map.get("secrets", []))),
-        "examples": [_safe_mask(x, keep=4) for x in dedupe(combined_map.get("secrets", []))[:3]],
-    }
-
-    expected_list_fields = [
+    # -----------------------------
+    # 9) Гарантуємо наявність усіх полів
+    # -----------------------------
+    expected = [
         "forms", "scripts", "links", "meta", "iframes", "events",
-        "api_endpoints", "emails", "phones", "tokens", "ips",
-        "ipv6", "mac", "cidr", "hostnames", "parameters",
-        "base64_strings", "uuids", "hashes", "api_keys", "jwt_tokens",
-        "credit_cards", "ssn", "passwords", "secrets", "cookies",
-        "websockets", "data_attributes", "comments", "buttons",
-        "selects", "textareas",
+        "api_endpoints", "emails", "phones", "ips", "ipv6", "mac",
+        "cidr", "hostnames", "parameters", "base64_strings", "uuids",
+        "hashes", "credit_cards", "ssn", "cookies", "websockets",
+        "data_attributes", "comments", "buttons", "selects", "textareas",
     ]
-    for field in expected_list_fields:
-        if field in ("tokens", "api_keys", "jwt_tokens", "passwords", "secrets"):
-            root.setdefault(field, {"count": 0, "examples": []})
-        else:
-            root.setdefault(field, [])
+    for f in expected:
+        root.setdefault(f, [])
 
     root.setdefault("headers", root.get("headers", {}))
     root.setdefault("url", root.get("url", ""))
     root.setdefault("error", None)
 
+    # -----------------------------
+    # 10) Фінальні метадані
+    # -----------------------------
     root["total_nodes"] = len(nodes)
-    root["merged_at"] = datetime.utcnow().isoformat()
+    root["merged_at"] = datetime.now(timezone.utc).isoformat(),
 
+    # -----------------------------
+    # 11) Обрізаємо надто великі списки
+    # -----------------------------
     for k, v in list(root.items()):
         if isinstance(v, list) and len(v) > max_items:
             root[k] = v[:max_items]
@@ -1439,209 +1585,344 @@ def build_final_dict(nodes: List[Dict[str, Any]], max_items: int = 500) -> Dict[
     return root
 
 # ============================================================
-#  Save Outputs (Tree, JSON, DOT, SVG, Summary)
+#  Save Outputs (Tree, JSON, DOT, SVG, Summary) — HARDENED
 # ============================================================
 
-def save_outputs(result: Dict[str, Any], gui_callback=None, max_nodes_save: int = 1000, max_items_per_field: int = 500) -> None:
+def save_outputs(
+    result: Dict[str, Any],
+    gui_callback=None,
+    max_nodes_save: int = 1000,
+    max_items_per_field: int = 500,
+) -> None:
+    """
+    Enterprise‑рівень збереження результатів:
+      • Повна нормалізація нод
+      • Маскування чутливих полів
+      • Захист від кривих структур
+      • Агрегований summary (Burp‑style)
+      • Повна сумісність з існуючим GUI
+    """
     logger = logging.getLogger("crawler.save_outputs")
     logger.setLevel(logging.INFO)
 
     os.makedirs("logs", exist_ok=True)
 
-    # 1) дерево
+    # ============================================================
+    # 1) Збереження дерева краулу
+    # ============================================================
     try:
+        tree_dir = os.path.dirname(LOG_CRAWL_STRUCTURE_PATH) or "."
+        os.makedirs(tree_dir, exist_ok=True)
+
         tmp = tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            delete=False,
-            dir=os.path.dirname(LOG_CRAWL_STRUCTURE_PATH) or ".",
-            prefix="tree_",
-            suffix=".tmp",
+            "w", encoding="utf-8", delete=False,
+            dir=tree_dir, prefix="tree_", suffix=".tmp"
         )
         try:
             tmp.write(f"--- Crawl Tree @ {datetime.now().isoformat()} ---\n")
-            tmp.writelines([line + "\n" for line in tree_log])
+            lines = globals().get("tree_log", [])
+            if isinstance(lines, (list, tuple)):
+                tmp.writelines([str(line) + "\n" for line in lines])
             tmp.flush()
         finally:
             tmp.close()
             os.replace(tmp.name, LOG_CRAWL_STRUCTURE_PATH)
+
         logger.info("Crawl tree saved to %s", LOG_CRAWL_STRUCTURE_PATH)
+
     except Exception as e:
         logger.exception("Failed to write crawl tree: %s", e)
 
-    # 2) JSON узлов
-    safe_nodes = []
-
+    # ============================================================
+    # 2) Витягуємо nodes_json / result
+    # ============================================================
     try:
         if isinstance(result, list):
-            nodes_to_save = result
+            nodes_raw = result
         elif isinstance(result, dict) and isinstance(result.get("nodes"), list):
-            nodes_to_save = result.get("nodes")
+            nodes_raw = result.get("nodes")
         else:
-            nodes_to_save = globals().get("nodes_json", []) or []
+            nodes_raw = globals().get("nodes_json", []) or []
     except Exception:
-        nodes_to_save = globals().get("nodes_json", []) or []
+        nodes_raw = globals().get("nodes_json", []) or []
 
-    nodes_to_save = list(nodes_to_save)[:max_nodes_save]
+    if not isinstance(nodes_raw, (list, tuple)):
+        nodes_raw = [nodes_raw]
+
+    nodes_raw = list(nodes_raw)[:max_nodes_save]
+
+    # ============================================================
+    # 2.1 Жорстка нормалізація — тільки dict
+    # ============================================================
+    clean_nodes: List[Dict[str, Any]] = []
+    for n in nodes_raw:
+        if isinstance(n, dict):
+            clean_nodes.append(n)
+        else:
+            logger.warning(f"Skipping invalid node in save_outputs: {type(n)} -> {n}")
+
+    if not clean_nodes:
+        clean_nodes = []
+
+    # ============================================================
+    # 2.2 Утиліти
+    # ============================================================
+    def _normalize_sensitive_list(v: Any) -> List[str]:
+        if isinstance(v, dict) and "examples" in v:
+            return [str(x) for x in v.get("examples", []) if x]
+        if isinstance(v, (list, tuple)):
+            return [str(x) for x in v if x]
+        return []
+
+    def _safe_mask(s: str, keep: int = 4) -> str:
+        try:
+            return mask_secret(str(s), keep=keep)
+        except Exception:
+            s = str(s)
+            return "*" * min(len(s), 8)
 
     def _mask_node_for_export(node: dict) -> dict:
-        n = {}
+        n: Dict[str, Any] = {}
         for k, v in node.items():
+
+            # Чутливі поля
             if k in ("tokens", "api_keys", "jwt_tokens"):
-                items = v if isinstance(v, (list, tuple)) else []
-                items = list(dict.fromkeys([str(x) for x in items]))[:max_items_per_field]
+                items = _normalize_sensitive_list(v)
+                items = list(dict.fromkeys(items))[:max_items_per_field]
                 n[k] = {
                     "count": len(items),
-                    "examples": [mask_secret(str(x), keep=4) for x in items[:5]],
+                    "examples": [_safe_mask(x, keep=4) for x in items[:5]],
                 }
+
             elif k in ("passwords", "secrets"):
-                items = v if isinstance(v, (list, tuple)) else []
-                items = list(dict.fromkeys([str(x) for x in items]))[:max_items_per_field]
+                items = _normalize_sensitive_list(v)
+                items = list(dict.fromkeys(items))[:max_items_per_field]
+                keep = 2 if k == "passwords" else 4
                 n[k] = {
                     "count": len(items),
-                    "examples": [mask_secret(str(x), keep=2) for x in items[:3]],
+                    "examples": [_safe_mask(x, keep=keep) for x in items[:3]],
                 }
+
+            # Списки
             elif isinstance(v, (list, tuple)):
-                n[k] = list(v)[:max_items_per_field]
+                try:
+                    n[k] = list(v)[:max_items_per_field]
+                except Exception:
+                    n[k] = []
+
+            # dict
             elif isinstance(v, dict):
-                n[k] = v.copy()
+                try:
+                    n[k] = v.copy()
+                except Exception:
+                    n[k] = {}
+
+            # Примітиви
             else:
                 n[k] = v
+
         return n
 
+    # ============================================================
+    # 3) Формуємо enterprise‑структуру
+    # ============================================================
+    safe_nodes: List[Dict[str, Any]] = []
+    host_counter: Dict[str, int] = {}
+    endpoint_counter: Dict[str, int] = {}
+    sensitive_total = 0
+
+    def _safe_url(u: Any) -> str:
+        try:
+            return str(u) if u is not None else ""
+        except Exception:
+            return ""
+
+    for node in clean_nodes:
+        masked = _mask_node_for_export(node)
+        safe_nodes.append(masked)
+
+        url = _safe_url(masked.get("url", ""))
+        try:
+            host = urlparse(url).netloc or ""
+        except Exception:
+            host = ""
+
+        if host:
+            host_counter[host] = host_counter.get(host, 0) + 1
+
+        # API endpoints
+        api_eps = masked.get("api_endpoints", [])
+        if isinstance(api_eps, dict) and "examples" in api_eps:
+            eps_list = api_eps.get("examples") or []
+        elif isinstance(api_eps, (list, tuple)):
+            eps_list = api_eps
+        else:
+            eps_list = []
+
+        for ep in eps_list:
+            ep_s = str(ep)
+            endpoint_counter[ep_s] = endpoint_counter.get(ep_s, 0) + 1
+
+        # Sensitive
+        for key in ("tokens", "api_keys", "jwt_tokens", "passwords", "secrets"):
+            val = masked.get(key)
+            if isinstance(val, dict):
+                sensitive_total += int(val.get("count", 0))
+
+    # Топ‑хости / ендпоінти
+    top_hosts = sorted(
+        [{"host": h, "pages": c} for h, c in host_counter.items()],
+        key=lambda x: x["pages"], reverse=True
+    )[:20]
+
+    top_endpoints = sorted(
+        [{"endpoint": e, "hits": c} for e, c in endpoint_counter.items()],
+        key=lambda x: x["hits"], reverse=True
+    )[:50]
+
+    enterprise_summary = {
+        "total_nodes": len(safe_nodes),
+        "total_hosts": len(host_counter),
+        "total_api_endpoints": len(endpoint_counter),
+        "total_sensitive_items": sensitive_total,
+        "top_hosts": top_hosts,
+        "top_api_endpoints": top_endpoints,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    enterprise_payload = {
+        "nodes": safe_nodes,
+        "summary": enterprise_summary,
+    }
+
+    # ============================================================
+    # 4) Збереження JSON
+    # ============================================================
     try:
-        safe_nodes = [_mask_node_for_export(n) if isinstance(n, dict) else n for n in nodes_to_save]
+        json_dir = os.path.dirname(JSON_CRAWL_EXPORT_PATH) or "."
+        os.makedirs(json_dir, exist_ok=True)
+
         tmp = tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            delete=False,
-            dir=os.path.dirname(JSON_CRAWL_EXPORT_PATH) or ".",
-            prefix="nodes_",
-            suffix=".tmp",
+            "w", encoding="utf-8", delete=False,
+            dir=json_dir, prefix="nodes_", suffix=".tmp"
         )
         try:
-            json.dump(safe_nodes, tmp, indent=2, ensure_ascii=False)
+            json.dump(enterprise_payload, tmp, indent=2, ensure_ascii=False)
             tmp.flush()
         finally:
             tmp.close()
             os.replace(tmp.name, JSON_CRAWL_EXPORT_PATH)
-        logger.info("Nodes JSON saved to %s (%d nodes)", JSON_CRAWL_EXPORT_PATH, len(safe_nodes))
-    except Exception as e:
-        logger.exception("Failed to write nodes JSON: %s", e)
 
-    # 3) DOT
-    def _safe_dot_pair(x):
+        logger.info(
+            "Enterprise JSON saved to %s (%d nodes, %d hosts, %d endpoints)",
+            JSON_CRAWL_EXPORT_PATH,
+            enterprise_summary["total_nodes"],
+            enterprise_summary["total_hosts"],
+            enterprise_summary["total_api_endpoints"],
+        )
+    except Exception as e:
+        logger.exception("Failed to write enterprise JSON: %s", e)
+
+    # ============================================================
+    # 5) DOT + SVG (без зміни логіки)
+    # ============================================================
+    def _safe_dot_pair(x: Any) -> str:
         try:
             s = str(x)
-            s = s.replace("\n", " ").replace("\r", " ").replace('"', '\\"')
-            return s
+            return s.replace("\n", " ").replace("\r", " ").replace('"', '\\"')
         except Exception:
             return ""
 
     try:
+        dot_dir = os.path.dirname(LOG_CRAWL_GRAPH_DOT) or "."
+        os.makedirs(dot_dir, exist_ok=True)
+
         tmp = tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            delete=False,
-            dir=os.path.dirname(LOG_CRAWL_GRAPH_DOT) or ".",
-            prefix="dot_",
-            suffix=".tmp",
+            "w", encoding="utf-8", delete=False,
+            dir=dot_dir, prefix="dot_", suffix=".tmp"
         )
         try:
             tmp.write("digraph Crawl {\n")
-            if isinstance(dot_edges, (list, tuple)):
-                for pair in dot_edges:
-                    try:
-                        frm, to = pair
-                        frm_safe = _safe_dot_pair(frm)
-                        to_safe = _safe_dot_pair(to)
-                        if frm_safe and to_safe:
-                            tmp.write(f'  "{frm_safe}" -> "{to_safe}";\n')
-                    except Exception:
-                        continue
+            edges = globals().get("dot_edges", [])
+            if isinstance(edges, (list, tuple)):
+                for frm, to in edges:
+                    frm_s = _safe_dot_pair(frm)
+                    to_s = _safe_dot_pair(to)
+                    if frm_s and to_s:
+                        tmp.write(f'  "{frm_s}" -> "{to_s}";\n')
             tmp.write("}\n")
             tmp.flush()
         finally:
             tmp.close()
             os.replace(tmp.name, LOG_CRAWL_GRAPH_DOT)
-        logger.info("DOT file written to %s", LOG_CRAWL_GRAPH_DOT)
+
     except Exception as e:
         logger.exception("Failed to write DOT file: %s", e)
 
-    # 4) SVG через Graphviz
+    # SVG
     try:
         import shutil
-        from graphviz import Source  # для совместимости
-
-        if shutil.which("dot") is None:
-            logger.warning("Graphviz 'dot' не найден. Пропускаем SVG-рендеринг.")
-        else:
+        if shutil.which("dot"):
             try:
                 svg_out = LOG_CRAWL_GRAPH_SVG + ".svg"
-                cmd = ["dot", "-Tsvg", LOG_CRAWL_GRAPH_DOT, "-o", svg_out]
-                subprocess.run(cmd, timeout=10, check=True)
-                logger.info("SVG generated: %s", svg_out)
-            except subprocess.TimeoutExpired:
-                logger.warning("Graphviz завис: превышен таймаут 10 секунд.")
-            except Exception as e:
-                logger.warning("Graphviz render failed: %s", e)
-    except Exception as e:
-        logger.debug("Graphviz import failed: %s", e)
+                subprocess.run(
+                    ["dot", "-Tsvg", LOG_CRAWL_GRAPH_DOT, "-o", svg_out],
+                    timeout=10, check=True
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
 
-    # 5) статистика
-    def safe_len(node: dict, key: str) -> int:
+    # ============================================================
+    # 6) Summary для GUI (повністю сумісний)
+    # ============================================================
+    if gui_callback:
         try:
-            v = node.get(key, [])
-        except Exception:
-            return 0
-        return len(v) if isinstance(v, (list, tuple, set)) else 0
+            gui_summary = []
+            for n in safe_nodes:
+                if not isinstance(n, dict):
+                    continue
 
-    def safe_url(u: object, maxlen: int = 200) -> str:
-        s = str(u) if u is not None else ""
-        s = s.replace("<", "").replace(">", "")
-        return s if len(s) <= maxlen else s[:maxlen] + "…"
+                def _safe_len(key: str) -> int:
+                    v = n.get(key, [])
+                    return len(v) if isinstance(v, (list, tuple, set)) else 0
 
-    nodes_list = safe_nodes if isinstance(safe_nodes, (list, tuple)) else list(safe_nodes or [])
-    total_sensitive = sum(
-        (n.get("tokens", {}).get("count", 0) if isinstance(n.get("tokens"), dict) else safe_len(n, "tokens"))
-        + (n.get("api_keys", {}).get("count", 0) if isinstance(n.get("api_keys"), dict) else safe_len(n, "api_keys"))
-        + (n.get("jwt_tokens", {}).get("count", 0) if isinstance(n.get("jwt_tokens"), dict) else safe_len(n, "jwt_tokens"))
-        for n in nodes_list
-    )
-    dot_count = len(dot_edges) if isinstance(dot_edges, (list, tuple)) else 0
-
-    logger.info("Saved %d nodes, %d edges, %d sensitive items", len(nodes_list), dot_count, total_sensitive)
-
-    # 6) сводка для GUI
-    if gui_callback and isinstance(nodes_list, (list, tuple)):
-        summary = []
-        for n in nodes_list:
-            if not isinstance(n, dict):
-                continue
-            try:
                 api_ep = n.get("api_endpoints")
                 api_ep_count = (
                     api_ep.get("count", 0)
                     if isinstance(api_ep, dict)
-                    else safe_len(n, "api_endpoints")
+                    else _safe_len("api_endpoints")
                 )
-                summary.append({
-                    "url": safe_url(n.get("url", "")),
-                    "forms": safe_len(n, "forms"),
-                    "scripts": safe_len(n, "scripts"),
-                    "api_endpoints": api_ep_count,
-                    "ipv6": safe_len(n, "ipv6"),
-                    "mac": safe_len(n, "mac"),
-                    "cidr": safe_len(n, "cidr"),
-                    "hostnames": safe_len(n, "hostnames"),
-                    "sensitive_data": (
-                        (n.get("tokens", {}).get("count", 0) if isinstance(n.get("tokens"), dict) else safe_len(n, "tokens"))
-                        + (n.get("api_keys", {}).get("count", 0) if isinstance(n.get("api_keys"), dict) else safe_len(n, "api_keys"))
-                    ),
-                })
-            except Exception:
-                continue
-        try:
-            gui_callback({"crawler": summary})
+
+                sens_count = 0
+                if isinstance(n.get("tokens"), dict):
+                    sens_count += n["tokens"].get("count", 0)
+                if isinstance(n.get("api_keys"), dict):
+                    sens_count += n["api_keys"].get("count", 0)
+
+                gui_summary.append(
+                    {
+                        "url": _safe_url(n.get("url", "")),
+                        "forms": _safe_len("forms"),
+                        "scripts": _safe_len("scripts"),
+                        "api_endpoints": api_ep_count,
+                        "ipv6": _safe_len("ipv6"),
+                        "mac": _safe_len("mac"),
+                        "cidr": _safe_len("cidr"),
+                        "hostnames": _safe_len("hostnames"),
+                        "sensitive_data": sens_count,
+                    }
+                )
+
+            gui_callback(
+                {
+                    "crawler": {
+                        "nodes": gui_summary,
+                        "summary": enterprise_summary,
+                    }
+                }
+            )
         except Exception as e:
             logger.exception("GUI callback failed: %s", e)
+

@@ -10,12 +10,17 @@ from datetime import datetime
 from urllib.parse import urlparse
 from queue import Empty
 
+from xss_security_gui.threat_analysis.sqli_worker import SQLiWorker
+from xss_security_gui.threat_analysis.sqli_module import SQLiTester
+
 from xss_security_gui import DIRS, settings
 from xss_security_gui.attack_engine import AttackEngine
 from xss_security_gui.mutator_task_manager import MutatorTaskManager
 from xss_security_gui.gui.mutator_tasks_panel import MutatorTasksPanel
 from xss_security_gui.mutation_queue import MUTATION_ATTACK_QUEUE
 from xss_security_gui.auto_modules.dom_and_endpoints import build_headers_list
+from xss_security_gui.auto_modules.module_families import MODULE_FAMILIES
+
 
 
 class AttackGUI(tk.Frame):
@@ -71,6 +76,9 @@ class AttackGUI(tk.Frame):
         self.tabs.pack(fill="both", expand=True)
 
         self.mutator_manager = MutatorTaskManager()
+
+        self.mutator_manager.on_task_added = self._on_task_added
+        self.mutator_manager.on_task_finished = self._on_mutator_task_finished
         self.mutator_panel = MutatorTasksPanel(self.tabs, self.mutator_manager)
         self.tabs.add(self.mutator_panel, text="Mutator Tasks")
 
@@ -83,13 +91,55 @@ class AttackGUI(tk.Frame):
             self.xss_tree.heading(col, text=col.capitalize())
         self.tabs.add(self.xss_tree, text="XSS Results")
 
+        # === SQLi Results ===
+        self.sqli_tree = ttk.Treeview(
+            self.tabs,
+            columns=("payload", "status", "code", "body_hit", "header_hit", "severity", "raw"),
+            show="headings"
+        )
+
+        columns = [
+            ("payload", "Payload", 300),
+            ("status", "Status", 120),
+            ("code", "HTTP Code", 80),
+            ("body_hit", "Body Hit", 80),
+            ("header_hit", "Header Hit", 80),
+            ("severity", "Severity", 80),
+            ("raw", "Raw Sample", 400),
+        ]
+
+        for col, text, width in columns:
+            self.sqli_tree.heading(col, text=text)
+            self.sqli_tree.column(col, width=width, anchor="w")
+
+        self.tabs.add(self.sqli_tree, text="SQLi Results")
+
         # === Состояние ===
         self.engine = AttackEngine(
             self.domain,
             threat_sender=self._send_to_threat_intel,
             log_func=self._log_proxy
         )
+
+        # === SQLi Tester створюється тут (ПЕРШИМ) ===
+        sqli_payloads = self._load_sqli_payloads()
+
+        self.sqli_tester = SQLiTester(
+            base_url=self.domain,
+            param="id",
+            base_value="1",
+            payloads=sqli_payloads,
+            output_callback=None
+        )
+
+        # === SQLi Worker створюється ТІЛЬКИ ПІСЛЯ тестера ===
+        self.sqli_worker = SQLiWorker(self.sqli_tester)
+
+        # === Mutator Worker ===
         self._start_mutation_worker()
+
+        # === Запускаємо читання черги SQLi Worker ===
+        self.after(50, self._poll_sqli_queue)
 
         self.crawl_json = {}
         self._attack_thread = None
@@ -129,6 +179,111 @@ class AttackGUI(tk.Frame):
             # добавьте другие ключи по необходимости, но не хардкодьте значения
         }
 
+    def _on_task_added(self, task_id, payload):
+        # Мутаторні задачі
+        if isinstance(payload, dict) and "family" in payload:
+            label = payload["payload"]
+        else:
+            # Модульні задачі
+            label = str(payload)
+
+        self.mutator_panel.add_task(task_id, label)
+
+    def _load_sqli_payloads(self):
+        path = r"C:\Users\sanch\PycharmProjects\itproger\xss_security_gui\payloads\sqli.json"
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)  # твій JSON з категоріями
+                return data
+        except Exception as e:
+            self._safe_call(self._log_proxy, f"❌ Не удалось загрузить SQLi payloads: {e}", "error")
+            return {"default": []}
+
+    def _poll_sqli_queue(self):
+        try:
+            while True:
+                event = self.sqli_worker.queue.get_nowait()
+                self._handle_sqli_event(event)
+        except Empty:
+            pass
+
+        self.after(50, self._poll_sqli_queue)
+
+    def _handle_sqli_event(self, event):
+        etype = event["type"]
+
+        if etype == "result":
+            self._safe_call(self._add_sqli_result, event)
+            self._safe_call(self._log_proxy, f"[SQLi] Результат получен для payload: {event.get('payload')}", "info")
+
+        elif etype == "error":
+            self._safe_call(self._log_proxy, f"[SQLi ERROR] {event['error']}", "error")
+
+        elif etype == "done":
+            self._safe_call(self._log_proxy, "SQLi тестирование завершено", "info")
+
+    def _on_mutator_task_finished(self, task_id, result):
+        payload = result.get("payload")
+
+        # Мутаторна задача
+        if isinstance(payload, dict) and "family" in payload:
+            label = payload["payload"]
+            status = result.get("status")
+            reflected = result.get("reflected")
+            length = result.get("length")
+
+            if reflected:
+                self.mutation_hits += 1
+
+            self._safe_call(
+                self._add_xss_result,
+                self.domain,
+                status,
+                reflected,
+                length,
+                label
+            )
+
+            self._safe_call(
+                self._log_proxy,
+                f"[Mutator DONE] {label} → {status}",
+                "info"
+            )
+
+        else:
+            # Модульна задача
+            module_name = payload
+            status = result.get("status", "done")
+            count = result.get("count", 0)
+            error = result.get("error")
+
+            if error:
+                final_status = f"🔴 Ошибка: {error}"
+            else:
+                final_status = f"🟢 Готово ({count} элементов)"
+
+            self.mutator_panel.update_task(task_id, final_status)
+
+    def _add_sqli_result(self, event):
+        payload = event.get("payload")
+        status = event.get("status", "-")
+        code = event.get("code", "-")
+        body_hit = event.get("body_hit", False)
+        header_hit = event.get("header_hit", False)
+        severity = event.get("severity", "info")
+        raw = event.get("raw", "")
+
+        # Обрізаємо raw, щоб не ламати GUI
+        if raw and len(raw) > 200:
+            raw = raw[:200] + "..."
+
+        self.sqli_tree.insert(
+            "",
+            "end",
+            values=(payload, status, code, body_hit, header_hit, severity, raw)
+        )
+
     def _start_mutation_worker(self):
         threading.Thread(target=self._mutation_worker, daemon=True).start()
 
@@ -161,18 +316,51 @@ class AttackGUI(tk.Frame):
             except Empty:
                 continue
             except Exception as e:
-                self._safe_call(self._log_proxy, f"❌ Ошибка очереди мутаций: {type(e).__name__}: {e}", "error")
+                self._safe_call(
+                    self._log_proxy,
+                    f"❌ Ошибка очереди мутаций: {type(e).__name__}: {e}",
+                    "error"
+                )
                 continue
 
+            # === ФИЛЬТР НЕ-XSS ЗАДАЧ ===
+            category = task.get("category", "").lower()
+            if "xss" not in category:
+                # НЕ вызываем submit → задача НЕ попадёт в MutatorTasksPanel
+                MUTATION_ATTACK_QUEUE.task_done()
+                continue
+
+            # === Только XSS задачи доходят сюда ===
             payload = task["payload"]
+            generated = task.get("generated", 1)
+            risk = task.get("risk", 1)
+            family = task.get("family", "generic")
+            tags = task.get("tags", [])
             url = getattr(self, "default_url", self.domain)
 
-            result = self.engine.attack_payload(url, payload)
+            tag_str = ", ".join(tags) if tags else "no-tags"
+            self._safe_call(
+                self._log_proxy,
+                f"[Mutator→Queue][prio={priority}] "
+                f"family={family} | risk={risk} | payload={payload} | tags=[{tag_str}]",
+                "info"
+            )
+
+            # === ТОЛЬКО ТЕПЕР submit() ===
+            task_id = self.mutator_manager.submit(
+                self.engine.attack_payload,
+                url,
+                payload,
+                payload={
+                    "payload": payload,
+                    "generated": generated,
+                    "risk": risk,
+                    "family": family,
+                    "tags": tags,
+                }
+            )
 
             self.mutation_count += 1
-            if result.get("reflected"):
-                self.mutation_hits += 1
-
             self._safe_call(
                 self.status_label.config,
                 text=f"Mutations: {self.mutation_count} | Hits: {self.mutation_hits}"
@@ -180,13 +368,8 @@ class AttackGUI(tk.Frame):
 
             self._safe_call(
                 self._log_proxy,
-                f"[Mutator→Attack][prio={priority}] {payload} → {result.get('status')}", "info"
-            )
-
-            self._safe_call(
-                self._add_xss_result,
-                url, result.get("status"), result.get("reflected"),
-                result.get("length"), payload
+                f"[Mutator→Attack] task_id={task_id} | risk={risk} | family={family} | payload={payload}",
+                "info"
             )
 
             MUTATION_ATTACK_QUEUE.task_done()
@@ -261,6 +444,9 @@ class AttackGUI(tk.Frame):
             self.crawl_json = {"visited": [self.domain]}
 
         self._stop_requested = False
+        # === Запуск SQLi Worker ===
+        self.sqli_worker.start()
+        self._safe_call(self._log_proxy, "🚀 SQLi Worker запущен в фоне", "info")
 
         modules = [
             "API Endpoints", "Token Brute Force", "Parameters Discovery", "User IDs Enumeration",
@@ -374,11 +560,22 @@ class AttackGUI(tk.Frame):
 
                     except Exception as e:
                         result = {"status": "error", "error": str(e)}
+                        if not isinstance(result, dict):
+                            result = {
+                                "status": "ok",
+                                "data": result
+                            }
                         self._safe_call(
                             self._log_proxy,
                             f"❌ Ошибка в модуле {name}: {type(e).__name__}: {e}",
                             "error"
                         )
+                    # === ДОБАВЛЯЕМ МЕТАДАННЫЕ СЕМЕЙСТВА ===
+                    module_meta = MODULE_FAMILIES.get(name, {})
+
+                    result["family"] = module_meta.get("family", "-")
+                    result["risk"] = module_meta.get("risk", "-")
+                    result["tags"] = module_meta.get("tags", [])
 
                     if isinstance(result, dict):
                         try:
@@ -402,6 +599,28 @@ class AttackGUI(tk.Frame):
                         "info"
                     )
 
+                    # === ЗАПУСК МОДУЛЯ ЧЕРЕЗ MUTATOR MANAGER ===
+                    self.mutator_manager.submit(
+                        handler,
+                        ctx,
+                        payload={
+                            "payload": name,
+                            "family": module_meta.get("family"),
+                            "risk": module_meta.get("risk"),
+                            "tags": module_meta.get("tags"),
+                            "generated": 0
+                        },
+                        task_type="module"
+                    )
+
+                    self._safe_call(
+                        self._log_proxy,
+                        f"[Mutator] Модуль отправлен в очередь: {name}",
+                        "info"
+                    )
+
+                    # Переходим к следующему модулю, не блокируя GUI
+                    self._safe_call(self._increment_progress)
                     time.sleep(0.2)
 
                 time.sleep(0.3)

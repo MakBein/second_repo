@@ -1,0 +1,43 @@
+{
+  "status": "ok",
+  "message": "Модель успішно натренована.",
+  "files_stats": {
+    "files_total": 70,
+    "files_skipped_size": 3,
+    "files_failed_read": 0,
+    "files_processed": 67
+  },
+  "num_samples_raw": 93404,
+  "num_classes": 2,
+  "metrics": {
+    "classification_report": {
+      "0": {
+        "precision": 0.995223621363439,
+        "recall": 0.9997818974918211,
+        "f1-score": 0.9974975519529975,
+        "support": 18340.0
+      },
+      "1": {
+        "precision": 0.9991881469454029,
+        "recall": 0.9824386350029934,
+        "f1-score": 0.9907426041457034,
+        "support": 5011.0
+      },
+      "accuracy": 0.9960601259046722,
+      "macro avg": {
+        "precision": 0.9972058841544209,
+        "recall": 0.9911102662474073,
+        "f1-score": 0.9941200780493504,
+        "support": 23351.0
+      },
+      "weighted avg": {
+        "precision": 0.9960743873987788,
+        "recall": 0.9960601259046722,
+        "f1-score": 0.996047976197683,
+        "support": 23351.0
+      }
+    }
+  },
+  "model_path": "C:\\Users\\sanch\\PycharmProjects\\itproger\\xss_security_gui\\ai_core\\model_store\\nn_model_trained.joblib",
+  "training_log_path": "C:\\Users\\sanch\\PycharmProjects\\itproger\\xss_security_gui\\ai_core\\model_store\\ai_training.log"
+}

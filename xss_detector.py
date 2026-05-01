@@ -14,6 +14,7 @@ from typing import Any, Union, Optional, List, Dict, Tuple, Set
 from bs4 import BeautifulSoup
 import re
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+from xss_security_gui.ai_core.synthetic_xss import generate_synthetic_xss
 
 
 # ======================
@@ -144,8 +145,18 @@ class XSSDetector:
     def extract_inline_js_blocks(self, html: str) -> List[str]:
         if not html:
             return []
-        soup = BeautifulSoup(html, "html.parser")
-        return [s.get_text(strip=True) for s in soup.find_all("script") if not s.get("src")]
+
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            scripts = soup.find_all("script")
+            return [
+                s.get_text(strip=True)
+                for s in scripts
+                if not s.get("src")  # тільки inline JS
+            ]
+        except Exception:
+            # HTML може бути пошкодженим — не валимо GUI
+            return []
 
     def scan_inline_js_for_payload(
         self,
@@ -157,7 +168,11 @@ class XSSDetector:
         if not payload or not html:
             return []
 
-        scripts = self.extract_inline_js_blocks(html)
+        try:
+            scripts = self.extract_inline_js_blocks(html)
+        except Exception:
+            return []
+
         hits: List[Tuple[str, str]] = []
 
         for code in scripts:
@@ -194,14 +209,22 @@ class XSSDetector:
         return "🧠 DOM-based" if any(ind in code_lower for ind in dom_indicators) else "📜 Reflected JS"
 
     def get_code_snippet(self, text: str, payload: str, window: int = 60) -> str:
+        """Повертає фрагмент коду навколо payload. Стійко до помилок."""
         if not payload or not text:
             return ""
-        index = text.find(payload)
-        if index == -1:
+
+        try:
+            index = text.find(payload)
+            if index == -1:
+                return ""
+
+            start = max(0, index - window)
+            end = index + len(payload) + window
+
+            snippet = text[start:end]
+            return snippet.replace("\n", " ").strip()
+        except Exception:
             return ""
-        start = max(0, index - window)
-        end = index + len(payload) + window
-        return text[start:end].replace("\n", " ").strip()
 
     # -------------------------------------------
     # GET URL builder
@@ -224,14 +247,22 @@ class XSSDetector:
     # XSS Fuzzing (GET + POST)
     # -------------------------------------------
     def fuzz_xss_parameters(
-        self,
-        base_url: str,
-        payload_data: Optional[Dict[str, Any]],
-        method: str,
-        xss_vectors: Optional[List[str]] = None,
+            self,
+            base_url: str,
+            payload_data: Optional[Dict[str, Any]],
+            method: str,
+            xss_vectors: Optional[List[str]] = None,
     ) -> List[Union[str, Dict[str, Any]]]:
 
-        vectors = xss_vectors or DEFAULT_XSS_VECTORS
+        # -----------------------
+        # Вибір payload‑ів
+        # -----------------------
+        if xss_vectors is not None:
+            vectors = xss_vectors
+        else:
+            # дефолтні + synthetic XSS
+            synthetic = generate_synthetic_xss(200)
+            vectors = DEFAULT_XSS_VECTORS + synthetic
 
         base_params: Dict[str, Any] = {
             k: [str(x) for x in v] if isinstance(v, (list, tuple)) else ("" if v is None else str(v))

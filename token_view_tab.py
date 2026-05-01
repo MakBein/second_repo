@@ -121,9 +121,9 @@ class TokenViewTab(ttk.Frame):
     # ============================================================
     def _ask_and_load_log(self) -> None:
         # Можно позже заменить на filedialog, сейчас — дефолтный путь
-        self.load_log("logs/token_risks.json")
+        self.load_log("logs/tokens/token_risks.json")
 
-    def load_log(self, report_path: str = "logs/token_risks.json") -> None:
+    def load_log(self, report_path: str = "logs/tokens/token_risks.json") -> None:
         try:
             if not os.path.exists(report_path):
                 raise FileNotFoundError(f"Файл не найден: {report_path}")
