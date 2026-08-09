@@ -1,0 +1,10 @@
+{
+  "status": "no_data",
+  "message": "Немає JS-коду в логах. Немає даних для тренування.",
+  "files_stats": {
+    "files_total": 1,
+    "files_skipped_size": 0,
+    "files_failed_read": 0,
+    "files_processed": 1
+  }
+}
