@@ -111,42 +111,42 @@ class AITrainingTab(ttk.Frame):
             on_error=lambda _task_id, err: self._on_training_error(err),
         )
 
-        def _on_test_model(self) -> None:
-            """Live-test trained model on a JS snippet (runs in background)."""
-            from tkinter import simpledialog
+    def _on_test_model(self) -> None:
+        """Live-test trained model on a JS snippet (runs in background)."""
+        from tkinter import simpledialog
 
-            raw_js = simpledialog.askstring("Test model", "Вставте JS-код для live-тесту:")
-            if not raw_js:
-                return
+        raw_js = simpledialog.askstring("Test model", "Вставте JS-код для live-тесту:")
+        if not raw_js:
+            return
 
-            self.status_label.config(text="Testing model…")
-            self.progress.start(10)
+        self.status_label.config(text="Testing model…")
+        self.progress.start(10)
 
-            import threading
+        import threading
 
-            def worker():
-                try:
-                    from xss_security_gui.js_inspector import extract_js_insights
-                    from xss_security_gui.ai_core.risk_engine import analyze_security_risk
+        def worker():
+            try:
+                from xss_security_gui.js_inspector import extract_js_insights
+                from xss_security_gui.ai_core.risk_engine import analyze_security_risk
 
-                    js_insights = extract_js_insights(raw_js)
-                    res = analyze_security_risk(js_insights, raw_js)
-                except Exception as e:
-                    res = {"error": str(e)}
+                js_insights = extract_js_insights(raw_js)
+                res = analyze_security_risk(js_insights, raw_js)
+            except Exception as e:
+                res = {"error": str(e)}
 
-                def on_done():
-                    self.progress.stop()
-                    self.status_label.config(text="Idle")
-                    if "error" in res:
-                        messagebox.showerror("Model Test", f"Error: {res['error']}")
-                        self._append_metrics_text(f"Test error: {res['error']}\n")
-                    else:
-                        pretty = json.dumps(res, ensure_ascii=False, indent=2)
-                        self._append_metrics_text("=== Live test result ===\n" + pretty + "\n")
+            def on_done():
+                self.progress.stop()
+                self.status_label.config(text="Idle")
+                if "error" in res:
+                    messagebox.showerror("Model Test", f"Error: {res['error']}")
+                    self._append_metrics_text(f"Test error: {res['error']}\n")
+                else:
+                    pretty = json.dumps(res, ensure_ascii=False, indent=2)
+                    self._append_metrics_text("=== Live test result ===\n" + pretty + "\n")
 
-                self._root.after(1, on_done)
+            self._root.after(1, on_done)
 
-            threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, daemon=True).start()
 
     def _on_training_error(self, e: Exception) -> None:
         self.progress.stop()
