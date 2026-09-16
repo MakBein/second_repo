@@ -1,23 +1,30 @@
 # xss_security_gui/threat_analysis/xss_module.py
-"""
-XSSTester (ULTRA Hybrid 6.5)
-----------------------------
-• Проверяет отражение XSS payload'ов
-• Определяет контекст (HTML, JS, Attribute, URL)
-• Работает через универсальный TesterBase
-"""
+# ============================================================
+# XSSTester 11.0 — context-aware, risk-aware, ThreatConnector-ready
+# ============================================================
 
+from __future__ import annotations
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Callable, Optional
 
 import requests
 
 from xss_security_gui.threat_analysis.tester_base import TesterBase
 from xss_security_gui.settings import settings
 
+XSSCallback = Callable[[Dict[str, Any]], None]
+
 
 class XSSTester(TesterBase):
-    """Модуль тестирования XSS-инъекций."""
+    """
+    XSSTester 11.0 — Combat Edition
+    -------------------------------
+    • ReflectionEngine 2.0 (точне визначення відображення payload)
+    • ContextEngine 3.0 (JS, HTML, Attribute, URL, Inline Events, Dangerous Sinks)
+    • SeverityEngine 11.0 (critical/high/medium/low/info)
+    • ThreatConnector-friendly артефакти
+    • Повна сумісність з TesterBase 11.0 (ретраї, троттлінг, stability-window)
+    """
 
     def __init__(
         self,
@@ -25,18 +32,22 @@ class XSSTester(TesterBase):
         param: str,
         base_value: str,
         payloads: List[str],
-        output_callback: Optional[callable] = None,
+        output_callback: Optional[XSSCallback] = None,
         timeout: Optional[int] = None,
         headers: Optional[Dict[str, str]] = None,
     ):
-        # Оборачиваем payloads в категорию "default"
-        super().__init__("XSS", base_url, param, base_value, {"default": payloads}, output_callback)
+        super().__init__(
+            "XSS",
+            base_url,
+            param,
+            base_value,
+            {"default": payloads},
+            output_callback
+        )
 
-        # Таймаут
         self.timeout: int = timeout or int(settings.get("http.request_timeout", 7))
 
-        # Заголовки
-        default_ua = settings.get("http.default_user_agent", "XSS-Security-GUI/6.5")
+        default_ua = settings.get("http.default_user_agent", "XSS-Security-GUI/11.0")
         base_headers = {"User-Agent": default_ua}
 
         if headers:
@@ -44,9 +55,9 @@ class XSSTester(TesterBase):
 
         self.headers: Dict[str, str] = base_headers
 
-    # ---------------------------------------------------------
-    # HTTP-запрос (контракт TesterBase.send_request)
-    # ---------------------------------------------------------
+    # ============================================================
+    # HTTP-запрос
+    # ============================================================
     def send_request(self, full_value: str):
         try:
             response = requests.get(
@@ -60,9 +71,9 @@ class XSSTester(TesterBase):
         except Exception as e:
             return {"status": "blocked", "reason": str(e)}
 
-    # ---------------------------------------------------------
-    # Анализ ответа (контракт TesterBase._analyze_response)
-    # ---------------------------------------------------------
+    # ============================================================
+    # Анализ ответа
+    # ============================================================
     def _analyze_response(
         self,
         text: str,
@@ -70,13 +81,10 @@ class XSSTester(TesterBase):
         response,
     ) -> Dict[str, Any]:
 
-        # === Проверка отражения ===
         reflected = self._is_reflected(text, response.request.url)
 
-        # === Контекст ===
         context_type, context_snippet = self._detect_context(text, reflected)
 
-        # === Оценка риска ===
         severity = self._assess_severity(reflected, context_type)
 
         return {
@@ -91,15 +99,18 @@ class XSSTester(TesterBase):
             "severity": severity,
         }
 
-    # ---------------------------------------------------------
-    # Вспомогательные методы
-    # ---------------------------------------------------------
+    # ============================================================
+    # ReflectionEngine 2.0
+    # ============================================================
     def _is_reflected(self, html: str, url: str) -> bool:
-        """Проверяет, отражён ли payload в HTML."""
-        return self.base_value.lower() in html.lower() or self.base_value.lower() in url.lower()
+        """Перевіряє, чи відображено payload у HTML або URL."""
+        p = self.base_value.lower()
+        return p in html.lower() or p in url.lower()
 
+    # ============================================================
+    # ContextEngine 3.0
+    # ============================================================
     def _detect_context(self, html: str, reflected: bool):
-        """Определяет контекст инъекции: HTML, JS, Attribute, URL."""
         if not reflected:
             return "Not Reflected", None
 
@@ -113,25 +124,48 @@ class XSSTester(TesterBase):
             end = min(len(html), index + len(p) + 80)
             snippet = html[start:end]
 
-        # Контекст
+        # JS Context
         if "<script" in lower and p in lower:
             return "JS Context", snippet
+
+        # Inline Event Handlers
+        if any(ev in lower for ev in ("onerror=", "onclick=", "onload=", "onmouseover=", "onfocus=", "onblur=")):
+            return "Inline Event Handler", snippet
+
+        # Dangerous JS sinks
+        if any(sink in lower for sink in ("eval(", "function(", "settimeout(", "setinterval(", "innerhtml", "outerhtml")):
+            return "Dangerous JS Sink", snippet
+
+        # Attribute Injection
         if f"=\"{p}\"" in lower or f"='{p}'" in lower:
             return "Attribute Injection", snippet
+
+        # HTML Body
         if f">{p}<" in lower:
             return "HTML Body", snippet
+
+        # URL Parameter
         if f"url={p}" in lower or f"href={p}" in lower:
             return "URL Parameter", snippet
 
         return "Unknown", snippet
 
+    # ============================================================
+    # SeverityEngine 11.0
+    # ============================================================
     @staticmethod
     def _assess_severity(reflected: bool, context_type: str) -> str:
-        """Оценка риска по факту отражения и контексту."""
         if not reflected:
             return "INFO"
-        if context_type in ("JS Context", "Attribute Injection"):
+
+        if context_type in ("JS Context", "Dangerous JS Sink"):
+            return "CRITICAL"
+
+        if context_type in ("Inline Event Handler", "Attribute Injection"):
             return "HIGH"
+
         if context_type in ("HTML Body", "URL Parameter"):
             return "MEDIUM"
+
         return "LOW"
+

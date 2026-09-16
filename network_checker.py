@@ -11,12 +11,15 @@ NetworkChecker ULTRA 7.0
 """
 
 import os
+import re
 import socket
 import ssl
 import subprocess
 import threading
 from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional
 import time
+from urllib.parse import urljoin, urlparse
 
 import requests
 from pythonping import ping
@@ -36,6 +39,96 @@ except ImportError:
 
 
 NETWORK_LOG_PATH = LOG_DIR / "network_checks.log"
+
+# Типичные HTTP-пути утечки pg_hba.conf (только read-only проверка)
+PG_HBA_PROBE_PATHS: List[str] = [
+    "/pg_hba.conf",
+    "/data/pg_hba.conf",
+    "/postgresql/data/pg_hba.conf",
+    "/var/lib/postgresql/data/pg_hba.conf",
+    "/PostgreSQL/data/pg_hba.conf",
+    "/backup/pg_hba.conf",
+    "/backups/pg_hba.conf",
+    "/config/pg_hba.conf",
+    "/pg_hba.conf.bak",
+    "/pg_hba.conf.old",
+    "/pg_hba.conf~",
+    "/.pg_hba.conf.swp",
+]
+
+PG_HBA_AUTH_METHODS = (
+    "scram-sha-256",
+    "md5",
+    "password",
+    "trust",
+    "reject",
+    "peer",
+    "ident",
+    "cert",
+    "gss",
+    "sspi",
+    "ldap",
+    "radius",
+)
+
+
+def _hostname_from_target(target: str) -> str:
+    target = target.strip()
+    if "://" in target:
+        host = urlparse(target).hostname
+        return host or target.split("/")[0]
+    return target.split("/")[0].split(":")[0]
+
+
+def _normalize_scan_base(domain: str) -> List[str]:
+    """Возвращает базовые URL для HTTP-проб (http + https)."""
+    domain = domain.strip().rstrip("/")
+    if domain.startswith(("http://", "https://")):
+        return [domain]
+    return [f"https://{domain}", f"http://{domain}"]
+
+
+def is_pg_hba_content(text: str) -> bool:
+    """Эвристика: похоже ли содержимое на pg_hba.conf."""
+    if not text or len(text) < 20:
+        return False
+    low = text.lower()
+    if "pg_hba" in low and any(k in low for k in ("host", "local", "hostssl")):
+        return True
+    return bool(re.search(r"^\s*(local|host|hostssl|hostnossl)\s+\S+", text, re.M | re.I))
+
+
+def audit_pg_hba_content(text: str) -> Dict[str, Any]:
+    """Read-only аудит методов аутентификации в pg_hba.conf."""
+    methods: Dict[str, int] = {}
+    rules: List[str] = []
+    warnings: List[str] = []
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if parts and parts[0].lower() in {"local", "host", "hostssl", "hostnossl"}:
+            rules.append(line[:240])
+            if len(parts) >= 2:
+                method = parts[-1].lower()
+                if method in PG_HBA_AUTH_METHODS or method.isalpha():
+                    methods[method] = methods.get(method, 0) + 1
+
+    if methods.get("trust"):
+        warnings.append("⚠️ Найден метод trust — подключение без пароля")
+    if methods.get("md5") and not methods.get("scram-sha-256"):
+        warnings.append("ℹ️ Используется устаревший md5 вместо scram-sha-256")
+    if not methods:
+        warnings.append("ℹ️ Строки HBA не распознаны — возможно частичная утечка")
+
+    return {
+        "rule_count": len(rules),
+        "auth_methods": methods,
+        "warnings": warnings,
+        "sample_rules": rules[:8],
+    }
 
 
 # Примитивный WAF-фингерпринт по заголовкам/баннерам
@@ -85,10 +178,17 @@ def measure_latency(url: str):
 
 
 class NetworkChecker:
-    def __init__(self, domain: str, gui_output=None):
+    def __init__(
+        self,
+        domain: str,
+        gui_output=None,
+        log_fn: Optional[Callable[[str], None]] = None,
+    ):
         self.domain = domain.strip()
         self.gui_output = gui_output
+        self.log_fn = log_fn
         self.user_agent = settings.get("crawl.user_agent", "Mozilla/5.0")
+        self.request_timeout = float(settings.get("http.default_timeout", 8))
 
     # ---------------------------------------------------------
     # Thread-safe log
@@ -102,6 +202,13 @@ class NetworkChecker:
                 f.write(line + "\n")
         except Exception:
             pass
+
+        if self.log_fn:
+            try:
+                self.log_fn(line)
+                return
+            except Exception:
+                pass
 
         if self.gui_output:
             try:
@@ -490,3 +597,102 @@ class NetworkChecker:
             target=self.domain,
             result={"check": "asn_geoip", "status": status},
         )
+
+    # ---------------------------------------------------------
+    # PostgreSQL pg_hba.conf — сетевой поиск (read-only)
+    # ---------------------------------------------------------
+    def check_pg_hba_exposure(self) -> Dict[str, Any]:
+        """
+        Ищет признаки pg_hba.conf:
+        - открытый порт PostgreSQL 5432
+        - HTTP-утечки конфигурации по типичным путям
+        - аудит методов аутентификации (без изменения файлов)
+        """
+        self._log(f"🔍 Поиск pg_hba.conf / PostgreSQL для {self.domain}")
+
+        report: Dict[str, Any] = {
+            "domain": self.domain,
+            "postgres_port_open": False,
+            "findings": [],
+            "auth_audit": [],
+        }
+
+        # 1) Порт 5432
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            host = _hostname_from_target(self.domain)
+            if sock.connect_ex((host, 5432)) == 0:
+                report["postgres_port_open"] = True
+                self._log("✅ Порт 5432 (PostgreSQL) открыт")
+            else:
+                self._log("ℹ️ Порт 5432 закрыт или фильтруется")
+            sock.close()
+        except Exception as e:
+            self._log(f"⚠️ Проверка порта 5432: {e}")
+
+        # 2) HTTP-пробы типичных путей
+        headers = {"User-Agent": self.user_agent}
+        paths = list(PG_HBA_PROBE_PATHS)
+        extra = settings.get("postgres.pg_hba_probe_paths", [])
+        if isinstance(extra, list):
+            paths.extend(str(p) for p in extra if p)
+
+        for base in _normalize_scan_base(self.domain):
+            for path in paths:
+                url = urljoin(base.rstrip("/") + "/", path.lstrip("/"))
+                try:
+                    r = requests.get(
+                        url,
+                        headers=headers,
+                        timeout=self.request_timeout,
+                        allow_redirects=False,
+                        verify=False,
+                    )
+                except Exception:
+                    continue
+
+                body = (r.text or "")[:50000]
+                if r.status_code not in (200, 403, 401) and not is_pg_hba_content(body):
+                    continue
+
+                if is_pg_hba_content(body) or (
+                    r.status_code == 200 and path.lower().endswith("pg_hba.conf") and len(body) > 40
+                ):
+                    audit = audit_pg_hba_content(body)
+                    finding = {
+                        "url": url,
+                        "status": r.status_code,
+                        "size": len(body),
+                        "audit": audit,
+                    }
+                    report["findings"].append(finding)
+                    report["auth_audit"].append(audit)
+
+                    self._log(f"🎯 Возможный pg_hba.conf: {url} (HTTP {r.status_code}, {len(body)} bytes)")
+                    if audit.get("auth_methods"):
+                        self._log(f"   Методы: {audit['auth_methods']}")
+                    for warn in audit.get("warnings", []):
+                        self._log(f"   {warn}")
+
+                    THREAT_CONNECTOR.emit(
+                        module="NetworkChecker",
+                        target=self.domain,
+                        result={
+                            "check": "pg_hba_exposure",
+                            "category": "postgres_config_leak",
+                            "severity": "critical" if audit.get("auth_methods", {}).get("trust") else "high",
+                            "url": url,
+                            "status_code": r.status_code,
+                            "auth_methods": audit.get("auth_methods", {}),
+                            "warnings": audit.get("warnings", []),
+                        },
+                    )
+
+        if not report["findings"]:
+            self._log("ℹ️ pg_hba.conf по HTTP не обнаружен (это нормально для корректно настроенных серверов)")
+        else:
+            self._log(f"📋 Итого находок pg_hba: {len(report['findings'])}")
+
+        self._log("✔️ Поиск pg_hba.conf завершён")
+        return report

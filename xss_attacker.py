@@ -7,7 +7,7 @@ import threading
 import time
 import random
 import html
-from typing import Callable, List, Optional, Any
+from typing import Callable, List, Optional
 
 from xss_security_gui.settings import settings
 from xss_security_gui.payloads import get_payloads
@@ -18,6 +18,7 @@ from xss_security_gui.utils.network import (
     default_accepts,
 )
 from xss_security_gui.threat_tab_connector import ThreatIntelConnector
+from xss_security_gui.utils.safe_call import safe_invoke
 from xss_security_gui.payload_mutator import mutate_async
 
 
@@ -188,8 +189,11 @@ class XSSAttacker:
     def _log(self, msg: str) -> None:
         if not self.on_log:
             return
+        # Use safe_invoke so that if on_log is a bound method of a Tk widget
+        # (e.g. Text.insert) it will be scheduled via widget.after and executed
+        # in the GUI thread.
         try:
-            self.on_log(msg)
+            safe_invoke(self.on_log, msg)
         except Exception:
-            # Логгер не должен ломать атаку
+            # Ensure logging never breaks the attacker loop
             pass

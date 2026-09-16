@@ -35,6 +35,11 @@ class XSSTab(ttk.Frame):
         self.payload_file = payload_file or os.path.join(base_dir, default_payload_file)
 
         self.payloads: Dict[str, List[str]] = self._load_payloads()
+
+        # === UIQueueBridge для фоновых операций ===
+        from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
+        self._bridge = UIQueueBridge(self, poll_ms=50)
+
         self._build_ui()
 
     # ---------------------------------------------------------
@@ -182,17 +187,21 @@ class XSSTab(ttk.Frame):
             self.payloads if category == "Всі категорії" else {category: self.payloads.get(category, [])}
         )
 
-        tester = XSSTester(
-            base_url=self.url,
-            param=param,
-            base_value=base_value,
-            payloads=selected_payloads,
-            output_callback=self._on_test_finish,
-        )
-        tester.start()
+        self._safe_log(f"🚀 Запущено XSS-тестування для {self.url} (param={param})\n")
         self.active_tests += 1
 
-        self._safe_log(f"🚀 Запущено XSS-тестування для {self.url} (param={param})\n")
+        # Запускаємо в фоне через UIQueueBridge
+        def worker():
+            tester = XSSTester(
+                base_url=self.url,
+                param=param,
+                base_value=base_value,
+                payloads=selected_payloads,
+                output_callback=self._on_test_finish,
+            )
+            tester.start()
+
+        self._bridge.post_bg(worker)
 
     # ---------------------------------------------------------
     # Loop mode

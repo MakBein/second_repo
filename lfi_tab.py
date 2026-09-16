@@ -8,6 +8,7 @@ import json
 
 from xss_security_gui.settings import settings
 from xss_security_gui.lfi_tester import test_lfi_payloads
+from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
 
 
 class LFITab(ttk.Frame):
@@ -22,6 +23,7 @@ class LFITab(ttk.Frame):
     def __init__(self, parent, threat_tab=None):
         super().__init__(parent)
         self.threat_tab = threat_tab
+        self._bridge = UIQueueBridge(self, poll_ms=50)
         self._build_ui()
 
     # ---------------------------------------------------------
@@ -65,7 +67,7 @@ class LFITab(ttk.Frame):
     # Thread-safe log
     # ---------------------------------------------------------
     def _safe_log(self, text: str) -> None:
-        self.after(0, lambda: self._append(text))
+        self._bridge.call_ui(self._append, text)
 
     def _append(self, text: str) -> None:
         self.output_box.insert("end", text)
@@ -88,10 +90,7 @@ class LFITab(ttk.Frame):
 
         self._safe_log(f"📂 Старт LFI-аналізу: {url} [param={param}]\n")
 
-        threading.Thread(
-            target=lambda: self._run_test(url, param),
-            daemon=True
-        ).start()
+        self._bridge.post_bg(self._run_test, url, param)
 
     # ---------------------------------------------------------
     # Run test logic
@@ -122,15 +121,18 @@ class LFITab(ttk.Frame):
 
             # Threat Intel integration
             if self.threat_tab:
-                self.threat_tab.add_threat({
-                    "type": "LFI",
-                    "url": full_url,
-                    "payload": payload,
-                    "status": status,
-                    "length": length,
-                    "suspicious": suspicious,
-                    "source": "LFI Scanner",
-                })
+                self._bridge.post_ui(
+                    self.threat_tab.add_threat,
+                    {
+                        "type": "LFI",
+                        "url": full_url,
+                        "payload": payload,
+                        "status": status,
+                        "length": length,
+                        "suspicious": suspicious,
+                        "source": "LFI Scanner",
+                    },
+                )
 
     # ---------------------------------------------------------
     # Clear output
@@ -150,3 +152,10 @@ class LFITab(ttk.Frame):
             self._safe_log(f"✅ Лог артефактів очищено: {artifact_path}\n")
         except Exception as e:
             self._safe_log(f"❌ Помилка очищення: {e}\n")
+
+    def destroy(self):
+        try:
+            self._bridge.stop()
+        except Exception:
+            pass
+        super().destroy()

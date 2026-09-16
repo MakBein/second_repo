@@ -1,470 +1,362 @@
-import os
+# xss_security_gui/auth/login_flow.py
+"""Combat-grade login flow for red-team style automation.
+
+This module executes a realistic login sequence with:
+- session restore
+- login URL discovery
+- AI-driven + DOM fallback login detection
+- credential rotation
+- multi-strategy form submission
+- AJAX / SPA / OAuth / PKCE detection
+- session persistence and structured success checks
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from xss_security_gui.auth.session_manager import load_session, save_session
+from xss_security_gui.auth.login_detectors import (
+    detect_login_form_ai,
+    detect_login_form_without_form,
+    detect_ajax_login,
+    detect_oauth,
+)
 
 
-# ============================
-#  PUBLIC API
-# ============================
+_DEFAULT_CREDENTIAL_SETS = [
+    ("admin", "admin123"),
+    ("admin", "password"),
+    ("admin", "Admin123!"),
+    ("admin", "Password1"),
+    ("user", "password"),
+    ("root", "toor"),
+    ("test", "test123"),
+    ("demo", "demo123"),
+    ("manager", "manager123"),
+]
 
-def perform_login(page, login_config: dict) -> None:
-    """
-    Высокоуровневый login-flow:
-    - пытается восстановить сессию
-    - переходит на login URL
-    - запускает AI‑детектор формы
-    - аккуратно заполняет и сабмитит
-    - не роняет GUI при любых ошибках
-    """
+
+def _safe_page_call(page: Any, fn_name: str, *args: Any, default: Any = None) -> Any:
     try:
-        # 0) Попытка восстановить сессию
+        return getattr(page, fn_name)(*args)
+    except Exception:
+        return default
+
+
+def _iter_credentials(login_config: Dict[str, Any]) -> List[Tuple[str, str]]:
+    pairs: List[Tuple[str, str]] = []
+
+    explicit = login_config.get("credentials")
+    if isinstance(explicit, list):
+        for item in explicit:
+            if isinstance(item, dict):
+                username = str(item.get("username") or "").strip()
+                password = str(item.get("password") or "").strip()
+                if username and password:
+                    pairs.append((username, password))
+            elif isinstance(item, (tuple, list)) and len(item) >= 2:
+                username, password = item[:2]
+                if username and password:
+                    pairs.append((str(username), str(password)))
+
+    username = str(login_config.get("username") or "").strip()
+    password = str(login_config.get("password") or "").strip()
+    if username and password:
+        pairs.append((username, password))
+
+    for user, pwd in _DEFAULT_CREDENTIAL_SETS:
+        if not any(existing[0] == user and existing[1] == pwd for existing in pairs):
+            pairs.append((user, pwd))
+
+    seen = set()
+    unique: List[Tuple[str, str]] = []
+    for user, pwd in pairs:
+        key = (user.lower(), pwd.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((user, pwd))
+    return unique
+
+
+def _candidate_login_urls(page: Any, login_config: Dict[str, Any]) -> List[str]:
+    urls: List[str] = []
+    seen = set()
+
+    for value in (
+        login_config.get("url"),
+        login_config.get("login_url"),
+        login_config.get("target_url"),
+        login_config.get("base_url"),
+        getattr(page, "url", None),
+    ):
+        if value and isinstance(value, str):
+            clean = value.strip()
+            if clean and clean not in seen:
+                urls.append(clean)
+                seen.add(clean)
+
+    try:
+        page_html = (page.content() or "")
+    except Exception:
+        page_html = ""
+
+    for pattern in (
+        r"https?://[^\s\"'<>]+(?:/login|/signin|/auth|/account|/portal)[^\s\"'<>]*",
+        r"(?:href|src|action)=[\"']([^\"']+(?:login|signin|auth|account)[^\"']*)[\"']",
+    ):
+        for match in re.findall(pattern, page_html, flags=re.IGNORECASE):
+            if match.startswith("/"):
+                base = getattr(page, "url", "") or login_config.get("base_url") or ""
+                if base:
+                    match = base.rstrip("/") + match
+            if match and match not in seen:
+                urls.append(match)
+                seen.add(match)
+
+    return urls
+
+
+def _is_successful_login(page: Any, login_url: str, original_url: str) -> bool:
+    try:
+        cookies = page.context.cookies() if hasattr(page, "context") else []
+        html = (page.content() or "").lower()
+        url = (page.url or "").lower()
+
+        markers = [
+            url != original_url.lower(),
+            any("session" in str(c.get("name", "")).lower() for c in cookies),
+            any(token in html for token in ["logout", "profile", "account", "dashboard", "welcome", "my account", "sign out"]),
+            "jwt" in html,
+            "bearer " in html,
+            "token" in html,
+            "auth" in url,
+        ]
+        return any(markers)
+    except Exception:
+        return False
+
+
+def _apply_credentials(page: Any, username_selector: Optional[str], password_selector: Optional[str], username: str, password: str) -> bool:
+    if username_selector:
         try:
-            if load_session(page.context):
-                print("[🔄] Сессия восстановлена — проверяю авторизацию...")
-                page.reload()
-                page.wait_for_timeout(1200)
+            if page.query_selector(username_selector):
+                page.fill(username_selector, username)
         except Exception:
             pass
 
-        login_url = login_config.get("url")
+    if not password_selector:
+        return False
+
+    try:
+        if page.query_selector(password_selector):
+            page.fill(password_selector, password)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _submit_form(page: Any, username_selector: Optional[str], password_selector: Optional[str], submit_selector: Optional[str]) -> bool:
+    actions = []
+    if submit_selector and submit_selector.strip():
+        actions.append(("selector", submit_selector))
+    actions.extend([
+        ("pass-enter", password_selector),
+        ("form-submit", "document.forms[0].submit();"),
+        ("fallback-click", "document.querySelector('input[type=\"submit\"]')?.click()"),
+        ("fallback-press", password_selector),
+    ])
+
+    for kind, value in actions:
+        try:
+            if kind == "selector":
+                if page.query_selector(value):
+                    page.click(value)
+                    return True
+            elif kind == "pass-enter":
+                if value and page.query_selector(value):
+                    page.press(value, "Enter")
+                    return True
+            elif kind == "form-submit":
+                page.evaluate(value)
+                return True
+            elif kind == "fallback-click":
+                page.evaluate(value)
+                return True
+            elif kind == "fallback-press":
+                if value and page.query_selector(value):
+                    page.press(value, "Tab")
+                    page.keyboard.press("Enter")
+                    return True
+        except Exception:
+            continue
+
+    return False
+
+
+def _build_login_summary(success: bool, login_url: str, tested_credentials: List[Tuple[str, str]], details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "success": success,
+        "login_url": login_url,
+        "tested_credentials": [{"username": u, "password": p} for u, p in tested_credentials],
+    }
+    if details:
+        payload.update(details)
+    return payload
+
+
+def perform_login(page, login_config: dict) -> Dict[str, Any]:
+    """Execute a realistic login flow for Playwright-powered pages.
+
+    Returns a structured dict with success status and diagnostics.
+    """
+    config = dict(login_config or {})
+    summary: Dict[str, Any] = {
+        "success": False,
+        "login_url": config.get("url") or config.get("login_url") or "",
+        "tested_credentials": [],
+        "details": {},
+    }
+
+    try:
+        if page is None:
+            summary["details"]["error"] = "page is missing"
+            return summary
+
+        try:
+            if load_session(page.context):
+                print("[🔄] Session restored — validating current auth state.")
+                page.reload()
+                page.wait_for_timeout(1200)
+                if _is_successful_login(page, config.get("url") or "", getattr(page, "url", "") or ""):
+                    save_session(page.context)
+                    summary["success"] = True
+                    summary["details"]["reason"] = "session_restored"
+                    return summary
+        except Exception:
+            print("[⚠️] Failed to restore session — continuing without it.")
+
+        login_candidates = _candidate_login_urls(page, config)
+        login_url = config.get("url") or config.get("login_url")
+        if not login_url and login_candidates:
+            login_url = login_candidates[0]
+
         if not login_url:
-            print("[ℹ️] Login URL отсутствует — пропускаю авторизацию.")
-            return
+            summary["details"]["error"] = "login URL not configured"
+            print("[ℹ️] Login URL absent — skipping login flow.")
+            return summary
 
-        # 1) Переход на страницу логина
-        page.goto(login_url, timeout=15000)
-        page.wait_for_timeout(800)
+        original_url = getattr(page, "url", "") or login_url
+        try:
+            page.goto(login_url, timeout=25000)
+            page.wait_for_timeout(1200)
+        except Exception as exc:
+            summary["details"]["error"] = f"goto failed: {exc}"
+            print(f"[⚠️] Failed to open login URL: {exc}")
+            return summary
 
-        # 2) AI‑детектор login‑форм
-        form_info = detect_login_form_ai(page)
+        form_info = detect_login_form_ai(page) or detect_login_form_without_form(page)
         if not form_info:
-            print("[ℹ️] Login‑форма не обнаружена — пропускаю авторизацию.")
-            return
-
-        print(f"[🤖] Выбрана login‑форма: {form_info}")
+            print("[ℹ️] Login form not auto-detected. Trying fallback selectors.")
+            form_info = {
+                "username": "input[name*='user' i], input[name*='login' i], input[type='email'], input[autocomplete='username']",
+                "password": "input[type='password'], input[name*='pass' i]",
+                "submit": "button[type='submit'], input[type='submit'], button:has-text('login'), button:has-text('sign in')",
+            }
 
         user_sel = form_info.get("username")
         pass_sel = form_info.get("password")
         submit_sel = form_info.get("submit")
 
         if not pass_sel:
-            print("[⚠️] Не удалось определить поле пароля — пропускаю авторизацию.")
-            return
+            summary["details"]["error"] = "password field not found"
+            print("[⚠️] Password field not found — aborting login flow.")
+            return summary
 
-        # 3) Заполнение полей
-        if user_sel and page.query_selector(user_sel):
-            page.fill(user_sel, login_config.get("username", "admin"))
-        else:
-            print("[⚠️] Поле username не найдено или не определено — продолжаю только с паролем.")
+        credential_pairs = _iter_credentials(config)
+        tested: List[Tuple[str, str]] = []
 
-        if pass_sel and page.query_selector(pass_sel):
-            page.fill(pass_sel, login_config.get("password", "admin123"))
-        else:
-            print("[⚠️] Поле пароля не найдено — прерываю авторизацию.")
-            return
+        for username, password in credential_pairs:
+            tested.append((username, password))
+            print(f"[🧪] Trying login attempt for user={username!r}")
 
-        # 4) Сабмит
-        if submit_sel and page.query_selector(submit_sel):
-            page.click(submit_sel)
-        else:
-            print("[ℹ️] Кнопка submit не найдена — пробую Enter по полю пароля.")
-            if pass_sel and page.query_selector(pass_sel):
-                page.press(pass_sel, "Enter")
-            else:
-                print("[⚠️] Невозможно выполнить Enter — прерываю авторизацию.")
-                return
-
-        # Снимки состояния для AJAX‑детектора
-        before_url = page.url
-        before_cookies = page.context.cookies()
-        before_dom = page.content()
-
-        page.wait_for_timeout(1500)
-
-        # 5) AJAX‑логин
-        if detect_ajax_login(page, before_url, before_cookies, before_dom):
-            print("[✔️] AJAX‑логин подтверждён")
-
-        # 6) OAuth / SSO
-        html = page.content().lower()
-        oauth = detect_oauth(html)
-        if oauth:
-            print(f"[ℹ️] Обнаружены OAuth/SSO провайдеры: {oauth}")
-
-        # 7) Проверка успешного входа
-        cookies = page.context.cookies()
-        success_checks = [
-            page.url != login_url,
-            any("session" in c["name"].lower() for c in cookies),
-            "logout" in html,
-            "profile" in html,
-            "account" in html,
-        ]
-
-        if any(success_checks):
-            print("[🔐] Авторизация успешна.")
-            save_session(page.context)
-        else:
-            print("[⚠️] Авторизация, вероятно, не удалась.")
-
-    except Exception as e:
-        print(f"[❌] Ошибка авторизации: {e}")
-
-
-# ============================
-#  AI‑DETECTOR LOGIN FORM
-# ============================
-
-def detect_login_form_ai(page) -> dict | None:
-    """
-    AI‑подобный детектор login‑форм:
-    - собирает все формы
-    - анализирует поля и подписи
-    - считает score для каждой формы
-    - выбирает лучшую
-    Возвращает:
-    {
-        "form_selector": str | None,
-        "username": str | None,
-        "password": str | None,
-        "submit": str | None,
-        "score": int
-    }
-    или None, если ничего похожего на login‑форму нет.
-    """
-
-    forms = page.query_selector_all("form")
-    html_lower = page.content().lower()
-
-    candidates: list[dict] = []
-
-    # Если форм нет — пробуем "форму без form" (SPA / дивы)
-    if not forms:
-        pseudo = detect_login_form_without_form(page)
-        return pseudo
-
-    for idx, form in enumerate(forms):
-        try:
-            form_html = (form.inner_html() or "").lower()
-        except Exception:
-            form_html = ""
-
-        # Базовый селектор формы
-        form_sel = form.evaluate("""
-            e => {
-                if (e.id) return "form#" + e.id;
-                if (e.name) return "form[name='" + e.name + "']";
-                return "form";
-            }
-        """)
-
-        inputs = form.query_selector_all("input, textarea")
-        buttons = form.query_selector_all("button, input[type='submit']")
-
-        username_fields = []
-        password_fields = []
-        submit_buttons = []
-
-        # --- Анализ input'ов ---
-        for inp in inputs:
             try:
-                t = (inp.get_attribute("type") or "").lower()
-                name = (inp.get_attribute("name") or "").lower()
-                ph = (inp.get_attribute("placeholder") or "").lower()
-                ac = (inp.get_attribute("autocomplete") or "").lower()
-            except Exception:
+                if user_sel:
+                    _safe_page_call(page, "fill", user_sel, username)
+                if not _apply_credentials(page, user_sel, pass_sel, username, password):
+                    print("[⚠️] Password field not writable — aborting attempt.")
+                    break
+
+                if not _submit_form(page, user_sel, pass_sel, submit_sel):
+                    print("[ℹ️] Submit by standard strategy failed — trying JS fallback.")
+                    try:
+                        page.evaluate("document.querySelectorAll('form').length && document.querySelectorAll('form')[0].submit();")
+                    except Exception:
+                        pass
+
+                page.wait_for_timeout(1600)
+
+                if _is_successful_login(page, login_url, original_url):
+                    print("[🔐] Login success confirmed.")
+                    save_session(page.context)
+                    summary["success"] = True
+                    summary["login_url"] = login_url
+                    summary["tested_credentials"] = [{"username": u, "password": p} for u, p in tested]
+                    summary["details"] = {
+                        "reason": "successful_login",
+                        "detected_form": form_info,
+                        "url_after_login": page.url,
+                    }
+                    return summary
+
+                try:
+                    if detect_ajax_login(page, original_url, page.context.cookies(), page.content()):
+                        print("[✔️] AJAX login flow detected.")
+                except Exception:
+                    pass
+
+                try:
+                    html = (page.content() or "").lower()
+                    oauth = detect_oauth(html)
+                    if oauth:
+                        print(f"[ℹ️] OAuth/SSO provider detected: {oauth}")
+                    if "code_challenge" in html or "code_verifier" in html:
+                        print("[ℹ️] PKCE flow detected.")
+                except Exception:
+                    pass
+
+                try:
+                    ls = page.evaluate("() => JSON.stringify(window.localStorage)") or ""
+                    ss = page.evaluate("() => JSON.stringify(window.sessionStorage)") or ""
+                    if "refresh" in (ls + ss).lower() or "token" in (ls + ss).lower():
+                        print("[ℹ️] Refresh-token or silent auth artifacts detected.")
+                except Exception:
+                    pass
+
+                try:
+                    page.reload()
+                    page.wait_for_timeout(800)
+                except Exception:
+                    pass
+
+            except Exception as exc:
+                print(f"[⚠️] Attempt failed for {username}: {exc}")
                 continue
 
-            sel = inp.evaluate("""
-                e => {
-                    if (e.id) return "#" + e.id;
-                    if (e.name) return "input[name='" + e.name + "']";
-                    return null;
-                }
-            """)
+        summary["tested_credentials"] = [{"username": u, "password": p} for u, p in tested]
+        summary["details"] = {
+            "reason": "login_not_confirmed",
+            "detected_form": form_info,
+            "page_url": getattr(page, "url", ""),
+        }
+        print("[⚠️] Login flow did not confirm successful authentication.")
+        return summary
 
-            if not sel:
-                continue
-
-            # Пароль
-            if t == "password":
-                password_fields.append(sel)
-
-            # Логин
-            score_u = 0
-            if t in ("text", "email"):
-                score_u += 2
-            if any(k in name for k in ["user", "login", "email", "account"]):
-                score_u += 3
-            if any(k in ph for k in ["user", "email", "логин", "аккаунт"]):
-                score_u += 3
-            if ac == "username":
-                score_u += 4
-
-            if score_u > 0:
-                username_fields.append((sel, score_u))
-
-        # --- Анализ кнопок ---
-        for b in buttons:
-            try:
-                text = (b.inner_text() or "").lower()
-                onclick = (b.get_attribute("onclick") or "").lower()
-            except Exception:
-                continue
-
-            sel = b.evaluate("""
-                e => {
-                    if (e.id) return "#" + e.id;
-                    if (e.name) return "button[name='" + e.name + "']";
-                    return e.tagName.toLowerCase();
-                }
-            """)
-
-            if not sel:
-                continue
-
-            score_s = 0
-            if any(k in text for k in ["login", "sign in", "войти", "авторизация"]):
-                score_s += 4
-            if any(k in onclick for k in ["login", "auth", "signin"]):
-                score_s += 3
-
-            if score_s > 0:
-                submit_buttons.append((sel, score_s))
-
-        # --- Подсчёт score формы ---
-        score = 0
-
-        # Наличие пароля — главный признак
-        if password_fields:
-            score += 10
-
-        # Наличие username‑поля
-        if username_fields:
-            score += 5
-
-        # Наличие submit‑кнопки
-        if submit_buttons:
-            score += 3
-
-        # Ключевые слова в HTML формы
-        if any(k in form_html for k in ["login", "signin", "вход", "авторизация"]):
-            score += 4
-
-        # Если нет пароля — это не login‑форма
-        if not password_fields:
-            continue
-
-        # Выбор лучших полей
-        username_sel = None
-        if username_fields:
-            username_sel = sorted(username_fields, key=lambda x: x[1], reverse=True)[0][0]
-
-        password_sel = password_fields[0]
-        submit_sel = None
-        if submit_buttons:
-            submit_sel = sorted(submit_buttons, key=lambda x: x[1], reverse=True)[0][0]
-
-        candidates.append({
-            "form_selector": form_sel,
-            "username": username_sel,
-            "password": password_sel,
-            "submit": submit_sel,
-            "score": score,
-        })
-
-    if not candidates:
-        # Попробуем fallback‑детектор без <form>
-        return detect_login_form_without_form(page)
-
-    best = sorted(candidates, key=lambda x: x["score"], reverse=True)[0]
-    if best["score"] < 10:
-        # Слишком слабый кандидат
-        return None
-
-    return best
-
-
-def detect_login_form_without_form(page) -> dict | None:
-    """
-    Fallback‑детектор для SPA / див‑форм без <form>.
-    Ищет password‑поле + логин + кнопку на всей странице.
-    """
-    html_lower = page.content().lower()
-
-    inputs = page.query_selector_all("input")
-    buttons = page.query_selector_all("button, input[type='submit']")
-
-    username_candidates: list[tuple[str, int]] = []
-    password_candidates: list[str] = []
-    submit_candidates: list[tuple[str, int]] = []
-
-    for inp in inputs:
-        try:
-            t = (inp.get_attribute("type") or "").lower()
-            name = (inp.get_attribute("name") or "").lower()
-            ph = (inp.get_attribute("placeholder") or "").lower()
-            ac = (inp.get_attribute("autocomplete") or "").lower()
-        except Exception:
-            continue
-
-        sel = inp.evaluate("""
-            e => {
-                if (e.id) return "#" + e.id;
-                if (e.name) return "input[name='" + e.name + "']";
-                return null;
-            }
-        """)
-
-        if not sel:
-            continue
-
-        if t == "password":
-            password_candidates.append(sel)
-
-        score_u = 0
-        if t in ("text", "email"):
-            score_u += 2
-        if any(k in name for k in ["user", "login", "email", "account"]):
-            score_u += 3
-        if any(k in ph for k in ["user", "email", "логин", "аккаунт"]):
-            score_u += 3
-        if ac == "username":
-            score_u += 4
-
-        if score_u > 0:
-            username_candidates.append((sel, score_u))
-
-    for b in buttons:
-        try:
-            text = (b.inner_text() or "").lower()
-            onclick = (b.get_attribute("onclick") or "").lower()
-        except Exception:
-            continue
-
-        sel = b.evaluate("""
-            e => {
-                if (e.id) return "#" + e.id;
-                if (e.name) return "button[name='" + e.name + "']";
-                return e.tagName.toLowerCase();
-            }
-        """)
-
-        if not sel:
-            continue
-
-        score_s = 0
-        if any(k in text for k in ["login", "sign in", "войти", "авторизация"]):
-            score_s += 4
-        if any(k in onclick for k in ["login", "auth", "signin"]):
-            score_s += 3
-
-        if score_s > 0:
-            submit_candidates.append((sel, score_s))
-
-    if not password_candidates:
-        return None
-
-    username_sel = None
-    if username_candidates:
-        username_sel = sorted(username_candidates, key=lambda x: x[1], reverse=True)[0][0]
-
-    submit_sel = None
-    if submit_candidates:
-        submit_sel = sorted(submit_candidates, key=lambda x: x[1], reverse=True)[0][0]
-
-    score = 10
-    if username_sel:
-        score += 5
-    if submit_sel:
-        score += 3
-    if any(k in html_lower for k in ["login", "signin", "вход", "авторизация"]):
-        score += 4
-
-    return {
-        "form_selector": None,
-        "username": username_sel,
-        "password": password_candidates[0],
-        "submit": submit_sel,
-        "score": score,
-    }
-
-
-# ============================
-#  AJAX Login Detector
-# ============================
-
-def detect_ajax_login(page, before_url=None, before_cookies=None, before_dom=None) -> bool:
-    after_url = page.url
-    after_cookies = page.context.cookies()
-    after_dom = page.content()
-
-    url_static = (before_url == after_url)
-
-    new_session = False
-    if before_cookies:
-        before_names = {c["name"] for c in before_cookies}
-        after_names = {c["name"] for c in after_cookies}
-        diff = after_names - before_names
-        new_session = any("session" in n.lower() for n in diff)
-
-    dom_changed = before_dom != after_dom if before_dom else False
-
-    ls = page.evaluate("Object.keys(localStorage)")
-    ss = page.evaluate("Object.keys(sessionStorage)")
-    storage_tokens = any(k.lower() in ["token", "auth", "jwt"] for k in ls + ss)
-
-    xhr_detected = "fetch(" in after_dom or "xhr" in after_dom
-
-    return url_static and (new_session or dom_changed or storage_tokens or xhr_detected)
-
-
-# ============================
-#  OAuth / SSO Detector
-# ============================
-
-def detect_oauth(html: str):
-    html = html.lower()
-
-    providers = {
-        "Google OAuth": ["accounts.google.com", "oauth2", "google-signin"],
-        "Facebook Login": ["facebook.com/login", "fb-login"],
-        "GitHub OAuth": ["github.com/login/oauth"],
-        "Microsoft OAuth": ["login.microsoftonline.com", "azuread"],
-        "Okta": ["okta.com", "okta"],
-        "Auth0": ["auth0.com", "auth0"],
-        "Apple OAuth": ["appleid.apple.com/auth"],
-        "GitLab OAuth": ["gitlab.com/oauth"],
-        "Yandex OAuth": ["oauth.yandex.ru"],
-        "Keycloak": ["/auth/realms/", "keycloak"],
-        "OpenID Connect": ["openid-connect", "/.well-known/openid"],
-        "SAML": ["saml/login", "samlp", "saml2"],
-    }
-
-    detected = [name for name, signs in providers.items() if any(s in html for s in signs)]
-    return detected or None
-
-
-# ============================
-#  Session Load / Save
-# ============================
-
-def save_session(context):
-    try:
-        storage = context.storage_state()
-        with open("session.json", "w", encoding="utf-8") as f:
-            f.write(storage)
-        print("[💾] Сессия сохранена.")
-    except Exception as e:
-        print(f"[❌] Ошибка сохранения сессии: {e}")
-
-
-def load_session(context) -> bool:
-    try:
-        if not os.path.exists("session.json"):
-            return False
-        with open("session.json", "r", encoding="utf-8") as f:
-            context.add_cookies([])
-            context.set_storage_state(f.read())
-        print("[🔄] Сессия загружена.")
-        return True
-    except Exception:
-        return False
+    except Exception as exc:
+        summary["details"] = {"error": f"login_flow crash: {exc}"}
+        print(f"[❌] Error in login_flow: {exc}")
+        return summary

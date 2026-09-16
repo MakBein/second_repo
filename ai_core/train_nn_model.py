@@ -41,7 +41,7 @@ LOGS_DIR = Path(LOG_DIR)
 TRAINING_REPORT_PATH = AI_MODEL_PATH.parent / "training_report.json"
 TRAINING_LOG_PATH = AI_MODEL_PATH.parent / "ai_training.log"
 
-MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024   # 50 MB
+MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024   # 500 MB
 
 
 # ============================================================
@@ -119,7 +119,7 @@ def setup_logger() -> logging.Logger:
     # -----------------------------
     fh = RotatingFileHandler(
         TRAINING_LOG_PATH,
-        maxBytes=5 * 1024 * 1024,   # 5 MB
+        maxBytes=500 * 1024 * 1024,   # 500 MB
         backupCount=5,
         encoding="utf-8"
     )

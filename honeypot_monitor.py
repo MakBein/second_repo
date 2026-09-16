@@ -92,13 +92,25 @@ def _append_json_log(event: Dict[str, Any]) -> None:
 
 
 def _insert(target, text: str) -> None:
+    from xss_security_gui.utils.safe_call import safe_invoke
+
     try:
         if hasattr(target, "output_box"):
-            target.output_box.insert("end", text)
-            target.output_box.see("end")
+            # target.output_box.insert is usually a bound Text.insert; safe_invoke will
+            # schedule via owner.after if available
+            safe_invoke(target.output_box.insert, "end", text)
+            # also try to scroll to end in GUI thread
+            try:
+                safe_invoke(target.output_box.see, "end")
+            except Exception:
+                pass
         else:
-            target.insert("end", text)
-            target.see("end")
+            # target may be a Text widget or similar — use safe_invoke
+            safe_invoke(target.insert, "end", text)
+            try:
+                safe_invoke(target.see, "end")
+            except Exception:
+                pass
     except Exception as err:
         print(f"[HoneypotULTRA] insert error: {err}")
 

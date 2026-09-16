@@ -24,7 +24,7 @@ from xss_security_gui.payloads import PAYLOADS
 from xss_security_gui.settings import LOG_SUCCESS_PATH, MAX_REPORT_LINE_LENGTH
 from xss_security_gui.attack_engine import AttackEngine
 from xss_security_gui.dom_parser import DOMParser
-from xss_security_gui.crawler import crawl_site, save_outputs
+from xss_security_gui.crawler import run_crawl_in_background, save_outputs
 
 from fpdf import FPDF
 from fpdf import __version__ as fpdf_version
@@ -439,6 +439,16 @@ class XSSAnalyzerApp(ttk.Frame, ThreatSenderMixin):
                         self.update_from_crawler(data)
                     except Exception as e:
                         self._handle_error("update_from_crawler", e)
+                elif task_id == "crawler_status":
+                    self.update_status(str(data))
+                elif task_id == "crawler_log":
+                    if isinstance(data, tuple) and len(data) == 2:
+                        text, level = data
+                    else:
+                        text, level = data, "info"
+                    self.log_output(str(text), level=str(level))
+                elif task_id == "crawler_summary":
+                    self.send_to_threat_intel("crawler_summary", data)
                 self.data_queue.task_done()
         except Exception as e:
             self._handle_error("обработки очереди", e)
@@ -505,7 +515,7 @@ class XSSAnalyzerApp(ttk.Frame, ThreatSenderMixin):
     # ========================================================
 
     def run_crawler(self) -> None:
-        """Запуск краулера в отдельном потоке"""
+        """Run the crawler in a background thread without blocking Tkinter."""
         domain = self.input_entry.get().strip()
         if not domain:
             self.log_output("⚠️ Укажите домен или URL для краулинга.", level="warn")
@@ -521,14 +531,12 @@ class XSSAnalyzerApp(ttk.Frame, ThreatSenderMixin):
         def gui_callback(payload: Dict[str, Any]) -> None:
             self.data_queue.put(("crawler", payload))
 
-        def worker() -> None:
+        def on_result(result: Dict[str, Any]) -> None:
             try:
-                result = crawl_site(domain, depth=0, gui_callback=gui_callback, parallel=True)
                 if not isinstance(result, dict):
-                    self.after(0, lambda: self.log_output("❌ Краулер вернул неожиданный формат данных.", level="error"))
+                    self.data_queue.put(("crawler_log", ("❌ Краулер вернул неожиданный формат данных.", "error")))
                     return
 
-                save_outputs(result)
                 self.crawled_scripts = result.get("scripts", [])
                 self.crawled_domain = domain
                 self.full_data = result
@@ -542,21 +550,33 @@ class XSSAnalyzerApp(ttk.Frame, ThreatSenderMixin):
                     "events": len(result.get("events", [])),
                     "sensitive": result.get("sensitive_count", 0),
                 }
-                self.send_to_threat_intel("crawler_summary", summary)
-                self.after(0, lambda: self.update_status("✔️ Краулинг завершён."))
-
-            except requests.Timeout:
-                logger.exception("Таймаут краулера")
-                self.after(0, lambda: self.log_output("❌ Таймаут краулера", level="error"))
-                self.after(0, lambda: self.update_status("⚠️ Ошибка при краулинге."))
+                self.data_queue.put(("crawler_summary", summary))
+                self.data_queue.put(("crawler_status", "✔️ Краулинг завершён."))
             except Exception as e:
-                logger.exception("Ошибка краулера")
-                self.after(0, lambda: self.log_output(f"❌ Ошибка краулера: {e}", level="error"))
-                self.after(0, lambda: self.update_status("⚠️ Ошибка при краулинге."))
+                logger.exception("Ошибка пост-обработки краулера")
+                self.data_queue.put(("crawler_log", (f"❌ Ошибка пост-обработки краулера: {e}", "error")))
             finally:
                 self._crawler_running = False
 
-        self._run_in_thread("CrawlerThread", worker)
+        def on_error(exc: Exception) -> None:
+            if isinstance(exc, requests.Timeout):
+                logger.exception("Таймаут краулера")
+                self.data_queue.put(("crawler_log", ("❌ Таймаут краулера", "error")))
+                self.data_queue.put(("crawler_status", "⚠️ Ошибка при краулинге."))
+            else:
+                logger.exception("Ошибка краулера")
+                self.data_queue.put(("crawler_log", (f"❌ Ошибка краулера: {exc}", "error")))
+                self.data_queue.put(("crawler_status", "⚠️ Ошибка при краулинге."))
+            self._crawler_running = False
+
+        run_crawl_in_background(
+            domain,
+            depth=0,
+            gui_callback=gui_callback,
+            parallel=True,
+            on_result=on_result,
+            on_error=on_error,
+        )
 
     # ========================================================
     #  Вставка payload'ов

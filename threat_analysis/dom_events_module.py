@@ -1,22 +1,31 @@
 # xss_security_gui/threat_analysis/dom_events_module.py
 """
-DOMEventMapper (ULTRA Hybrid 6.5)
----------------------------------
-• Анализирует JavaScript-код на наличие DOM-событий
-• Определяет опасные DOM-синки (innerHTML, eval, write, insertAdjacentHTML)
-• Строит карту событий → потенциальных уязвимостей
-• Возвращает унифицированный Threat Intel-friendly результат
+DOMEventMapper 11.0 — Combat Edition
+====================================
+• Розширений аналіз DOM‑подій у JS
+• Виявлення небезпечних DOM‑синків (innerHTML, eval, write, insertAdjacentHTML, Function, setTimeout)
+• Виявлення XSS‑синків (srcdoc, iframe, script injection)
+• Виявлення SPA‑подій (Vue, React, Angular)
+• Побудова карти подія → ризик → snippet → sinks
+• Повністю ThreatConnector‑friendly артефакт
+• Асинхронний запуск через ThreadWorker 10.0
+• Без фризів, без падінь, без race‑conditions
 """
 
-from typing import Any, Dict, List
+from __future__ import annotations
+from typing import Any, Dict, List, Optional, Callable
+
+from xss_security_gui.utils.thread_worker import run_in_thread
+from xss_security_gui.utils.safe_call import safe_invoke
 
 
 class DOMEventMapper:
-    """Модуль анализа DOM-событий и опасных конструкций."""
+    """Бойовий модуль аналізу DOM‑подій та небезпечних JS‑конструкцій."""
 
     DEFAULT_EVENTS = [
         "click", "input", "submit", "mouseover", "keydown", "change",
         "keyup", "dblclick", "contextmenu", "touchstart", "touchend",
+        "focus", "blur", "wheel", "scroll", "drag", "drop",
     ]
 
     DANGEROUS_SINKS = [
@@ -29,21 +38,36 @@ class DOMEventMapper:
         "Function(",
         "setTimeout(",
         "setInterval(",
+        "srcdoc",
+        "<iframe",
+        "<script",
+        "createElement('script'",
+        "appendChild(script",
     ]
 
-    def __init__(self, events: List[str] | None = None) -> None:
+    SPA_PATTERNS = [
+        "Vue.component",
+        "new Vue",
+        "ReactDOM.render",
+        "useEffect(",
+        "useState(",
+        "angular.module",
+        "ng-click",
+        "ng-submit",
+    ]
+
+    def __init__(
+        self,
+        events: Optional[List[str]] = None,
+        threat_connector: Any | None = None,
+    ):
         self.events = events if events is not None else self.DEFAULT_EVENTS
+        self.threat_connector = threat_connector
 
     # ---------------------------------------------------------
-    # Основной метод
+    # Основний аналіз
     # ---------------------------------------------------------
-    def run(self, page_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Анализирует скрипты страницы на наличие DOM-событий и опасных конструкций.
-
-        :param page_data: словарь с ключами "dom" и "scripts"
-        :return: словарь с найденными событиями и рисками
-        """
+    def analyze(self, page_data: Dict[str, Any]) -> Dict[str, Any]:
         scripts = page_data.get("scripts", [])
         results: List[Dict[str, Any]] = []
 
@@ -51,37 +75,52 @@ class DOMEventMapper:
             code = script.get("content", "") or ""
             lower = code.lower()
 
-            # === Поиск событий ===
+            # === DOM Events ===
             for event_type in self.events:
                 if event_type in lower:
-                    sink_hits = self._find_sinks(code)
-                    risk = self._assess_risk(sink_hits)
+                    sinks = self._find_sinks(code)
+                    spa = self._find_spa(code)
+                    risk = self._assess_risk(sinks, spa)
 
                     results.append({
                         "event": event_type,
-                        "snippet": code[:200],
-                        "sinks": sink_hits,
+                        "snippet": code[:300],
+                        "sinks": sinks,
+                        "spa": spa,
                         "risk": risk,
                     })
 
-            # === Если нет событий, но есть опасные синки ===
-            sink_hits = self._find_sinks(code)
-            if sink_hits:
+            # === Якщо немає подій, але є небезпечні синки ===
+            sinks = self._find_sinks(code)
+            spa = self._find_spa(code)
+            if sinks or spa:
                 results.append({
                     "event": None,
-                    "snippet": code[:200],
-                    "sinks": sink_hits,
-                    "risk": self._assess_risk(sink_hits),
+                    "snippet": code[:300],
+                    "sinks": sinks,
+                    "spa": spa,
+                    "risk": self._assess_risk(sinks, spa),
                 })
 
-        return {
+        artifact = {
+            "module": "DOMEventMapper",
+            "category": "dom_intel",
             "status": "success",
             "events_detected": len(results),
             "results": results,
         }
 
+        # ThreatConnector інтеграція
+        if self.threat_connector:
+            try:
+                self.threat_connector.add_artifact(artifact)
+            except Exception:
+                pass
+
+        return artifact
+
     # ---------------------------------------------------------
-    # Поиск опасных DOM-синков
+    # Пошук небезпечних DOM‑синків
     # ---------------------------------------------------------
     def _find_sinks(self, code: str) -> List[str]:
         found = []
@@ -94,19 +133,75 @@ class DOMEventMapper:
         return found
 
     # ---------------------------------------------------------
-    # Оценка риска
+    # Пошук SPA‑подій
     # ---------------------------------------------------------
-    def _assess_risk(self, sinks: List[str]) -> str:
+    def _find_spa(self, code: str) -> List[str]:
+        found = []
+        lower = code.lower()
+
+        for pattern in self.SPA_PATTERNS:
+            if pattern.lower() in lower:
+                found.append(pattern)
+
+        return found
+
+    # ---------------------------------------------------------
+    # Оцінка ризику 11.0
+    # ---------------------------------------------------------
+    def _assess_risk(self, sinks: List[str], spa: List[str]) -> str:
         """
-        Оценка риска по наличию опасных DOM-синков.
+        Розширена логіка ризику:
+        • CRITICAL — eval, Function, script injection, iframe injection
+        • HIGH — innerHTML/outerHTML/insertAdjacentHTML + SPA
+        • MEDIUM — innerHTML/outerHTML/insertAdjacentHTML без SPA
+        • LOW — будь-які інші синки
         """
-        if any(s in sinks for s in ["eval(", "Function("]):
+
+        sinks_lower = [s.lower() for s in sinks]
+
+        # CRITICAL — прямі XSS‑синки
+        if any(s in sinks_lower for s in ["eval(", "function(", "<script", "<iframe", "srcdoc"]):
+            return "CRITICAL"
+
+        # HIGH — DOM‑sink + SPA (реактивні фреймворки)
+        if sinks and spa:
             return "HIGH"
 
-        if any(s in sinks for s in ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"]):
+        # MEDIUM — DOM‑sink без SPA
+        if any(s in sinks_lower for s in ["innerhtml", "outerhtml", "insertadjacenthtml", "document.write"]):
             return "MEDIUM"
 
+        # LOW — інші синки
         if sinks:
             return "LOW"
 
         return "LOW"
+
+    # ---------------------------------------------------------
+    # Асинхронний запуск через ThreadWorker
+    # ---------------------------------------------------------
+    def analyze_async(
+        self,
+        page_data: Dict[str, Any],
+        callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> None:
+
+        def work_fn(progress, is_cancelled):
+            return self.analyze(page_data)
+
+        def on_success(result: Dict[str, Any]) -> None:
+            if callback:
+                safe_invoke(callback, result)
+
+        def on_error(e: Exception) -> None:
+            if callback:
+                safe_invoke(callback, {"status": "error", "error": str(e)})
+
+        run_in_thread(
+            work_fn,
+            name="DOMEventMapper",
+            on_success=on_success,
+            on_progress=None,
+            on_error=on_error,
+            on_finally=None,
+        )

@@ -14,7 +14,7 @@ import html
 import threading
 import requests
 from datetime import datetime
-from typing import Optional, Callable, Any
+from typing import Optional, Callable
 
 from xss_security_gui.settings import TRAP_WEBHOOK_URL
 from xss_security_gui.threat_tab_connector import ThreatIntelConnector
@@ -61,8 +61,26 @@ def send_trap_to_webhook(
     """
 
     def safe_callback(ok: bool, msg: str):
-        if callback:
+        if not callback:
+            return
+
+        try:
+            # If callback is a bound method of a Tk widget (has __self__ with after), schedule via after
+            owner = getattr(callback, "__self__", None)
+            after = getattr(owner, "after", None)
+            if callable(after):
+                try:
+                    owner.after(0, lambda o=ok, m=msg: callback(o, m))
+                    return
+                except Exception:
+                    # fallthrough to direct call
+                    pass
+
+            # Fallback: call synchronously (caller should ensure thread-safety if needed)
+            callback(ok, msg)
+        except Exception:
             try:
+                # Last-ditch attempt, swallow any exception
                 callback(ok, msg)
             except Exception:
                 pass

@@ -36,6 +36,7 @@ from xss_security_gui.settings import (
     LOG_HONEYPOT_HITS,
     PARAM_FUZZ_LOG_PATH,
 )
+from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
 
 
 class OverviewTab(ttk.Frame):
@@ -64,6 +65,7 @@ class OverviewTab(ttk.Frame):
 
         # Маппинг «лейбл → (StringVar, функция‑счётчик)»
         self.label_vars: Dict[str, tuple[tk.StringVar, Callable[[], Any]]] = {}
+        self._bridge = UIQueueBridge(self, poll_ms=50)
 
         self.build_ui()
         self.after(4000, self.refresh_stats)
@@ -132,7 +134,11 @@ class OverviewTab(ttk.Frame):
 
         def callback(report: Dict[str, Any], error: Optional[Exception]):
             if error:
-                self.after(0, lambda: messagebox.showerror("Threat Report Merger", f"Ошибка объединения отчётов:\n{error}"))
+                self._bridge.post_ui(
+                    messagebox.showerror,
+                    "Threat Report Merger",
+                    f"Ошибка объединения отчётов:\n{error}",
+                )
                 return
 
             def send():
@@ -142,7 +148,7 @@ class OverviewTab(ttk.Frame):
                 except Exception as e:
                     messagebox.showerror("Threat Report Merger", f"Ошибка отправки в Threat Intel:\n{e}")
 
-            self.after(0, send)
+            self._bridge.post_ui(send)
 
         merger = ReportMerger()
         merger.merge_async(callback)
@@ -160,16 +166,20 @@ class OverviewTab(ttk.Frame):
         def gui_callback(payload: Dict[str, Any]) -> None:     # noinspection PyUnusedLocal
             analyzer = getattr(self.app, "analyzer", None)
             if analyzer and hasattr(analyzer, "update_from_crawler"):
-                self.after(0, lambda: analyzer.update_from_crawler(payload))
+                self._bridge.post_ui(analyzer.update_from_crawler, payload)
 
 
         def worker() -> None:
             try:
                 crawl_site(url, gui_callback=gui_callback, parallel=True)
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Ошибка краулера", f"Не удалось выполнить краулинг:\n{e}"))
+                self._bridge.post_ui(
+                    messagebox.showerror,
+                    "Ошибка краулера",
+                    f"Не удалось выполнить краулинг:\n{e}",
+                )
 
-        threading.Thread(target=worker, daemon=True, name="OverviewCrawler").start()
+        self._bridge.post_bg(worker)
         messagebox.showinfo("Запущено", "Краулер работает.\nРезультаты смотри во вкладке «Анализатор».")
 
     # ========================================================
@@ -185,14 +195,17 @@ class OverviewTab(ttk.Frame):
         def worker():
             try:
                 results = extract_api_data(log_path, threat_tab=self.threat_tab)
-                self.last_api_results = results
+                self._bridge.post_ui(setattr, self, "last_api_results", results)
                 total = sum(len(v) for v in results.values())
-                self.after(0, lambda: messagebox.showinfo("✅ Парсинг завершён",
-                                                         f"Найдено {total} индикаторов.\nРезультаты отправлены в Threat Intel."))
+                self._bridge.post_ui(
+                    messagebox.showinfo,
+                    "✅ Парсинг завершён",
+                    f"Найдено {total} индикаторов.\nРезультаты отправлены в Threat Intel.",
+                )
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("❌ Ошибка парсинга", str(e)))
+                self._bridge.post_ui(messagebox.showerror, "❌ Ошибка парсинга", str(e))
 
-        threading.Thread(target=worker, daemon=True, name="OverviewAPIParser").start()
+        self._bridge.post_bg(worker)
 
     def run_api_parser_file(self) -> None:
         """Запуск API‑парсера по выбранному лог‑файлу."""
@@ -205,22 +218,24 @@ class OverviewTab(ttk.Frame):
         def worker():
             try:
                 results = extract_api_data(path, threat_tab=self.threat_tab)
-                self.last_api_results = results
+                self._bridge.post_ui(setattr, self, "last_api_results", results)
                 total = sum(len(v) for v in results.values())
-                self.after(
-                    0,
-                    lambda: messagebox.showinfo(
-                        "✅ Парсинг завершён",
-                        f"Найдено {total} индикаторов.\nРезультаты отправлены в Threat Intel.",
-                    ),
+                self._bridge.post_ui(
+                    messagebox.showinfo,
+                    "✅ Парсинг завершён",
+                    f"Найдено {total} индикаторов.\nРезультаты отправлены в Threat Intel.",
                 )
             except Exception as e:
-                self.after(
-                    0,
-                    lambda: messagebox.showerror("❌ Ошибка парсинга", str(e)),
-                )
+                self._bridge.post_ui(messagebox.showerror, "❌ Ошибка парсинга", str(e))
 
-        threading.Thread(target=worker, daemon=True, name="OverviewAPIParserFile").start()
+        self._bridge.post_bg(worker)
+
+    def destroy(self) -> None:
+        try:
+            self._bridge.stop()
+        except Exception:
+            pass
+        super().destroy()
 
 
     # ========================================================
