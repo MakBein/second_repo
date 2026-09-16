@@ -57,12 +57,21 @@ class ReportMerger:
             try:
                 result = self.merge()
                 if callback:
-                    callback(result, None)
+                    self._dispatch_callback(callback, result, None)
             except Exception as e:
                 if callback:
-                    callback({}, e)
+                    self._dispatch_callback(callback, {}, e)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    @staticmethod
+    def _dispatch_callback(callback, report: Dict[str, Any], error: Optional[Exception]) -> None:
+        owner = getattr(callback, "__self__", None)
+        after = getattr(owner, "after", None)
+        if callable(after):
+            after(0, lambda r=report, e=error: callback(r, e))
+        else:
+            callback(report, error)
 
     # ============================================================
     #  Внутренние методы

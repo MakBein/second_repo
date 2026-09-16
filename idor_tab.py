@@ -7,6 +7,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 from xss_security_gui.idor_tester import fuzz_id_parameter
+from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
 
 
 class IDORTab(ttk.Frame):
@@ -32,6 +33,7 @@ class IDORTab(ttk.Frame):
 
         # простий лок для потокобезпечних змін
         self._lock = threading.Lock()
+        self._bridge = UIQueueBridge(self, poll_ms=50)
 
         self._build_ui()
 
@@ -99,7 +101,7 @@ class IDORTab(ttk.Frame):
     # Thread-safe log
     # ---------------------------------------------------------
     def _safe_log(self, data: Any) -> None:
-        self.after(0, lambda: self._append(data))
+        self._bridge.call_ui(self._append, data)
 
     def _append(self, data: Any) -> None:
         if isinstance(data, tuple):
@@ -163,14 +165,18 @@ class IDORTab(ttk.Frame):
         with self._lock:
             self.active_tests += 1
 
-        t = threading.Thread(
-            target=lambda: self._run_idor(
-                url, param, method, token, start, stop, delay, agent
-            ),
-            daemon=True,
+        self._bridge.post_bg(
+            self._run_idor,
+            url,
+            param,
+            method,
+            token,
+            start,
+            stop,
+            delay,
+            agent,
             name=f"IDOR-{url}-{param}",
         )
-        t.start()
 
     # ---------------------------------------------------------
     # Severity нормалізація для Threat Intel
@@ -241,7 +247,8 @@ class IDORTab(ttk.Frame):
                 # Threat Intel інтеграція
                 if self.threat_tab and hasattr(self.threat_tab, "add_threat"):
                     try:
-                        self.threat_tab.add_threat(
+                        self._bridge.post_ui(
+                            self.threat_tab.add_threat,
                             {
                                 "type": "IDOR",
                                 "url": full_url,
@@ -345,3 +352,10 @@ class IDORTab(ttk.Frame):
 
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+
+    def destroy(self):
+        try:
+            self._bridge.stop()
+        except Exception:
+            pass
+        super().destroy()

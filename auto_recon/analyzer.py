@@ -1,9 +1,11 @@
 # xss_security_gui/auto_recon/analyzer.py
 import logging
+import re
 import time
 import json
 import os
-from typing import List, Dict, Any
+import hashlib
+from typing import List, Dict, Any, Optional
 
 from xss_security_gui.threat_analysis.threat_connector import ThreatConnector
 from xss_security_gui.threat_analysis.csp_module import CSPAnalyzer
@@ -24,20 +26,52 @@ from xss_security_gui import DIRS
 # ============================================================
 #  Простые анализаторы структуры страницы
 # ============================================================
+# ============================================================
+#  Паттерны для извлечения секретов
+# ============================================================
+_SECRET_PATTERNS: Dict[str, str] = {
+    "AWS Access Key": r"AKIA[0-9A-Z]{16}",
+    "AWS Secret Key": r"(?i)aws(.{0,20})?['\"][0-9a-zA-Z/+]{40}['\"]",
+    "Google API Key": r"AIza[0-9A-Za-z\-_]{35}",
+    "Slack Token": r"xox[bpors]-[0-9a-zA-Z]{10,48}",
+    "GitHub Token": r"gh[pousr]_[0-9a-zA-Z]{36}",
+    "Private Key": r"-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----",
+    "Generic Secret": r"(?i)(secret|password|passwd|api_key|apikey|token|access_token)\s*[=:]\s*['\"][^'\"]{8,}['\"]",
+    "Bearer Token": r"Bearer\s+[A-Za-z0-9\-._~+/]+=*",
+    "Basic Auth": r"Basic\s+[A-Za-z0-9+/=]{10,}",
+    "Stripe Key": r"sk_live_[0-9a-zA-Z]{24}",
+    "Mailgun Key": r"key-[0-9a-zA-Z]{32}",
+    "Twilio SID": r"AC[a-z0-9]{32}",
+    "SendGrid Key": r"SG\.[a-zA-Z0-9_-]{22}\.[a-zA-Z0-9_-]{43}",
+}
+
+_SENSITIVE_KEYWORDS = [
+    "login", "password", "passwd", "token", "auth", "secret",
+    "api_key", "apikey", "access_token", "session", "cookie",
+    "admin", "debug", "trace", "internal", "private",
+    "credit_card", "ssn", "oauth", "jwt", "bearer",
+]
+
+
 def analyze_page(html: str, url: str) -> dict:
-    """Простейший анализ содержимого страницы."""
+    """Расширенный анализ содержимого страницы."""
     lower = html.lower()
     return {
         "url": url,
         "length": len(html),
         "has_script": "<script" in lower,
         "has_form": "<form" in lower,
-        "keywords": [k for k in ["login", "password", "token", "auth"] if k in lower],
+        "has_iframe": "<iframe" in lower,
+        "has_object": "<object" in lower,
+        "has_embed": "<embed" in lower,
+        "has_comments": "<!--" in lower,
+        "keywords": [k for k in _SENSITIVE_KEYWORDS if k in lower],
+        "content_hash": hashlib.md5(html.encode("utf-8", errors="ignore")).hexdigest(),
     }
 
 
 def analyze_structure(html: str) -> dict:
-    """Подсчёт базовых HTML-тегов."""
+    """Расширенный подсчёт HTML-тегов и атрибутов."""
     lower = html.lower()
     return {
         "tags": {
@@ -46,7 +80,76 @@ def analyze_structure(html: str) -> dict:
             "form": lower.count("<form"),
             "input": lower.count("<input"),
             "a": lower.count("<a "),
-        }
+            "iframe": lower.count("<iframe"),
+            "object": lower.count("<object"),
+            "embed": lower.count("<embed"),
+            "textarea": lower.count("<textarea"),
+            "select": lower.count("<select"),
+            "button": lower.count("<button"),
+            "img": lower.count("<img"),
+            "link": lower.count("<link"),
+            "meta": lower.count("<meta"),
+            "style": lower.count("<style"),
+        },
+        "event_handlers": len(re.findall(r'on\w+\s*=', lower)),
+        "inline_scripts": len(re.findall(r'<script[^>]*>[^<]+</script>', lower)),
+        "external_scripts": len(re.findall(r'<script[^>]+src\s*=', lower)),
+        "hidden_inputs": len(re.findall(r'<input[^>]+type\s*=\s*["\']hidden', lower)),
+        "comments": len(re.findall(r'<!--', lower)),
+    }
+
+
+def extract_secrets(html: str, url: str) -> List[Dict[str, Any]]:
+    """Извлекает секреты и ключи из HTML/JS."""
+    findings: List[Dict[str, Any]] = []
+    for name, pattern in _SECRET_PATTERNS.items():
+        for match in re.finditer(pattern, html):
+            findings.append({
+                "type": name,
+                "value": match.group()[:120],
+                "url": url,
+                "severity": "critical" if "key" in name.lower() or "private" in name.lower() else "high",
+            })
+    return findings
+
+
+def extract_emails(html: str) -> List[str]:
+    """Извлекает email-адреса из HTML."""
+    return list(set(re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', html)))
+
+
+def detect_technology(html: str, headers: dict) -> Dict[str, Any]:
+    """Определяет технологии по HTML и заголовкам."""
+    lower = html.lower()
+    techs = []
+    if "react" in lower or "__NEXT_DATA__" in html:
+        techs.append("React/Next.js")
+    if "ng-app" in lower or "ng-controller" in lower:
+        techs.append("AngularJS")
+    if "vue" in lower or "v-bind" in lower or "v-model" in lower:
+        techs.append("Vue.js")
+    if "jquery" in lower or "$.ajax" in html:
+        techs.append("jQuery")
+    if "wp-content" in lower or "wordpress" in lower:
+        techs.append("WordPress")
+    if "drupal" in lower:
+        techs.append("Drupal")
+    if "joomla" in lower:
+        techs.append("Joomla")
+    if "laravel" in lower or "csrf-token" in lower:
+        techs.append("Laravel")
+    if "django" in lower or "csrfmiddlewaretoken" in lower:
+        techs.append("Django")
+    if "bootstrap" in lower:
+        techs.append("Bootstrap")
+
+    server = headers.get("Server", headers.get("server", ""))
+    powered = headers.get("X-Powered-By", headers.get("x-powered-by", ""))
+
+    return {
+        "frameworks": techs,
+        "server": server,
+        "powered_by": powered,
     }
 
 
@@ -75,6 +178,9 @@ class AutoReconAnalyzerV2:
         self.security_headers_report: List[Dict[str, Any]] = []
         self.page_report: List[Dict[str, Any]] = []
         self.structure_report: List[Dict[str, Any]] = []
+        self.secrets_report: List[Dict[str, Any]] = []
+        self.tech_report: List[Dict[str, Any]] = []
+        self.emails_report: List[Dict[str, Any]] = []
 
         # Анализаторы
         self.csp_analyzer = CSPAnalyzer(threat_tab=self.connector)
@@ -93,13 +199,51 @@ class AutoReconAnalyzerV2:
             logging.error(f"[AutoReconAnalyzerV2] NDJSON log error: {e}")
 
     def analyze_security_headers(self, headers: dict) -> dict:
-        """Анализ базовых security-заголовков."""
+        """Расширенный анализ security-заголовков с оценкой рисков."""
+        expected = {
+            "X-Frame-Options": "clickjacking",
+            "X-Content-Type-Options": "mime_sniffing",
+            "Referrer-Policy": "referrer_leak",
+            "Permissions-Policy": "feature_abuse",
+            "Strict-Transport-Security": "no_hsts",
+            "Content-Security-Policy": "no_csp",
+            "X-XSS-Protection": "no_xss_filter",
+            "Cache-Control": "caching_risk",
+            "Cross-Origin-Opener-Policy": "no_coop",
+            "Cross-Origin-Resource-Policy": "no_corp",
+            "Cross-Origin-Embedder-Policy": "no_coep",
+        }
+        dangerous = {
+            "Server": "server_exposed",
+            "X-Powered-By": "tech_exposed",
+            "X-AspNet-Version": "aspnet_exposed",
+            "X-AspNetMvc-Version": "aspnet_mvc_exposed",
+        }
+
+        present = {}
+        missing = []
+        exposed = []
+        for hdr, risk in expected.items():
+            val = headers.get(hdr)
+            if val:
+                present[hdr] = val
+            else:
+                missing.append({"header": hdr, "risk": risk})
+
+        for hdr, risk in dangerous.items():
+            val = headers.get(hdr)
+            if val:
+                exposed.append({"header": hdr, "value": val, "risk": risk})
+
+        score = max(0, 100 - len(missing) * 10 - len(exposed) * 5)
+        severity = "critical" if score < 30 else "high" if score < 50 else "medium" if score < 70 else "low"
+
         return {
-            "x_frame_options": headers.get("X-Frame-Options"),
-            "x_content_type_options": headers.get("X-Content-Type-Options"),
-            "referrer_policy": headers.get("Referrer-Policy"),
-            "permissions_policy": headers.get("Permissions-Policy"),
-            "strict_transport_security": headers.get("Strict-Transport-Security"),
+            "present": present,
+            "missing": missing,
+            "exposed": exposed,
+            "score": score,
+            "severity": severity,
         }
 
     def analyze(self, responses: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -177,7 +321,25 @@ class AutoReconAnalyzerV2:
             self.structure_report.append({"url": url, **struct_info})
             result_entry["structure"] = struct_info
 
-            # 10. NDJSON log
+            # 10. Secrets extraction
+            secrets = extract_secrets(text, url)
+            if secrets:
+                self.secrets_report.extend(secrets)
+                self.connector.add_artifact("SECRETS", url, secrets)
+            result_entry["secrets"] = secrets
+
+            # 11. Technology fingerprint
+            tech = detect_technology(text, headers)
+            self.tech_report.append({"url": url, **tech})
+            result_entry["technology"] = tech
+
+            # 12. Email extraction
+            emails = extract_emails(text)
+            if emails:
+                self.emails_report.append({"url": url, "emails": emails})
+            result_entry["emails"] = emails
+
+            # 13. NDJSON log
             result_entry["duration"] = time.time() - start
             self._log_ndjson(result_entry)
 
@@ -194,7 +356,15 @@ class AutoReconAnalyzerV2:
             "security_headers": self.security_headers_report,
             "page": self.page_report,
             "structure": self.structure_report,
+            "secrets": self.secrets_report,
+            "technology": self.tech_report,
+            "emails": self.emails_report,
             "threat_summary": self.connector.summary(),
+            "total_findings": (
+                len(self.dom_xss_report) + len(self.csrf_report)
+                + len(self.sqli_report) + len(self.ssrf_report)
+                + len(self.secrets_report) + len(self.token_report)
+            ),
         }
 
 
@@ -205,4 +375,7 @@ __all__ = [
     "AutoReconAnalyzerV2",
     "analyze_page",
     "analyze_structure",
+    "extract_secrets",
+    "extract_emails",
+    "detect_technology",
 ]

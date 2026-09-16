@@ -2,39 +2,39 @@
   "status": "ok",
   "message": "Модель успішно натренована.",
   "files_stats": {
-    "files_total": 70,
-    "files_skipped_size": 3,
+    "files_total": 116,
+    "files_skipped_size": 2,
     "files_failed_read": 0,
-    "files_processed": 67
+    "files_processed": 114
   },
-  "num_samples_raw": 93404,
+  "num_samples_raw": 168124,
   "num_classes": 2,
   "metrics": {
     "classification_report": {
       "0": {
-        "precision": 0.995223621363439,
-        "recall": 0.9997818974918211,
-        "f1-score": 0.9974975519529975,
-        "support": 18340.0
+        "precision": 0.9939559996776534,
+        "recall": 0.9996757983465716,
+        "f1-score": 0.9968076938618823,
+        "support": 37014.0
       },
       "1": {
-        "precision": 0.9991881469454029,
-        "recall": 0.9824386350029934,
-        "f1-score": 0.9907426041457034,
-        "support": 5011.0
+        "precision": 0.9975020815986678,
+        "recall": 0.9551524815626868,
+        "f1-score": 0.9758680378780165,
+        "support": 5017.0
       },
-      "accuracy": 0.9960601259046722,
+      "accuracy": 0.9943613047512551,
       "macro avg": {
-        "precision": 0.9972058841544209,
-        "recall": 0.9911102662474073,
-        "f1-score": 0.9941200780493504,
-        "support": 23351.0
+        "precision": 0.9957290406381606,
+        "recall": 0.9774141399546292,
+        "f1-score": 0.9863378658699493,
+        "support": 42031.0
       },
       "weighted avg": {
-        "precision": 0.9960743873987788,
-        "recall": 0.9960601259046722,
-        "f1-score": 0.996047976197683,
-        "support": 23351.0
+        "precision": 0.9943792751885318,
+        "recall": 0.9943613047512551,
+        "f1-score": 0.9943082469281656,
+        "support": 42031.0
       }
     }
   },

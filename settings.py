@@ -223,6 +223,16 @@ class Settings:
                 "crawl.max_api_endpoints": 200,
                 "crawl.domains_whitelist": [],
                 "crawl.error_log": str(LOG_DIR / "crawler_errors.log"),
+                # Anti-detection / Super Crawler
+                "anti_detection.tls_spoofing": True,
+                "anti_detection.playwright_stealth": True,
+                "anti_detection.dns_over_https": False,
+                "anti_detection.geo_ip_rotation": False,
+                "anti_detection.chrome_fingerprint": True,
+                "anti_detection.multi_session": True,
+                "anti_detection.auto_retry": True,
+                "anti_detection.use_tls_client": False,
+                "anti_detection.use_anti_detection_session": False,
                 # Crawler / JS detection
                 "crawler.enable_graphql_detection": True,
                 "js.enable_dynamic_detection": True,
@@ -248,6 +258,17 @@ class Settings:
                 "attack.max_token_attempts": 80,
                 "attack.max_auth_header_variants": 3,
                 "attack.user_id_param_names": None,
+                "attack.waf_evasion": True,
+                "attack.waf_auto_scan": True,
+                "attack.waf_max_attempts": 8,
+                # RealTimeWatcher adaptive retry
+                "watcher.retry_max_attempts": 5,
+                "watcher.retry_base_timeout": 8.0,
+                "watcher.retry_backoff_base": 0.6,
+                "watcher.retry_backoff_cap": 15.0,
+                "watcher.retry_jitter": 0.35,
+                "watcher.locale_ru_rotation": True,
+                "watcher.locale_ru_weight": 0.55,
                 # IDOR
                 "idor.delay": 0.5,
                 # LFI
@@ -407,6 +428,18 @@ class Settings:
         # fallback: str
         return v
 
+
+    def __getitem__(self, key: str) -> Any:
+        value = self.get(key, None)
+        if value is None and key not in self.data:
+            raise KeyError(key)
+        return value
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self.data[key] = value
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.data or self._KEY_ALIASES.get(key) in self.data or self._KEY_ALIASES_REVERSE.get(key) in self.data
 
     def get(self, key: str, default: Any = None) -> Any:
         """

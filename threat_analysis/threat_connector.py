@@ -1,17 +1,37 @@
-# xss_security_gui/threat_analysis/threat_connector.py
-# 🛡️ ThreatConnector 6.0 — Async Queue + Batched Writes
-
+﻿# xss_security_gui/threat_analysis/threat_connector.py
+"""
+    ThreatConnector 11.0 — Combat‑Grade Threat Pipeline Core
+    ---------------------------------------------------------
+    • Full Pipeline 11.0 normalization
+    • async queue + batched writes
+    • throttling per second
+    • threat‑query API (delegates to backend)
+    • LiveAttackMonitor / SecurityDashboardPanel / HistoryTab compatible
+    """
 import os
 import json
+import socket
+import sqlite3
+import uuid
+import subprocess
 import threading
 import hashlib
 import logging
-import requests
-import sqlite3
 import queue
-from datetime import datetime
-from typing import Dict, Any, List, Optional, Iterable
+from datetime import datetime, timezone
+from time import time
+from typing import Dict, Any, List, Optional
 from queue import Queue, Empty
+from urllib.parse import urlparse
+
+import requests
+import shodan
+
+from xss_security_gui.threat_analysis.account_extractor import AccountExtractor
+
+from xss_security_gui.threat_analysis.backends.base_backend import ThreatBackendBase
+from xss_security_gui.threat_analysis.backends.sqlite_backend import SQLiteBackend
+from xss_security_gui.threat_analysis.backends.elastic_backend import ElasticSearchBackend
 
 LIVE_MONITOR_QUEUE: "queue.Queue[dict]" = queue.Queue()
 
@@ -19,798 +39,48 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOGS_DIR, exist_ok=True)
 
-# ============================================================
-#  Базовый backend (расширенный)
-# ============================================================
 
-class ThreatBackendBase:
+def normalize_xss_artifact(entry: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "category": entry.get("category", "unknown"),
+        "context": entry.get("context", "unknown"),
+        "payload": entry.get("payload", ""),
+        "url": entry.get("url", "—"),
+        "snippet": entry.get("snippet", ""),
+        "risk": entry.get("risk", "medium"),
+        "parameter": entry.get("parameter"),
+        "method": entry.get("method"),
+        "status_code": entry.get("status_code"),
+        "reflected": entry.get("reflected"),
+        "length": entry.get("length"),
+        "full_response": entry.get("full_response"),
+        "timestamp": entry.get("timestamp") or datetime.utcnow().isoformat(),
+        "source": entry.get("source", "xss_engine"),
+        "iid": entry.get("iid"),
+        "ai_score": entry.get("ai_score"),
+        "ai_label": entry.get("ai_label"),
+        "context_confidence": entry.get("context_confidence"),
+        "parent_url": entry.get("parent_url"),
+        "chain": entry.get("chain"),
+        "waf_detected": entry.get("waf_detected"),
+        "waf_signature": entry.get("waf_signature"),
+        "line": entry.get("line"),
+        "column": entry.get("column"),
+    }
+
+
+class ThreatConnector:
     """
-    ThreatBackendBase 4.0 — розширений базовий клас backend'ів.
-
-    Особливості:
-    • Єдиний контракт для всіх backend'ів
-    • Дефолтні методи (load_all, stats)
-    • Уніфікована нормалізація результатів
-    • Покращена типізація
-    • Підтримка майбутніх можливостей ThreatConnector 7.0
-    """
-
-    # -----------------------------
-    # CRUD API (must override)
-    # -----------------------------
-    def add_artifact(self, artifact: Dict[str, Any]) -> None:
-        raise NotImplementedError("Backend must implement add_artifact()")
-
-    def add_batch(self, artifacts: Iterable[Dict[str, Any]]) -> None:
-        # Дефолтна реалізація — backend може перевизначити
-        for a in artifacts:
-            self.add_artifact(a)
-
-    def load_all(self) -> List[Dict[str, Any]]:
-        raise NotImplementedError("Backend must implement load_all()")
-
-    def update_artifact(self, artifact: Dict[str, Any]) -> None:
-        raise NotImplementedError("Backend must implement update_artifact()")
-
-    def delete_artifact(self, hash_value: str) -> None:
-        raise NotImplementedError("Backend must implement delete_artifact()")
-
-    # -----------------------------
-    # FIND API (optional override)
-    # -----------------------------
-    def find_by_hash(self, hash_value: str) -> Optional[Dict[str, Any]]:
-        # Дефолтна реалізація через load_all()
-        for a in self.load_all():
-            if a.get("_hash") == hash_value:
-                return a
-        return None
-
-    def find_by_target(self, target: str) -> List[Dict[str, Any]]:
-        return [a for a in self.load_all() if a.get("target") == target]
-
-    def find_by_module(self, module: str) -> List[Dict[str, Any]]:
-        return [a for a in self.load_all() if a.get("module") == module]
-
-    # -----------------------------
-    # Stats API
-    # -----------------------------
-    def stats(self) -> Dict[str, Any]:
-        data = self.load_all()
-        by_module: Dict[str, int] = {}
-
-        for a in data:
-            mod = a.get("module", "unknown")
-            by_module[mod] = by_module.get(mod, 0) + 1
-
-        return {
-            "total": len(data),
-            "by_module": by_module,
-        }
-
-    # -----------------------------
-    # Clear API
-    # -----------------------------
-    def clear_all(self) -> None:
-        raise NotImplementedError("Backend must implement clear_all()")
-
-    # -----------------------------
-    # Normalization helper
-    # -----------------------------
-    def normalize_artifact(self, artifact: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Уніфікована нормалізація артефакту.
-        Backend може викликати це перед збереженням.
-        """
-        artifact = dict(artifact)  # copy
-
-        # Гарантуємо, що result — dict
-        res = artifact.get("result", {})
-        artifact["result"] = _normalize_result_json(res)
-
-        # Гарантуємо наявність базових полів
-        artifact.setdefault("severity", artifact["result"].get("severity", "info"))
-        artifact.setdefault("category", artifact["result"].get("category", artifact.get("module", "")))
-        artifact.setdefault("source", artifact["result"].get("source", "engine"))
-        artifact.setdefault("tags", artifact["result"].get("tags", []))
-
-        return artifact
-
-# ============================================================
-#  NDJSON backend
-# ============================================================
-class NdjsonBackend(ThreatBackendBase):
-    """
-    NdjsonBackend 4.0 — індексований NDJSON-движок з mmap, WAL та авто-відновленням.
-
-    Особливості:
-    • mmap для швидкого читання великих файлів
-    • Atomic write + WAL
-    • Авто-відновлення після крашу
-    • Індекси в пам'яті: by_hash, by_module, by_target
-    • Інкрементальне оновлення індексів
-    • Thread-safe
-    """
-
-    def __init__(self, filename: str = "threat_intel.ndjson"):
-        self.log_file = os.path.join(LOGS_DIR, filename)
-        self.wal_file = self.log_file + ".wal"
-
-        os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
-
-        self._lock = threading.Lock()
-
-        self._by_hash: dict[str, Dict[str, Any]] = {}
-        self._by_module: dict[str, List[Dict[str, Any]]] = {}
-        self._by_target: dict[str, List[Dict[str, Any]]] = {}
-
-        self._recover_if_needed()
-        self._load_indexes()
-
-    # ---------------------------------------------------------
-    # JSON loader
-    # ---------------------------------------------------------
-    def _safe_load(self, line: str) -> Dict[str, Any]:
-        try:
-            raw = json.loads(line)
-        except Exception:
-            return {}
-        return _normalize_result_json(raw)
-
-    # ---------------------------------------------------------
-    # WAL recovery
-    # ---------------------------------------------------------
-    def _recover_if_needed(self) -> None:
-        """Відновлює файл, якщо попередній запис був перерваний."""
-        if not os.path.exists(self.wal_file):
-            return
-
-        with open(self.log_file, "a", encoding="utf-8") as main, \
-             open(self.wal_file, "r", encoding="utf-8") as wal:
-            for line in wal:
-                main.write(line)
-
-        os.remove(self.wal_file)
-
-    # ---------------------------------------------------------
-    # Indexing
-    # ---------------------------------------------------------
-    def _index(self, a: Dict[str, Any]) -> None:
-        h = a.get("_hash")
-        mod = a.get("module")
-        tgt = a.get("target")
-
-        if not h:
-            return
-
-        self._by_hash[h] = a
-
-        if mod:
-            self._by_module.setdefault(mod, []).append(a)
-        if tgt:
-            self._by_target.setdefault(tgt, []).append(a)
-
-    def _load_indexes(self) -> None:
-        if not os.path.exists(self.log_file):
-            return
-
-        with open(self.log_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                a = self._safe_load(line)
-                self._index(a)
-
-    # ---------------------------------------------------------
-    # Atomic append with WAL
-    # ---------------------------------------------------------
-    def _append_atomic(self, lines: List[str]) -> None:
-        with open(self.wal_file, "w", encoding="utf-8") as wal:
-            wal.writelines(lines)
-
-        with open(self.log_file, "a", encoding="utf-8") as main:
-            main.writelines(lines)
-
-        os.remove(self.wal_file)
-
-    # ---------------------------------------------------------
-    # INSERT
-    # ---------------------------------------------------------
-    def add_artifact(self, artifact: Dict[str, Any]) -> None:
-        with self._lock:
-            h = artifact.get("_hash")
-            if h and h in self._by_hash:
-                return
-
-            self._index(artifact)
-
-            line = json.dumps(artifact, ensure_ascii=False, default=str) + "\n"
-            self._append_atomic([line])
-
-    def add_batch(self, artifacts: Iterable[Dict[str, Any]]) -> None:
-        artifacts = list(artifacts)
-        if not artifacts:
-            return
-
-        lines = []
-        with self._lock:
-            for a in artifacts:
-                h = a.get("_hash")
-                if h and h in self._by_hash:
-                    continue
-                self._index(a)
-                lines.append(json.dumps(a, ensure_ascii=False, default=str) + "\n")
-
-            if lines:
-                self._append_atomic(lines)
-
-    # ---------------------------------------------------------
-    # SELECT ALL (O(n) but fast with mmap)
-    # ---------------------------------------------------------
-    def load_all(self) -> List[Dict[str, Any]]:
-        with self._lock:
-            return list(self._by_hash.values())
-
-    # ---------------------------------------------------------
-    # UPDATE
-    # ---------------------------------------------------------
-    def update_artifact(self, artifact: Dict[str, Any]) -> None:
-        h = artifact.get("_hash")
-        if not h:
-            return
-
-        with self._lock:
-            old = self._by_hash.get(h)
-            if old:
-                mod = old.get("module")
-                tgt = old.get("target")
-
-                if mod in self._by_module:
-                    self._by_module[mod] = [x for x in self._by_module[mod] if x.get("_hash") != h]
-                if tgt in self._by_target:
-                    self._by_target[tgt] = [x for x in self._by_target[tgt] if x.get("_hash") != h]
-
-            self._index(artifact)
-            self._rewrite_all()
-
-    # ---------------------------------------------------------
-    # DELETE
-    # ---------------------------------------------------------
-    def delete_artifact(self, hash_value: str) -> None:
-        with self._lock:
-            a = self._by_hash.pop(hash_value, None)
-            if not a:
-                return
-
-            mod = a.get("module")
-            tgt = a.get("target")
-
-            if mod in self._by_module:
-                self._by_module[mod] = [x for x in self._by_module[mod] if x.get("_hash") != hash_value]
-            if tgt in self._by_target:
-                self._by_target[tgt] = [x for x in self._by_target[tgt] if x.get("_hash") != hash_value]
-
-            self._rewrite_all()
-
-    # ---------------------------------------------------------
-    # Full rewrite (atomic)
-    # ---------------------------------------------------------
-    def _rewrite_all(self) -> None:
-        tmp = self.log_file + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            for a in self._by_hash.values():
-                f.write(json.dumps(a, ensure_ascii=False, default=str) + "\n")
-        os.replace(tmp, self.log_file)
-
-    # ---------------------------------------------------------
-    # FIND
-    # ---------------------------------------------------------
-    def find_by_hash(self, hash_value: str) -> Optional[Dict[str, Any]]:
-        with self._lock:
-            return self._by_hash.get(hash_value)
-
-    def find_by_target(self, target: str) -> List[Dict[str, Any]]:
-        with self._lock:
-            return list(self._by_target.get(target, []))
-
-    def find_by_module(self, module: str) -> List[Dict[str, Any]]:
-        with self._lock:
-            return list(self._by_module.get(module, []))
-
-    # ---------------------------------------------------------
-    # CLEAR
-    # ---------------------------------------------------------
-    def clear_all(self) -> None:
-        with self._lock:
-            self._by_hash.clear()
-            self._by_module.clear()
-            self._by_target.clear()
-            open(self.log_file, "w").close()
-
-# ============================================================
-#  SQLite backend
-# ============================================================
-
-class SQLiteBackend(ThreatBackendBase):
-    """
-    SQLiteBackend 4.0 — індексований, швидкий, thread-safe backend.
-
-    Особливості:
-    • Індекси в пам'яті: by_hash, by_module, by_target
-    • Ліниве завантаження + інкрементальні оновлення
-    • Thread-safe (RLock)
-    • JSON нормалізація (_normalize_result_json)
-    • WAL режим для швидких записів
-    """
-
-    def __init__(self, filename: str = "threat_intel.db"):
-        super().__init__()
-        self.db_path = os.path.join(LOGS_DIR, filename)
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-
-        self._lock = threading.RLock()
-
-        self._by_hash: dict[str, Dict[str, Any]] = {}
-        self._by_module: dict[str, List[Dict[str, Any]]] = {}
-        self._by_target: dict[str, List[Dict[str, Any]]] = {}
-
-        self._init_db()
-        self._load_indexes()
-
-    # ---------------------------------------------------------
-    # DB connect
-    # ---------------------------------------------------------
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        return conn
-
-    # ---------------------------------------------------------
-    # Init DB
-    # ---------------------------------------------------------
-    def _init_db(self) -> None:
-        conn = self._connect()
-        try:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS artifacts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    hash TEXT UNIQUE,
-                    timestamp TEXT,
-                    module TEXT,
-                    target TEXT,
-                    result_json TEXT
-                )
-                """
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-    # ---------------------------------------------------------
-    # JSON loader
-    # ---------------------------------------------------------
-    def _safe_load(self, raw_json: str) -> Dict[str, Any]:
-        try:
-            raw = json.loads(raw_json)
-        except Exception:
-            return {}
-        return _normalize_result_json(raw)
-
-    # ---------------------------------------------------------
-    # Indexing
-    # ---------------------------------------------------------
-    def _index(self, a: Dict[str, Any]) -> None:
-        h = a["_hash"]
-        mod = a["module"]
-        tgt = a["target"]
-
-        self._by_hash[h] = a
-        self._by_module.setdefault(mod, []).append(a)
-        self._by_target.setdefault(tgt, []).append(a)
-
-    def _load_indexes(self) -> None:
-        conn = self._connect()
-        try:
-            rows = conn.execute(
-                "SELECT hash, timestamp, module, target, result_json FROM artifacts"
-            ).fetchall()
-        finally:
-            conn.close()
-
-        with self._lock:
-            for h, ts, mod, tgt, res_json in rows:
-                a = {
-                    "_hash": h,
-                    "timestamp": ts,
-                    "module": mod,
-                    "target": tgt,
-                    "result": self._safe_load(res_json),
-                }
-                self._index(a)
-
-    # ---------------------------------------------------------
-    # INSERT / BATCH
-    # ---------------------------------------------------------
-    def add_artifact(self, artifact: Dict[str, Any]) -> None:
-        self.add_batch([artifact])
-
-    def add_batch(self, artifacts: Iterable[Dict[str, Any]]) -> None:
-        artifacts = list(artifacts)
-        if not artifacts:
-            return
-
-        with self._lock:
-            conn = self._connect()
-            try:
-                for a in artifacts:
-                    h = a["_hash"]
-                    if h in self._by_hash:
-                        continue
-
-                    conn.execute(
-                        """
-                        INSERT OR IGNORE INTO artifacts (hash, timestamp, module, target, result_json)
-                        VALUES (?, ?, ?, ?, ?)
-                        """,
-                        (
-                            h,
-                            a["timestamp"],
-                            a["module"],
-                            a["target"],
-                            json.dumps(a["result"], ensure_ascii=False, default=str),
-                        ),
-                    )
-
-                    self._index(a)
-
-                conn.commit()
-            finally:
-                conn.close()
-
-    # ---------------------------------------------------------
-    # SELECT ALL
-    # ---------------------------------------------------------
-    def load_all(self) -> List[Dict[str, Any]]:
-        with self._lock:
-            return list(self._by_hash.values())
-
-    # ---------------------------------------------------------
-    # UPDATE
-    # ---------------------------------------------------------
-    def update_artifact(self, artifact: Dict[str, Any]) -> None:
-        h = artifact["_hash"]
-
-        with self._lock:
-            old = self._by_hash.get(h)
-            if not old:
-                return
-
-            # remove from old indexes
-            self._by_module[old["module"]] = [
-                x for x in self._by_module[old["module"]] if x["_hash"] != h
-            ]
-            self._by_target[old["target"]] = [
-                x for x in self._by_target[old["target"]] if x["_hash"] != h
-            ]
-
-            # update DB
-            conn = self._connect()
-            try:
-                conn.execute(
-                    """
-                    UPDATE artifacts SET timestamp=?, module=?, target=?, result_json=?
-                    WHERE hash=?
-                    """,
-                    (
-                        artifact["timestamp"],
-                        artifact["module"],
-                        artifact["target"],
-                        json.dumps(artifact["result"], ensure_ascii=False, default=str),
-                        h,
-                    ),
-                )
-                conn.commit()
-            finally:
-                conn.close()
-
-            # reindex
-            self._index(artifact)
-
-    # ---------------------------------------------------------
-    # DELETE
-    # ---------------------------------------------------------
-    def delete_artifact(self, hash_value: str) -> None:
-        with self._lock:
-            a = self._by_hash.pop(hash_value, None)
-            if not a:
-                return
-
-            self._by_module[a["module"]] = [
-                x for x in self._by_module[a["module"]] if x["_hash"] != hash_value
-            ]
-            self._by_target[a["target"]] = [
-                x for x in self._by_target[a["target"]] if x["_hash"] != hash_value
-            ]
-
-            conn = self._connect()
-            try:
-                conn.execute("DELETE FROM artifacts WHERE hash=?", (hash_value,))
-                conn.commit()
-            finally:
-                conn.close()
-
-    # ---------------------------------------------------------
-    # FIND
-    # ---------------------------------------------------------
-    def find_by_hash(self, hash_value: str) -> Optional[Dict[str, Any]]:
-        with self._lock:
-            return self._by_hash.get(hash_value)
-
-    def find_by_target(self, target: str) -> List[Dict[str, Any]]:
-        with self._lock:
-            return list(self._by_target.get(target, []))
-
-    def find_by_module(self, module: str) -> List[Dict[str, Any]]:
-        with self._lock:
-            return list(self._by_module.get(module, []))
-
-    # ---------------------------------------------------------
-    # CLEAR
-    # ---------------------------------------------------------
-    def clear_all(self) -> None:
-        with self._lock:
-            self._by_hash.clear()
-            self._by_module.clear()
-            self._by_target.clear()
-
-            conn = self._connect()
-            try:
-                conn.execute("DELETE FROM artifacts")
-                conn.commit()
-            finally:
-                conn.close()
-
-# ============================================================
-#  Elasticsearch backend (batched)
-# ============================================================
-
-class ElasticSearchBackend(ThreatBackendBase):
-    """
-    ElasticSearchBackend 4.0 — індексований, fault‑tolerant backend.
-
-    Особливості:
-    • In‑memory індекси: by_hash, by_module, by_target
-    • Автоматична нормалізація JSON (_normalize_result_json)
-    • Bulk‑операції з retry
-    • Graceful degradation (ES недоступний → працюємо з кешу)
-    • Thread‑safe (RLock)
+    ThreatConnector 11.0 — Combat‑Grade Threat Pipeline Core
     """
 
     def __init__(
         self,
-        url: str,
-        index: str = "threat_intel",
-        username: Optional[str] = None,
-        password: Optional[str] = None,
+        backend: ThreatBackendBase,
+        batch_size: int = 50,
+        flush_interval: float = 1.0,
+        max_events_per_sec: int = 200,
     ):
-        super().__init__()
-        self.url = url.rstrip("/")
-        self.index = index
-        self.auth = (username, password) if username and password else None
-        self.log = logging.getLogger("ThreatConnector")
-
-        self._lock = threading.RLock()
-
-        self._by_hash: dict[str, Dict[str, Any]] = {}
-        self._by_module: dict[str, List[Dict[str, Any]]] = {}
-        self._by_target: dict[str, List[Dict[str, Any]]] = {}
-
-        self._load_indexes()
-
-    # ---------------------------------------------------------
-    # Internal helpers
-    # ---------------------------------------------------------
-    def _normalize(self, src: Dict[str, Any]) -> Dict[str, Any]:
-        return _normalize_result_json(src)
-
-    def _index_artifact(self, a: Dict[str, Any]) -> None:
-        h = a.get("_hash")
-        if not h:
-            return
-
-        mod = a.get("module")
-        tgt = a.get("target")
-
-        self._by_hash[h] = a
-        if mod:
-            self._by_module.setdefault(mod, []).append(a)
-        if tgt:
-            self._by_target.setdefault(tgt, []).append(a)
-
-    # ---------------------------------------------------------
-    # Load all from ES → build indexes
-    # ---------------------------------------------------------
-    def _load_indexes(self) -> None:
-        try:
-            resp = requests.get(
-                f"{self.url}/{self.index}/_search",
-                json={"query": {"match_all": {}}, "size": 10000},
-                auth=self.auth,
-                timeout=5,
-            )
-            hits = resp.json().get("hits", {}).get("hits", [])
-        except Exception:
-            self.log.warning("ElasticSearch backend: failed to load indexes", exc_info=True)
-            return
-
-        with self._lock:
-            for h in hits:
-                src = self._normalize(h.get("_source", {}))
-                self._index_artifact(src)
-
-    # ---------------------------------------------------------
-    # Bulk insert
-    # ---------------------------------------------------------
-    def add_artifact(self, artifact: Dict[str, Any]) -> None:
-        self.add_batch([artifact])
-
-    def add_batch(self, artifacts: Iterable[Dict[str, Any]]) -> None:
-        artifacts = list(artifacts)
-        if not artifacts:
-            return
-
-        bulk_lines = []
-        to_index = []
-
-        with self._lock:
-            for a in artifacts:
-                h = a.get("_hash")
-                if h in self._by_hash:
-                    continue
-
-                to_index.append(a)
-                bulk_lines.append(json.dumps({"index": {"_id": h}}))
-                bulk_lines.append(json.dumps(a, ensure_ascii=False, default=str))
-
-        if not bulk_lines:
-            return
-
-        data = "\n".join(bulk_lines) + "\n"
-
-        try:
-            resp = requests.post(
-                f"{self.url}/{self.index}/_bulk",
-                data=data.encode("utf-8"),
-                headers={"Content-Type": "application/x-ndjson"},
-                auth=self.auth,
-                timeout=5,
-            )
-            if resp.status_code >= 300:
-                self.log.warning("ElasticSearch backend: bulk failed %s", resp.status_code)
-        except Exception:
-            self.log.warning("ElasticSearch backend: bulk send failed", exc_info=True)
-
-        # Update in-memory indexes
-        with self._lock:
-            for a in to_index:
-                self._index_artifact(a)
-
-    # ---------------------------------------------------------
-    # Load all (from cache)
-    # ---------------------------------------------------------
-    def load_all(self) -> List[Dict[str, Any]]:
-        with self._lock:
-            return list(self._by_hash.values())
-
-    # ---------------------------------------------------------
-    # Update
-    # ---------------------------------------------------------
-    def update_artifact(self, artifact: Dict[str, Any]) -> None:
-        h = artifact.get("_hash")
-        if not h:
-            return
-
-        with self._lock:
-            old = self._by_hash.get(h)
-            if old:
-                mod = old.get("module")
-                tgt = old.get("target")
-
-                if mod in self._by_module:
-                    self._by_module[mod] = [x for x in self._by_module[mod] if x.get("_hash") != h]
-                if tgt in self._by_target:
-                    self._by_target[tgt] = [x for x in self._by_target[tgt] if x.get("_hash") != h]
-
-        try:
-            requests.post(
-                f"{self.url}/{self.index}/_update/{h}",
-                json={"doc": artifact},
-                auth=self.auth,
-                timeout=5,
-            )
-        except Exception:
-            self.log.warning("ElasticSearch backend: update failed", exc_info=True)
-
-        with self._lock:
-            self._index_artifact(artifact)
-
-    # ---------------------------------------------------------
-    # Delete
-    # ---------------------------------------------------------
-    def delete_artifact(self, hash_value: str) -> None:
-        try:
-            requests.delete(
-                f"{self.url}/{self.index}/_doc/{hash_value}",
-                auth=self.auth,
-                timeout=5,
-            )
-        except Exception:
-            self.log.warning("ElasticSearch backend: delete failed", exc_info=True)
-
-        with self._lock:
-            a = self._by_hash.pop(hash_value, None)
-            if not a:
-                return
-
-            mod = a.get("module")
-            tgt = a.get("target")
-
-            if mod in self._by_module:
-                self._by_module[mod] = [x for x in self._by_module[mod] if x.get("_hash") != hash_value]
-            if tgt in self._by_target:
-                self._by_target[tgt] = [x for x in self._by_target[tgt] if x.get("_hash") != hash_value]
-
-    # ---------------------------------------------------------
-    # Find
-    # ---------------------------------------------------------
-    def find_by_hash(self, hash_value: str) -> Optional[Dict[str, Any]]:
-        with self._lock:
-            return self._by_hash.get(hash_value)
-
-    def find_by_target(self, target: str) -> List[Dict[str, Any]]:
-        with self._lock:
-            return list(self._by_target.get(target, []))
-
-    def find_by_module(self, module: str) -> List[Dict[str, Any]]:
-        with self._lock:
-            return list(self._by_module.get(module, []))
-
-    # ---------------------------------------------------------
-    # Clear index
-    # ---------------------------------------------------------
-    def clear_all(self) -> None:
-        try:
-            requests.delete(
-                f"{self.url}/{self.index}",
-                auth=self.auth,
-                timeout=5,
-            )
-        except Exception:
-            self.log.warning("ElasticSearch backend: clear_all failed", exc_info=True)
-
-        with self._lock:
-            self._by_hash.clear()
-            self._by_module.clear()
-            self._by_target.clear()
-
-# ============================================================
-#  ThreatConnector 6.0 — Async Queue + Batched Writes
-# ============================================================
-
-class ThreatConnector:
-    """
-    ThreatConnector 6.0+
-    --------------------
-    • Плагинные backend'ы: NDJSON / SQLite / ElasticSearch
-    • Дедупликация по module + target + hash(result)
-    • Кэш хешей в памяти (захищений lock'ом)
-    • Асинхронная очередь артефактов
-    • Batched writes
-    """
-
-    def __init__(self, backend: ThreatBackendBase, batch_size: int = 50, flush_interval: float = 1.0):
         self.backend = backend
         self.log = logging.getLogger("ThreatConnector")
         self.log.setLevel(logging.INFO)
@@ -831,6 +101,27 @@ class ThreatConnector:
         )
         self._worker_thread.start()
 
+        # External integrations (optional)
+        self.gui_handler = None
+        self.siem_connector = None
+        self.dlq = None
+
+        # Optional enrichment cache
+        self.enrichment_cache = {}
+
+        # OpenPhish feed cache to avoid frequent network calls
+        self._openphish_cache = {"ts": 0, "domains": set()}
+
+        # Optional internal hosts correlation
+        self.internal_hosts_handler = None
+
+        self._max_events_per_sec = max_events_per_sec
+        self._throttle_lock = threading.Lock()
+        self._current_second = int(time())
+        self._events_this_second = 0
+
+        self.artifacts: List[Dict[str, Any]] = []
+
     def _load_initial_hashes(self) -> None:
         try:
             for a in self.backend.load_all():
@@ -841,22 +132,6 @@ class ThreatConnector:
         except Exception:
             self.log.warning("Failed to preload hashes from backend", exc_info=True)
 
-    def emit(self, module, target, result):
-        # как и раньше
-        ...
-        # плюс отправка в live‑monitor
-        try:
-            event = {
-                "module": module,
-                "target": target,
-                "severity": result.get("severity", "info"),
-                "category": result.get("category", ""),
-                "data": result,
-            }
-            LIVE_MONITOR_QUEUE.put_nowait(event)
-        except Exception:
-            pass
-
     def _hash_artifact(self, module: str, target: str, result: Dict[str, Any]) -> str:
         h = hashlib.sha256()
         h.update(module.encode())
@@ -864,17 +139,363 @@ class ThreatConnector:
         h.update(json.dumps(result, sort_keys=True, default=str).encode())
         return h.hexdigest()
 
-    def bulk(self, module: str, target: str, results: List[Dict[str, Any]]) -> None:
-        self.add_artifact(module, target, results)
+    def _throttle(self) -> bool:
+        now = int(time())
+        with self._throttle_lock:
+            if now != self._current_second:
+                self._current_second = now
+                self._events_this_second = 0
+            if self._events_this_second >= self._max_events_per_sec:
+                return False
+            self._events_this_second += 1
+            return True
 
-    def add_artifact(self, module_name: str, target: str, results: List[Dict[str, Any]]) -> None:
-        timestamp = datetime.utcnow().isoformat() + "Z"
+    def ingest_artifact(self, artifact: Dict[str, Any]) -> None:
+        try:
+            module = artifact.get("module", "unknown")
+            result = artifact.get("result", {}) or {}
+            target = result.get("target") or module.lower()
+
+            self.artifacts.append({
+                "module": module,
+                "target": target,
+                "result": result,
+            })
+
+            self.emit(module, target, result)
+
+            cb = getattr(self, "on_event", None)
+            if callable(cb):
+                cb("threat_connector_ingest_ultra", {
+                    "module": module,
+                    "target": target,
+                    "result": result,
+                })
+
+        except Exception:
+            self.log.error("[ThreatConnector] ingest_artifact error", exc_info=True)
+
+    def emit(self, module: str, target: str, result: Dict[str, Any]) -> None:
+        timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+        result = dict(result)
+        result.setdefault("severity", "info")
+        result.setdefault("category", module.lower())
+        result.setdefault("tags", [])
+        result.setdefault("source", "engine")
+
+        h = self._hash_artifact(module, target, result)
+        with self._hash_lock:
+            if h in self._hash_cache:
+                return
+            self._hash_cache.add(h)
+
+        artifact = {
+            "_hash": h,
+            "timestamp": timestamp,
+            "module": module,
+            "target": target,
+            "result": result,
+        }
+
+        if not self._throttle():
+            self.log.debug("ThreatConnector: throttled emit for %s → %s", module, target)
+            return
+
+        self._queue.put(artifact)
+
+        try:
+            event = {
+                "module": module,
+                "target": target,
+                "severity": result.get("severity", "info"),
+                "category": result.get("category", ""),
+                "data": result,
+                "timestamp": timestamp,
+            }
+            LIVE_MONITOR_QUEUE.put_nowait(event)
+        except Exception:
+            pass
+
+    def _check_shodan(self, target: str) -> Optional[Dict]:
+        """Check target against Shodan API with improved resolution and error handling."""
+        try:
+            shodan_api_key = os.getenv("SHODAN_API_KEY")
+            if not shodan_api_key or not target:
+                return None
+
+            # Extract hostname (strip port) if URL provided
+            hostname = target
+            if target.startswith(('http://', 'https://')):
+                parsed = urlparse(target)
+                hostname = parsed.hostname or parsed.netloc
+
+            ip = hostname
+            # Try to resolve to an IP address (non-fatal)
+            try:
+                infos = socket.getaddrinfo(hostname, None)
+                if infos:
+                    ip = infos[0][4][0]
+            except Exception:
+                # resolution failed, continue using hostname
+                pass
+
+            api = shodan.Shodan(shodan_api_key)
+            results = api.host(ip)
+
+            # Extract relevant security information
+            vulns = results.get('vulns') or {}
+            ports = results.get('ports') or []
+            org = results.get('org') or results.get('isp') or 'Unknown'
+            asn = results.get('asn', 'Unknown')
+
+            # Normalize vulnerabilities list
+            cve_list = [v for v in (vulns if isinstance(vulns, (list, set, dict)) else []) if isinstance(v, str) and v.startswith('CVE-')]
+
+            return {
+                "shodan": {
+                    "ip": ip,
+                    "ports": ports,
+                    "vulnerabilities": cve_list,
+                    "organization": org,
+                    "asn": asn,
+                    "last_seen": results.get('last_update')
+                },
+                "source": "shodan"
+            }
+
+        except shodan.APIError as e:
+            self.log.warning(f"Shodan API error for {target}: {e}")
+            return None
+
+        except Exception as e:
+            self.log.error(f"Shodan check failed: {e}")
+            return None
+
+    def _check_openphish(self, artifact_data: Dict) -> Optional[Dict]:
+        """Check against OpenPhish phishing database with simple caching and robust parsing."""
+        try:
+            ttl = int(os.getenv('OPENPHISH_TTL', '3600'))  # seconds
+            now_ts = int(time())
+
+            # Refresh cache if stale
+            if (now_ts - self._openphish_cache.get('ts', 0)) > ttl or not self._openphish_cache.get('domains'):
+                openphish_url = "https://openphish.com/feed.txt"
+                try:
+                    response = requests.get(openphish_url, timeout=10)
+                    response.raise_for_status()
+                    domains = set()
+                    for line in response.text.splitlines():
+                        v = line.strip()
+                        if not v:
+                            continue
+                        # If feed contains full URLs, extract hostname
+                        try:
+                            d = urlparse(v).netloc or v
+                            if d:
+                                # strip possible ports
+                                domains.add(d.split(':')[0])
+                        except Exception:
+                            domains.add(v)
+
+                    self._openphish_cache['domains'] = domains
+                    self._openphish_cache['ts'] = now_ts
+                except Exception as e:
+                    self.log.warning(f"OpenPhish fetch failed: {e}")
+
+            phishing_domains = self._openphish_cache.get('domains', set())
+
+            # Collect candidate URLs from artifact
+            urls_to_check = []
+            if isinstance(artifact_data.get('url'), str):
+                urls_to_check.append(artifact_data['url'])
+            if isinstance(artifact_data.get('js_files'), (list, tuple)):
+                urls_to_check.extend([u for u in artifact_data.get('js_files') if isinstance(u, str)])
+
+            matches = []
+            for url in urls_to_check:
+                try:
+                    domain = urlparse(url).netloc.split(':')[0]
+                except Exception:
+                    domain = url
+                if domain in phishing_domains:
+                    matches.append(domain)
+
+            if matches:
+                return {
+                    "openphish": {
+                        "matches": sorted(set(matches)),
+                        "severity": "high"
+                    },
+                    "source": "openphish"
+                }
+
+            return None
+
+        except Exception as e:
+            self.log.warning(f"OpenPhish check failed: {e}")
+            return None
+
+    def _check_urlhaus(self, target: str) -> Optional[Dict]:
+        """Check URL against URLhaus malware database (robust handling)."""
+        try:
+            # Accept either full URL or domain
+            if not target:
+                return None
+
+            urlhaus_api = "https://urlhaus-api.abuse.ch/v1/url/"
+            payload = {'url': target, 'format': 'json'}
+
+            try:
+                response = requests.post(urlhaus_api, data=payload, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+            except Exception as e:
+                # Some environments prefer GET with query param; fallback
+                try:
+                    response = requests.get(urlhaus_api, params=payload, timeout=10)
+                    response.raise_for_status()
+                    data = response.json()
+                except Exception as ex:
+                    self.log.warning(f"URLhaus request failed for {target}: {e} / {ex}")
+                    return None
+
+            # URLhaus returns query_status and possibly a 'urls' list in other endpoints
+            status = data.get('query_status') or data.get('status')
+            if status and status.lower() == 'ok':
+                # handle different result shapes
+                if data.get('result') == 'found' or data.get('data'):
+                    payloads = data.get('payloads') or data.get('data') or []
+                    threat_type = data.get('threat_type') or (payloads[0].get('threat') if payloads and isinstance(payloads, list) and isinstance(payloads[0], dict) else None)
+                    reporter = data.get('reporter') or None
+                    firstseen = data.get('firstseen') or None
+
+                    return {
+                        "urlhaus": {
+                            "threat_type": threat_type,
+                            "payloads": payloads,
+                            "reporter": reporter,
+                            "firstseen": firstseen
+                        },
+                        "source": "urlhaus"
+                    }
+
+            return None
+
+        except Exception as e:
+            self.log.warning(f"URLhaus check failed: {e}")
+            return None
+
+    def _block_ip(self, ip: str) -> bool:
+        """Block IP with configurable mode. Defaults to simulated safe mode.
+
+        BLOCK_MODE env var values:
+          - simulate (default) : don't run privileged commands, only log
+          - iptables            : attempt iptables rules on posix
+          - netsh               : attempt Windows netsh rule
+          - aws                 : attempt AWS NACL entry if AWS_NETWORK_ACL_ID present
+        """
+        try:
+            if not ip:
+                return False
+
+            mode = os.getenv('BLOCK_MODE', 'simulate').lower()
+
+            # Safety: default to simulate unless explicitly set
+            if mode == 'simulate':
+                self.log.info(f"[BLOCK_SIM] would block {ip} (simulate mode)")
+                return True
+
+            if mode == 'iptables':
+                if os.name != 'posix':
+                    self.log.warning('iptables mode requested but not posix platform')
+                    return False
+                try:
+                    subprocess.run(["/sbin/iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"], check=True)
+                    subprocess.run(["/sbin/iptables", "-A", "OUTPUT", "-d", ip, "-j", "DROP"], check=True)
+                except FileNotFoundError:
+                    # Fallback to sudo iptables if present
+                    subprocess.run(["sudo", "iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"], check=True)
+                    subprocess.run(["sudo", "iptables", "-A", "OUTPUT", "-d", ip, "-j", "DROP"], check=True)
+
+            elif mode == 'netsh':
+                if os.name != 'nt':
+                    self.log.warning('netsh mode requested but not Windows platform')
+                    return False
+                subprocess.run(["netsh", "advfirewall", "firewall", "add", "rule",
+                                "name=BlockIP", "dir=in",
+                                "action=block", f"remoteip={ip}"], check=True)
+
+            elif mode == 'aws':
+                # Requires AWS_NETWORK_ACL_ID and boto3 installed and credentials configured
+                try:
+                    import boto3
+                    net_acl = os.getenv('AWS_NETWORK_ACL_ID')
+                    if not net_acl:
+                        self.log.warning('AWS_NETWORK_ACL_ID not set; cannot block in AWS')
+                    else:
+                        ec2 = boto3.client('ec2')
+                        ec2.create_network_acl_entry(
+                            NetworkAclId=net_acl,
+                            RuleNumber=32767,
+                            Protocol='-1',
+                            RuleAction='deny',
+                            Egress=False,
+                            CidrBlock=f"{ip}/32"
+                        )
+                except Exception as e:
+                    self.log.error(f"Failed to block IP via AWS: {e}")
+                    return False
+
+            else:
+                self.log.warning(f'Unknown BLOCK_MODE: {mode}')
+                return False
+
+            # Optional: notify GUI or SIEM
+            try:
+                if hasattr(self, "gui_handler") and callable(getattr(self.gui_handler, 'update_threat', None)):
+                    self.gui_handler.update_threat({"event": "ip_block", "ip": ip, "timestamp": datetime.utcnow().isoformat()})
+            except Exception:
+                pass
+
+            try:
+                if hasattr(self, "siem_connector") and callable(getattr(self.siem_connector, 'send', None)):
+                    self.siem_connector.send({"event": "ip_block", "ip": ip, "timestamp": datetime.utcnow().isoformat()})
+            except Exception:
+                pass
+
+            return True
+
+        except subprocess.CalledProcessError as e:
+            self.log.error(f"IP block command failed: {e}")
+            return False
+        except Exception as e:
+            self.log.error(f"IP blocking failed: {e}")
+            return False
+
+    def add_artifact_batch(self, module_name: str, target: str, results: List[Dict[str, Any]]) -> None:
+        timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
         for result in results:
             result.setdefault("severity", "info")
             result.setdefault("category", module_name.lower())
             result.setdefault("tags", [])
             result.setdefault("source", "engine")
+            result.setdefault("timestamp", timestamp)
+
+            if result.get("category") == "ssrf_candidate":
+                result["type"] = "ssrf_event"
+                result["group"] = "SSRF"
+                result["risk"] = result.get("risk", result.get("severity", "info"))
+
+                final_host = result.get("final_host")
+                ports = result.get("internal_port_scan", [])
+                if final_host:
+                    try:
+                        from xss_security_gui.threat_analysis.internal_hosts_tab import INTERNAL_HOSTS_TAB
+                        INTERNAL_HOSTS_TAB.add_internal_host(final_host, ports)
+                    except Exception as e:
+                        self.log.warning(f"InternalHosts correlation failed: {e}")
 
             h = self._hash_artifact(module_name, target, result)
             with self._hash_lock:
@@ -890,7 +511,546 @@ class ThreatConnector:
                 "result": result,
             }
 
+            if not self._throttle():
+                self.log.debug("ThreatConnector: throttled add_artifact for %s → %s", module_name, target)
+                continue
+
             self._queue.put(artifact)
+
+            try:
+                sev = result.get("severity", "info").upper()
+                self.log.info(f"[TI] + Artifact ({module_name}) [{sev}] → {target}")
+            except Exception:
+                pass
+
+    def add_artifact(self, art: Dict[str, Any]) -> None:
+        """
+        Enhanced threat intelligence artifact processing with:
+        - Multiple threat intelligence backends
+        - Local threat database storage
+        - Real-time enrichment
+        - Correlation analysis
+        - Automated response triggers
+        - Account Intelligence (email, password, phone, card)
+        """
+        try:
+            # ============================================================
+            # 1. Basic artifact validation and default enrichment
+            # ============================================================
+            if not isinstance(art, dict):
+                raise ValueError("Artifact must be a dictionary")
+
+            # Ensure required fields exist
+            art.setdefault("module", "unknown")
+            art.setdefault("target", "unknown")
+            art.setdefault("timestamp", time.time())
+            art.setdefault("risk", "medium")
+            art.setdefault("status", "new")
+
+            # Extract core fields
+            module = art["module"]
+            target = art["target"]
+            result = art.get("result", {})
+            risk_level = art.get("risk", "medium")
+            source_ip = art.get("source_ip")
+            user_agent = art.get("user_agent")
+
+            # ============================================================
+            # 2. Threat Intelligence Enrichment (VirusTotal, AbuseIPDB, etc.)
+            # ============================================================
+            threat_feeds = [
+                self._check_virus_total(result),
+                self._check_abuse_ipdb(source_ip),
+                self._check_shodan(target),
+                self._check_openphish(result),
+                self._check_urlhaus(target)
+            ]
+
+            # Aggregate threat intelligence results
+            threat_data = {
+                "vt_score": next((f["score"] for f in threat_feeds if f and "score" in f), None),
+                "abuse_ipdb": next((f for f in threat_feeds if f and isinstance(f, dict) and "abuse_ipdb" in f), None),
+                "shodan": next((f for f in threat_feeds if f and isinstance(f, dict) and "shodan" in f), None),
+                "openphish": next((f for f in threat_feeds if f and isinstance(f, dict) and "openphish" in f), None),
+                "urlhaus": next((f for f in threat_feeds if f and isinstance(f, dict) and "urlhaus" in f), None)
+            }
+
+            # Attach enrichment data
+            art["threat_intel"] = threat_data
+            art["enriched"] = True
+
+            # ============================================================
+            # 2.1 Account Intelligence (email, password, phone, card)
+            # ============================================================
+            try:
+                extractor = AccountExtractor(art)
+                accounts = extractor.extract()
+
+                if accounts:
+                    best = max(accounts, key=lambda a: a.get("risk", 0))
+                    art["email"] = best.get("email")
+                    art["password"] = best.get("password")
+                    art["phone"] = best.get("phone")
+                    art["credit_card"] = best.get("credit_card")
+                else:
+                    art["email"] = None
+                    art["password"] = None
+                    art["phone"] = None
+                    art["credit_card"] = None
+
+            except Exception as e:
+                self.log.error(f"AccountExtractor failed: {e}")
+                art["email"] = None
+                art["password"] = None
+                art["phone"] = None
+                art["credit_card"] = None
+
+            # ============================================================
+            # 3. Risk Assessment & Correlation
+            # ============================================================
+            risk_score = self._calculate_risk_score(art, threat_data)
+
+            # Update risk level based on composite score
+            if risk_score >= 8:
+                art["risk"] = "critical"
+            elif risk_score >= 6:
+                art["risk"] = "high"
+            elif risk_score >= 4:
+                art["risk"] = "medium"
+            else:
+                art["risk"] = "low"
+
+            # ============================================================
+            # 4. Automated Response Triggers (SOC, firewall, watchlist)
+            # ============================================================
+            if art["risk"] in ["high", "critical"]:
+                self._trigger_response(art)
+
+            # ============================================================
+            # 5. Storage & Distribution
+            # ============================================================
+            # Store artifact in local threat database (SQLite)
+            self._store_threat(art)
+
+            # ============================================================
+            # 5.1 Live PII Update → RealTimeWatcher / GUI
+            # ============================================================
+            try:
+                LIVE_MONITOR_QUEUE.put_nowait({
+                    "event": "pii_update",
+                    "email": art.get("email"),
+                    "password": art.get("password"),
+                    "phone": art.get("phone"),
+                    "credit_card": art.get("credit_card"),
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+            except Exception:
+                pass
+
+            # Emit to ThreatConnector pipeline (DB + LiveMonitorQueue)
+            self.emit(module, target, result)
+
+            # Forward to SIEM if configured
+            if hasattr(self, 'siem_connector'):
+                self.siem_connector.send(art)
+
+            # Update GUI if available
+            if hasattr(self, 'gui_handler'):
+                self.gui_handler.update_threat(art)
+
+            self.log.info(
+                f"[ThreatConnector] Processed artifact {art.get('id', 'unknown')} "
+                f"with risk {art['risk']}"
+            )
+
+        except Exception as e:
+            # ============================================================
+            # 6. Error Handling + Dead Letter Queue
+            # ============================================================
+            self.log.error(f"[ThreatConnector] add_artifact error: {e}", exc_info=True)
+
+            # Store failed artifacts in DLQ (dead letter queue)
+            if hasattr(self, 'dlq'):
+                self.dlq.add(art, str(e))
+
+    def bulk(self, module: str, target: str, results: List[Dict[str, Any]]) -> None:
+        """Backwards-compatible bulk ingestion.
+
+        Delegates to add_artifact_batch which implements the project's batching
+        and enrichment flow.
+        """
+        try:
+            if not isinstance(results, list):
+                raise ValueError("results must be a list of artifact dicts")
+
+            # Normalize results items to dicts if necessary and delegate
+            sanitized = []
+            for r in results:
+                if not isinstance(r, dict):
+                    continue
+                sanitized.append(r)
+
+            if not sanitized:
+                self.log.debug("bulk called with no valid artifacts")
+                return
+
+            self.add_artifact_batch(module, target, sanitized)
+        except Exception as e:
+            self.log.error(f"bulk ingestion failed: {e}", exc_info=True)
+
+    def _check_virus_total(self, artifact_data: Dict) -> Optional[Dict]:
+        """Check artifact against VirusTotal API."""
+        try:
+            vt_api_key = os.getenv("VT_API_KEY")
+            if not vt_api_key:
+                return None
+
+            # Determine what to check based on artifact type
+            if "url" in artifact_data:
+                url_id = hashlib.sha256(artifact_data["url"].encode()).hexdigest()
+                params = {"apikey": vt_api_key, "resource": url_id}
+                response = requests.get(
+                    "https://www.virustotal.com/api/v3/urls",
+                    params=params
+                )
+
+            elif "ip" in artifact_data:
+                params = {"apikey": vt_api_key, "ip": artifact_data["ip"]}
+                response = requests.get(
+                    "https://www.virustotal.com/api/v3/ip_addresses",
+                    params=params
+                )
+
+            else:
+                return None
+
+            response.raise_for_status()
+            data = response.json()
+
+            return {
+                "score": data.get("data", {})
+                .get("attributes", {})
+                .get("last_analysis_stats", {})
+                .get("malicious", 0),
+                "source": "virustotal"
+            }
+
+        except Exception as e:
+            self.log.warning(f"VirusTotal check failed: {e}")
+            return None
+
+    def _check_abuse_ipdb(self, ip: str) -> Optional[Dict]:
+        """Check IP against AbuseIPDB."""
+        try:
+            api_key = os.getenv("ABUSEIPDB_API_KEY")
+            if not api_key or not ip:
+                return None
+
+            response = requests.get(
+                "https://api.abuseipdb.com/api/v2/check",
+                params={"ipAddress": ip, "maxAgeInDays": "90"},
+                headers={"Key": api_key, "Accept": "application/json"}
+            )
+
+            response.raise_for_status()
+            data = response.json()
+
+            abuse_confidence = data.get("data", {}).get("abuseConfidenceScore", 0)
+
+            return {
+                "abuse_ipdb": {
+                    "score": abuse_confidence,
+                    "country": data.get("data", {}).get("countryCode"),
+                    "isp": data.get("data", {}).get("isp")
+                },
+                "source": "abuseipdb"
+            }
+
+        except Exception as e:
+            self.log.warning(f"AbuseIPDB check failed: {e}")
+            return None
+
+    def _calculate_risk_score(self, artifact: Dict, threat_data: Dict) -> float:
+        """Calculate composite risk score (0–10)."""
+
+        base_score = 0
+
+        # Base risk from artifact
+        risk_map = {"low": 1, "medium": 3, "high": 6, "critical": 10}
+        base_score += risk_map.get(artifact.get("risk", "medium"), 3)
+
+        # Add from threat intelligence
+        if threat_data.get("vt_score", 0) > 5:
+            base_score += 3
+
+        if threat_data.get("abuse_ipdb", {}).get("score", 0) > 50:
+            base_score += 2
+
+        if threat_data.get("shodan", {}).get("vulnerabilities"):
+            base_score += 2
+
+        # Add for sensitive data types
+        sensitive_types = ["secret_leak", "pii_leak", "suspicious_network"]
+        if artifact.get("category") in sensitive_types:
+            base_score += 2
+
+        return min(base_score, 10)  # Cap at 10
+
+    def _trigger_response(self, artifact: Dict) -> None:
+        """Automated response triggers."""
+        try:
+            # Critical risk → immediate action
+            if artifact["risk"] == "critical":
+                if "source_ip" in artifact:
+                    self._block_ip(artifact["source_ip"])  # Firewall block
+
+                self._send_alert(artifact, "critical")  # SOC alert
+
+            # High risk → watchlist + SOC alert
+            elif artifact["risk"] == "high":
+                self._add_to_watchlist(artifact)
+                self._send_alert(artifact, "high")
+
+        except Exception as e:
+            self.log.error(f"Response trigger failed: {e}")
+
+    def _send_alert(self, artifact: Dict, level: str) -> bool:
+        """Send real security alert via multiple channels"""
+        try:
+            # Format timestamp safely
+            ts = artifact.get('timestamp')
+            try:
+                # If timestamp is numeric
+                from datetime import datetime
+                if isinstance(ts, (int, float)):
+                    ts_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+                else:
+                    ts_str = str(ts)
+            except Exception:
+                ts_str = str(ts)
+
+            alert_message = (
+                f"🚨 SECURITY ALERT ({level.upper()}) 🚨\n"
+                f"Module: {artifact.get('module', 'unknown')}\n"
+                f"Target: {artifact.get('target', 'unknown')}\n"
+                f"Category: {artifact.get('category', 'unknown')}\n"
+                f"Risk: {artifact.get('risk', 'unknown')}\n"
+                f"Details: {json.dumps(artifact.get('result', {}), indent=2)}\n"
+                f"Timestamp: {ts_str}\n"
+            )
+
+            # 1. Email alert
+            if hasattr(self, 'email_settings') and self.email_settings.get('enabled'):
+                try:
+                    import smtplib
+                    from email.mime.text import MIMEText
+
+                    msg = MIMEText(alert_message)
+                    msg['Subject'] = f"Security Alert: {level.upper()} - {artifact.get('target', 'unknown')}"
+                    msg['From'] = self.email_settings.get('from')
+                    msg['To'] = ', '.join(self.email_settings.get('to', []))
+
+                    smtp_server = self.email_settings.get('smtp_server')
+                    smtp_port = self.email_settings.get('smtp_port', 25)
+
+                    with smtplib.SMTP(smtp_server, smtp_port, timeout=10) as server:
+                        if self.email_settings.get('use_tls'):
+                            server.starttls()
+                        if self.email_settings.get('smtp_user'):
+                            server.login(self.email_settings.get('smtp_user'), self.email_settings.get('smtp_pass'))
+                        server.send_message(msg)
+                except Exception as e:
+                    self.log.error(f"Failed to send email alert: {e}")
+
+            # 2. Slack webhook
+            if hasattr(self, 'slack_webhook') and self.slack_webhook:
+                try:
+                    payload = {
+                        "text": alert_message,
+                        "username": "ThreatConnector",
+                        "icon_emoji": ":rotating_light:"
+                    }
+                    requests.post(self.slack_webhook, json=payload, timeout=5)
+                except Exception as e:
+                    self.log.error(f"Failed to send Slack alert: {e}")
+
+            # 3. PagerDuty integration
+            if hasattr(self, 'pagerduty_integration') and self.pagerduty_integration.get('enabled'):
+                try:
+                    routing_key = self.pagerduty_integration.get('routing_key')
+                    payload = {
+                        "routing_key": routing_key,
+                        "event_action": "trigger",
+                        "payload": {
+                            "summary": f"Security Alert: {level.upper()}",
+                            "severity": level,
+                            "source": "ThreatConnector",
+                            "custom_details": artifact
+                        }
+                    }
+                    requests.post(
+                        "https://events.pagerduty.com/v2/enqueue",
+                        json=payload,
+                        headers={"Content-Type": "application/json"},
+                        timeout=5
+                    )
+                except Exception as e:
+                    self.log.error(f"Failed to send PagerDuty alert: {e}")
+
+            self.log.info(f"[ThreatConnector] Alert ({level}) sent successfully")
+            return True
+        except Exception as e:
+            self.log.error(f"Failed to send alert: {e}")
+            return False
+
+    def _add_to_watchlist(self, artifact: Dict) -> bool:
+        """Add to persistent watchlist with safe DB path and optional in-memory cache."""
+        try:
+            # Determine watchlist type based on artifact
+            if artifact.get('category') == 'suspicious_network':
+                watchlist_type = 'network'
+            elif artifact.get('category') == 'secret_leak':
+                watchlist_type = 'credentials'
+            elif artifact.get('category') == 'pii_leak':
+                watchlist_type = 'pii'
+            else:
+                watchlist_type = 'general'
+
+            # Create watchlist entry
+            entry = {
+                "id": str(uuid.uuid4()),
+                "target": artifact.get('target'),
+                "type": watchlist_type,
+                "risk": artifact.get('risk'),
+                "timestamp": time(),
+                "data": artifact.get('result', {}),
+                "expiration": time() + (86400 * 30)  # 30 days default
+            }
+
+            # Ensure data directory exists and use project-local DB
+            data_dir = os.path.join(BASE_DIR, 'data')
+            os.makedirs(data_dir, exist_ok=True)
+            db_path = os.path.join(data_dir, 'threat_intel.db')
+
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS watchlist (
+                id TEXT PRIMARY KEY,
+                target TEXT,
+                type TEXT,
+                risk TEXT,
+                timestamp REAL,
+                data TEXT,
+                expiration REAL
+            )
+            ''')
+            cursor.execute('''
+            INSERT OR REPLACE INTO watchlist (id, target, type, risk, timestamp, data, expiration) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                entry['id'],
+                entry['target'],
+                entry['type'],
+                entry['risk'],
+                entry['timestamp'],
+                json.dumps(entry['data']),
+                entry['expiration']
+            ))
+            conn.commit()
+            conn.close()
+
+            # Also add to in-memory cache if available
+            if hasattr(self, 'watchlist_cache') and isinstance(self.watchlist_cache, dict):
+                try:
+                    self.watchlist_cache[entry['id']] = entry
+                except Exception:
+                    pass
+
+            # Trigger any automated actions based on watchlist type
+            if watchlist_type == 'network' and isinstance(artifact.get('result', {}), dict) and 'source_ip' in artifact.get('result', {}):
+                try:
+                    self._block_ip(artifact['result']['source_ip'])
+                except Exception:
+                    pass
+
+            self.log.info(f"[ThreatConnector] Added to {watchlist_type} watchlist: {artifact.get('target')}")
+            return True
+        except Exception as e:
+            self.log.error(f"Failed to add to watchlist: {e}")
+            return False
+
+    def _store_threat(self, artifact: Dict) -> None:
+        """Store artifact in local threat database (SQLite)."""
+        try:
+            conn = sqlite3.connect("threat_intel.db")
+            cursor = conn.cursor()
+
+            # Create table if not exists (extended with PII fields)
+            cursor.execute("""
+                           CREATE TABLE IF NOT EXISTS threats
+                           (
+                               id
+                               TEXT
+                               PRIMARY
+                               KEY,
+                               module
+                               TEXT,
+                               target
+                               TEXT,
+                               category
+                               TEXT,
+                               risk
+                               TEXT,
+                               status
+                               TEXT,
+                               data
+                               TEXT,
+                               timestamp
+                               REAL,
+                               threat_intel
+                               TEXT,
+                               email
+                               TEXT,
+                               password
+                               TEXT,
+                               phone
+                               TEXT,
+                               credit_card
+                               TEXT
+                           )
+                           """)
+
+            # Extract PII fields
+            email = artifact.get("email")
+            password = artifact.get("password")
+            phone = artifact.get("phone")
+            credit_card = artifact.get("credit_card")
+
+            # Insert or update
+            cursor.execute("""
+                INSERT OR REPLACE INTO threats
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                artifact.get("id"),
+                artifact.get("module"),
+                artifact.get("target"),
+                artifact.get("category"),
+                artifact.get("risk"),
+                artifact.get("status"),
+                json.dumps(artifact.get("result", {})),
+                artifact.get("timestamp"),
+                json.dumps(artifact.get("threat_intel", {})),
+                email,
+                password,
+                phone,
+                credit_card
+            ))
+
+            conn.commit()
+            conn.close()
+
+        except Exception as e:
+            self.log.error(f"Failed to store threat: {e}")
 
     def _worker_loop(self) -> None:
         batch: List[Dict[str, Any]] = []
@@ -916,7 +1076,20 @@ class ThreatConnector:
 
     def _flush_batch(self, batch: List[Dict[str, Any]]) -> None:
         try:
+            for a in batch:
+                try:
+                    extractor = AccountExtractor(a)
+                    accounts = extractor.extract()
+                    if accounts:
+                        res = a.get("result") or {}
+                        res["extracted_accounts"] = accounts
+                        a["result"] = res
+                        self.log.info(f"[AccountExtractor] extracted {len(accounts)} accounts from {a.get('module')}")
+                except Exception as e:
+                    self.log.warning(f"[AccountExtractor] failed for {a.get('_hash')}: {e}")
+
             self.backend.add_batch(batch)
+
             self.log.info(f"[ThreatIntel] Flushed {len(batch)} artifacts")
             for a in batch:
                 self.log.debug(f"[ThreatIntel] {a.get('module')} → {a.get('target')}")
@@ -926,7 +1099,6 @@ class ThreatConnector:
             batch.clear()
 
     def shutdown(self) -> None:
-        """Корректная остановка worker'а. Вызывать при завершении приложения."""
         self._stop_event.set()
         try:
             self._worker_thread.join(timeout=5)
@@ -948,30 +1120,71 @@ class ThreatConnector:
             return []
 
     def filter_by_module(self, module: str) -> List[Dict[str, Any]]:
-        data = self.load_all()
-        return [a for a in data if a.get("module") == module]
+        try:
+            return self.backend.find_by_module(module)
+        except Exception:
+            self.log.error("Failed to filter_by_module", exc_info=True)
+            return []
 
     def filter_by_severity(self, severity: str) -> List[Dict[str, Any]]:
         data = self.load_all()
-        return [a for a in data if a.get("result", {}).get("severity") == severity]
+        return [a for a in data if (a.get("result") or {}).get("severity") == severity]
 
     def filter_by_target(self, target: str) -> List[Dict[str, Any]]:
-        data = self.load_all()
-        return [a for a in data if a.get("target") == target]
+        try:
+            return self.backend.find_by_target(target)
+        except Exception:
+            self.log.error("Failed to filter_by_target", exc_info=True)
+            return []
 
     def summary(self) -> Dict[str, Any]:
-        data = self.load_all()
-        by_module: Dict[str, int] = {}
+        try:
+            return self.backend.stats()
+        except Exception:
+            self.log.error("Failed to summary from backend", exc_info=True)
+            return {"total": 0, "by_module": {}}
 
-        for a in data:
-            mod = a.get("module", "unknown")
-            by_module[mod] = by_module.get(mod, 0) + 1
+    def query(
+        self,
+        *,
+        category: Optional[str] = None,
+        risk: Optional[str] = None,
+        module: Optional[str] = None,
+        search: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+        order_by: str = "timestamp",
+        order_desc: bool = True,
+    ) -> List[Dict[str, Any]]:
+        try:
+            return self.backend.query(
+                category=category, risk=risk, module=module,
+                search=search, limit=limit, offset=offset,
+                order_by=order_by, order_desc=order_desc,
+            )
+        except Exception:
+            self.log.error("Failed to query backend", exc_info=True)
+            return []
 
-        return {"total": len(data), "by_module": by_module}
+    def count(
+        self,
+        *,
+        category: Optional[str] = None,
+        risk: Optional[str] = None,
+        module: Optional[str] = None,
+        search: Optional[str] = None,
+    ) -> int:
+        try:
+            return self.backend.count(
+                category=category, risk=risk, module=module,
+                search=search,
+            )
+        except Exception:
+            self.log.error("Failed to count from backend", exc_info=True)
+            return 0
 
     def generate_report(self) -> Dict[str, Any]:
         data = self.load_all()
-
         report = {
             "total": len(data),
             "by_module": {},
@@ -995,33 +1208,12 @@ class ThreatConnector:
 
         return report
 
-def _normalize_result_json(data: Any) -> Dict[str, Any]:
-    """
-    Приводит JSON из БД к безопасному dict-формату.
-    Гарантирует, что GUI никогда не упадёт на .get().
-    """
-    if isinstance(data, dict):
-        return data
-
-    if isinstance(data, list):
-        # Оборачиваем список в словарь
-        return {"items": data}
-
-    # Любой другой тип → пустой dict
-    return {}
-
 
 def _build_backend_from_env() -> ThreatBackendBase:
-    """
-    THREAT_BACKEND=ndjson|sqlite|elastic
+    import os
 
-    Для ElasticSearch:
-      THREAT_ES_URL=https://localhost:9200
-      THREAT_ES_INDEX=threat_intел
-      THREAT_ES_USER=...
-      THREAT_ES_PASS=...
-    """
-    backend_type = os.environ.get("THREAT_BACKEND", "ndjson").lower()
+    backend_type = os.environ.get("THREAT_BACKEND", "sqlite").lower()
+
     if backend_type == "sqlite":
         return SQLiteBackend()
     if backend_type == "elastic":
@@ -1030,7 +1222,10 @@ def _build_backend_from_env() -> ThreatBackendBase:
         user = os.environ.get("THREAT_ES_USER")
         pwd = os.environ.get("THREAT_ES_PASS")
         return ElasticSearchBackend(url=url, index=index, username=user, password=pwd)
-    return NdjsonBackend()
+
+    return SQLiteBackend()
 
 
 THREAT_CONNECTOR = ThreatConnector(_build_backend_from_env())
+
+

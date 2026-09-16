@@ -17,6 +17,7 @@ import subprocess
 import json
 import tkinter as tk
 from tkinter import ttk, messagebox
+from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
 
 # Универсальные импорты
 import xss_security_gui.settings as settings
@@ -44,10 +45,14 @@ class AutoAnalyzerTab(ttk.Frame, ThreatSenderMixin):
             insertbackground="white"
         )
         self.build_ui()
+        self._bridge = UIQueueBridge(self, poll_ms=80)
 
     def _log(self, text: str):
         self.result_box.insert("end", text + "\n")
         self.result_box.see("end")
+
+    def _ui_log(self, text: str):
+        self._bridge.post_ui(self._log, text)
 
     def build_ui(self):
         control = ttk.Frame(self)
@@ -76,32 +81,32 @@ class AutoAnalyzerTab(ttk.Frame, ThreatSenderMixin):
         if not domain.startswith("http"):
             messagebox.showwarning("Неверный ввод", "Укажите домен с http:// или https://")
             return
-        threading.Thread(target=self._crawl_worker, args=(domain,), daemon=True).start()
+        self._bridge.post_bg(self._crawl_worker, domain)
 
     def _crawl_worker(self, domain):
-        self.result_box.delete("1.0", "end")
-        self._log(f"🌍 Обход сайта: {domain} ...")
+        self._bridge.post_ui(self.result_box.delete, "1.0", "end")
+        self._ui_log(f"🌍 Обход сайта: {domain} ...")
 
         results = crawl_site(domain)
         save_outputs()
 
         if not results:
-            self._log("⚠️ Ничего не найдено или сайт не откликнулся.")
+            self._ui_log("⚠️ Ничего не найдено или сайт не откликнулся.")
             return
 
         all_links = []
-        self._log(f"🔎 Найдено страниц: {len(results)}")
+        self._ui_log(f"🔎 Найдено страниц: {len(results)}")
 
         for page in results:
-            self._log(f"📄 {page.get('url', '[?]')}")
+            self._ui_log(f"📄 {page.get('url', '[?]')}")
             for f in page.get("forms", []):
-                self._log(f"   📝 {f.get('method', '?')} {f.get('action', '?')} → поля: {f.get('inputs', [])}")
+                self._ui_log(f"   📝 {f.get('method', '?')} {f.get('action', '?')} → поля: {f.get('inputs', [])}")
             for script in page.get("scripts", []):
-                self._log(f"   📦 {script}")
+                self._ui_log(f"   📦 {script}")
             all_links.append(page.get("url"))
 
         self.links = list(filter(None, set(all_links)))
-        self._log("✅ Обход завершён. Готов к фуззингу.")
+        self._ui_log("✅ Обход завершён. Готов к фуззингу.")
 
         svg_path = settings.LOG_DIR / "crawl_graph.svg"
         if svg_path.exists():
@@ -114,21 +119,21 @@ class AutoAnalyzerTab(ttk.Frame, ThreatSenderMixin):
         if not self.links:
             messagebox.showinfo("Нет ссылок", "Сначала проведите обход сайта.")
             return
-        threading.Thread(target=self._fuzz_all_worker, daemon=True).start()
+        self._bridge.post_bg(self._fuzz_all_worker)
 
     def _fuzz_all_worker(self):
-        self._log("🚀 Запуск фуззинга всех URL...")
+        self._ui_log("🚀 Запуск фуззинга всех URL...")
         all_findings = []
         for url in self.links:
-            self._log(f"🎯 {url}")
+            self._ui_log(f"🎯 {url}")
             results = fuzz_url_params(url)
             if results:
                 for key, payload, test_url in results:
-                    self._log(f"✔️ XSS в параметре '{key}' → {test_url}")
+                    self._ui_log(f"✔️ XSS в параметре '{key}' → {test_url}")
                     all_findings.append({"param": key, "payload": payload, "url": test_url})
             else:
-                self._log("❌ Нет уязвимости")
-        self._log("✅ Фуззинг всех URL завершён.")
+                self._ui_log("❌ Нет уязвимости")
+        self._ui_log("✅ Фуззинг всех URL завершён.")
         THREAT_CONNECTOR.emit(module="AutoAnalyzer", target="links",
                               result={"check": "auto_fuzz", "findings": all_findings})
 
@@ -136,34 +141,34 @@ class AutoAnalyzerTab(ttk.Frame, ThreatSenderMixin):
         if not self.links:
             messagebox.showinfo("Нет ссылок", "Сначала проведите обычный обход.")
             return
-        threading.Thread(target=self._deep_analysis_worker, daemon=True).start()
+        self._bridge.post_bg(self._deep_analysis_worker)
 
     def _deep_analysis_worker(self):
         try:
-            self._log("🧬 Запуск глубокого анализа...")
+            self._ui_log("🧬 Запуск глубокого анализа...")
             analyze_list(self.links)
-            self._log("✅ deep_crawl.json создан. Можно открыть вкладку Глубокий анализ.")
+            self._ui_log("✅ deep_crawl.json создан. Можно открыть вкладку Глубокий анализ.")
             THREAT_CONNECTOR.emit(module="AutoAnalyzer", target="deep_analysis",
                                   result={"check": "deep_analysis", "links": self.links})
         except Exception as e:
-            self._log(f"❌ Ошибка при анализе: {e}")
+            self._ui_log(f"❌ Ошибка при анализе: {e}")
 
     def fuzz_forms(self):
-        threading.Thread(target=self._fuzz_forms_worker, daemon=True).start()
+        self._bridge.post_bg(self._fuzz_forms_worker)
 
     def _fuzz_forms_worker(self):
         path = settings.JSON_CRAWL_EXPORT_PATH
         if not path.exists():
-            self._log("❌ Нет результатов краулинга. Сначала обойдите сайт.")
+            self._ui_log("❌ Нет результатов краулинга. Сначала обойдите сайт.")
             return
         try:
             with open(path, encoding="utf-8") as f:
                 crawl_data = json.load(f)
         except Exception:
-            self._log("❌ Ошибка чтения crawler_results.json")
+            self._ui_log("❌ Ошибка чтения crawler_results.json")
             return
 
-        self._log("🎯 Начинаю фуззинг всех форм...")
+        self._ui_log("🎯 Начинаю фуззинг всех форм...")
         form_findings = []
         for page in crawl_data:
             forms = page.get("forms", [])
@@ -174,13 +179,13 @@ class AutoAnalyzerTab(ttk.Frame, ThreatSenderMixin):
                 inputs = form.get("inputs", [])
                 if not inputs:
                     continue
-                self._log(f"🧪 Тестирую: {action} ({method}) с полями {inputs}...")
+                self._ui_log(f"🧪 Тестирую: {action} ({method}) с полями {inputs}...")
                 results = fuzz_form(action, method, inputs)
                 for res in results:
                     if res.get("vulnerable"):
-                        self._log(f"⚠️ XSS на {res['url']} с payload: {res['payload']}")
+                        self._ui_log(f"⚠️ XSS на {res['url']} с payload: {res['payload']}")
                         form_findings.append(res)
-        self._log("✅ Фуззинг форм завершён.")
+        self._ui_log("✅ Фуззинг форм завершён.")
         THREAT_CONNECTOR.emit(module="AutoAnalyzer", target="forms",
                               result={"check": "form_fuzzer", "findings": form_findings})
 
@@ -211,6 +216,13 @@ class AutoAnalyzerTab(ttk.Frame, ThreatSenderMixin):
                 else:  # Linux/Unix
                     subprocess.Popen(["xdg-open", str(path)])
             except Exception as e:
-                self._log(f"❌ Не удалось открыть лог: {e}")
+                self._ui_log(f"❌ Не удалось открыть лог: {e}")
         else:
-            self._log("⚠️ Лог ошибок отсутствует. Ещё не было сбоев или он не создан.")
+            self._ui_log("⚠️ Лог ошибок отсутствует. Ещё не было сбоев или он не создан.")
+
+    def destroy(self):
+        try:
+            self._bridge.stop()
+        except Exception:
+            pass
+        super().destroy()

