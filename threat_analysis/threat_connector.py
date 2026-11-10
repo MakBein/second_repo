@@ -1013,7 +1013,7 @@ def _normalize_result_json(data: Any) -> Dict[str, Any]:
 
 def _build_backend_from_env() -> ThreatBackendBase:
     """
-    THREAT_BACKEND=ndjson|sqlite|elastic
+    THREAT_BACKEND=sqlite|ndjson|elastic
 
     Для ElasticSearch:
       THREAT_ES_URL=https://localhost:9200
@@ -1021,7 +1021,9 @@ def _build_backend_from_env() -> ThreatBackendBase:
       THREAT_ES_USER=...
       THREAT_ES_PASS=...
     """
-    backend_type = os.environ.get("THREAT_BACKEND", "ndjson").lower()
+    # SQLite keeps startup bounded for large historical NDJSON archives.
+    # Set THREAT_BACKEND=ndjson explicitly when the archive backend is needed.
+    backend_type = os.environ.get("THREAT_BACKEND", "sqlite").lower()
     if backend_type == "sqlite":
         return SQLiteBackend()
     if backend_type == "elastic":

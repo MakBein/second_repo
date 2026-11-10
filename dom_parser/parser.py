@@ -1,6 +1,6 @@
 # xss_security_gui/dom_parser.py
 """
-DOMParser ULTRA 6.0
+DOMParser ULTRA 6.1
 Парсер DOM для XSS Security Suite:
 - Извлечение форм, скриптов, событий, медиа и др.
 - Интеграция с settings.py и ThreatConnector
@@ -9,7 +9,7 @@ DOMParser ULTRA 6.0
 import os
 import json
 from bs4 import BeautifulSoup, Comment
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import xss_security_gui.settings as settings
 from xss_security_gui.threat_analysis.threat_connector import THREAT_CONNECTOR
 
@@ -19,6 +19,12 @@ class DOMParser:
         self.soup = BeautifulSoup(html, "html.parser")
         self.threat_tab = threat_tab
         self.log_path = settings.LOG_DIR / "dom_parser.log"
+
+    def parse(self, html: Optional[str] = None) -> dict:
+        """Parse HTML and return the extracted DOM findings."""
+        if html is not None:
+            self.soup = BeautifulSoup(html, "html.parser")
+        return self.extract_all()
 
     def _safe_log(self, text: str):
         """Логирование в файл и консоль"""
@@ -253,4 +259,3 @@ class DOMParser:
             self._safe_log(f"[⚠️] Ошибка записи лога DOMParser: {e}")
 
         return results
-

@@ -184,3 +184,7 @@ class MutatorTaskManager:
 
     def list_tasks(self):
         return list(self.meta.values())
+
+    def shutdown(self) -> None:
+        """Stop accepting new work and cancel tasks that have not started."""
+        self.executor.shutdown(wait=False, cancel_futures=True)

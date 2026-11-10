@@ -17,9 +17,10 @@ class MutatorTasksPanel(tk.Frame):
     • Інформаційні секції (headers, cookies, CSP, tech, history, WAF)
     """
 
-    def __init__(self, parent, task_manager):
+    def __init__(self, parent, task_manager, ui_bridge=None):
         super().__init__(parent)
         self.task_manager = task_manager
+        self.ui_bridge = ui_bridge
         # === Мапа task_id → row_id ===
         self.rows = {}
 
@@ -64,13 +65,28 @@ class MutatorTasksPanel(tk.Frame):
         self.history_text = self._build_textbox(self.tab_history)
         self.waf_text = self._build_textbox(self.tab_waf)
 
-        # -------------------------------
-        # Підключення callback’ів
-        # -------------------------------
-        task_manager.on_task_added = self.on_task_added
-        task_manager.on_task_started = self.on_task_started
-        task_manager.on_task_finished = self.on_task_finished
-        task_manager.on_task_error = self.on_task_error
+        # Keep existing manager listeners while routing widget updates to Tk's thread.
+        for event_name in (
+            "on_task_added",
+            "on_task_started",
+            "on_task_finished",
+            "on_task_error",
+        ):
+            self._subscribe_to_task_event(event_name)
+
+    def _subscribe_to_task_event(self, event_name):
+        previous = getattr(self.task_manager, event_name)
+        handler = getattr(self, event_name)
+
+        def dispatch(*args, _previous=previous, _handler=handler):
+            if _previous is not None:
+                _previous(*args)
+            if self.ui_bridge is not None:
+                self.ui_bridge.post_ui(_handler, *args)
+            else:
+                _handler(*args)
+
+        setattr(self.task_manager, event_name, dispatch)
 
     # =========================================================
     # Вкладка "Задачи"

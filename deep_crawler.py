@@ -17,15 +17,13 @@ from playwright.sync_api import sync_playwright
 from xss_security_gui.js_inspector import extract_js_insights
 from xss_security_gui.crawler import extract_sensitive_data
 from xss_security_gui.settings import LOG_DIR
+from xss_security_gui.auto_recon.scope import (
+    is_target_authorized,
+    normalize_http_url,
+    same_origin,
+)
 # Глобальная очередь для Live Monitor
 LIVE_MONITOR_QUEUE: "queue.Queue[dict]" = queue.Queue()
-
-# Используем единую лог‑директорию из settings.py
-LOGS_DIR = str(LOG_DIR)
-os.makedirs(LOGS_DIR, exist_ok=True)
-
-logger = logging.getLogger("ThreatConnector6")
-logger.setLevel(logging.INFO)
 
 from xss_security_gui.auth.login_flow import (
     perform_login,
@@ -53,8 +51,6 @@ def _write_gui_log(filename: str, prefix: str, msg: str) -> None:
     Вспомогательная функция для записи в GUI‑логи.
     Все логи лежат в общей директории LOGS_DIR.
     """
-    from datetime import datetime, UTC
-
     timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
     path = os.path.join(LOGS_DIR, filename)
 
@@ -97,8 +93,6 @@ def log_error(msg: str, exc: Exception | None = None) -> None:
     • в logs/error_log.txt
     • сохраняет traceback, если есть Exception
     """
-    from datetime import datetime, UTC
-
     logger.error(msg)
 
     timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
@@ -179,7 +173,21 @@ def detect_cms(html: str, headers: dict = None, cookies: list = None, url: str =
             detected.add("TYPO3")
 
     # 2) Cookies
-    cookie_names = [c.get("name", "").lower() for c in cookies]
+    cookie_names = []
+    for c in cookies:
+        # Case 1: dict-like cookie
+        if isinstance(c, dict):
+            name = c.get("name", "")
+        # Case 2: RequestsCookieJar cookie object
+        elif hasattr(c, "name"):
+            name = getattr(c, "name", "")
+        # Case 3: tuple ("name", "value")
+        elif isinstance(c, tuple) and len(c) >= 1:
+            name = c[0]
+        # Fallback: convert to string
+        else:
+            name = str(c)
+        cookie_names.append(str(name).lower())
 
     cookie_map = {
         "wordpress_logged_in_": "WordPress",
@@ -634,12 +642,33 @@ def deep_crawl(url: str, config: dict) -> dict:
         context = browser.new_context(user_agent=ua, proxy=proxy)
         page = context.new_page()
 
-        if "login" in config:
-            perform_login(page, config["login"])
+        login_config = config.get("login")
+        if isinstance(login_config, dict):
+            try:
+                target_url = normalize_http_url(url)
+                login_url = normalize_http_url(str(login_config.get("url") or ""))
+                username = login_config.get("username")
+                password = login_config.get("password")
+                if (
+                    is_target_authorized(target_url)
+                    and same_origin(login_url, target_url)
+                    and isinstance(username, str)
+                    and username.strip()
+                    and isinstance(password, str)
+                    and password
+                ):
+                    perform_login(page, login_config)
+                else:
+                    result["errors"].append(
+                        "Login skipped: credentials must be explicitly supplied "
+                        "and the login URL must match an authorized target origin."
+                    )
+            except ValueError as exc:
+                result["errors"].append(f"Login skipped: invalid login scope: {exc}")
 
         try:
-            page.goto(url, timeout=15000)
-            page.wait_for_timeout(delay * 1000)
+            page.goto(url, timeout=35000, wait_until="networkidle")
+            page.wait_for_timeout(min(max(float(delay), 0), 5) * 1000)
 
             # Ссылки
             for a in page.query_selector_all("a[href]"):
@@ -757,24 +786,16 @@ def deep_crawl(url: str, config: dict) -> dict:
 
 # === Часть 7–8: deep_crawl_site + summary ===
 
-def deep_crawl_site(url: str) -> dict:
+def deep_crawl_site(url: str, login_config: dict | None = None) -> dict:
     """
     Глубокий анализ сайта после Playwright‑краулинга.
     """
     config = {
         "user_agent": "Mozilla/5.0 (XSS-Scanner)",
         "delay": 1.5,
-        "login": {
-            "url": url.rstrip("/") + "/login",
-            "username": "admin",
-            "password": "admin123",
-            "selectors": {
-                "username": "#username",
-                "password": "#password",
-                "submit": "button[type='submit']",
-            },
-        },
     }
+    if login_config is not None:
+        config["login"] = login_config
 
     print(f"[🧬] Запуск глубокого анализа: {url}")
     raw = deep_crawl(url, config)

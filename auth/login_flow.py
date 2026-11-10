@@ -1,4 +1,7 @@
 import os
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+from xss_security_gui.auto_recon.scope import is_target_authorized
 
 
 # ============================
@@ -15,7 +18,26 @@ def perform_login(page, login_config: dict) -> None:
     - не роняет GUI при любых ошибках
     """
     try:
-        # 0) Попытка восстановить сессию
+        login_url = login_config.get("url")
+        if not login_url:
+            print("[ℹ️] Login URL отсутствует — пропускаю авторизацию.")
+            return
+        if not isinstance(login_url, str) or not is_target_authorized(login_url):
+            print(
+                "[🚫] Login URL вне ALLOW_REAL_RUN / ALLOWED_TARGETS — "
+                "пропускаю авторизацию."
+            )
+            return
+        username = login_config.get("username")
+        password = login_config.get("password")
+        if not isinstance(username, str) or not username.strip():
+            print("[ℹ️] Логин не задан оператором — пропускаю авторизацию.")
+            return
+        if not isinstance(password, str) or not password:
+            print("[ℹ️] Пароль не задан оператором — пропускаю авторизацию.")
+            return
+
+        # Session restoration is part of the explicitly requested authenticated run.
         try:
             if load_session(page.context):
                 print("[🔄] Сессия восстановлена — проверяю авторизацию...")
@@ -24,13 +46,15 @@ def perform_login(page, login_config: dict) -> None:
         except Exception:
             pass
 
-        login_url = login_config.get("url")
-        if not login_url:
-            print("[ℹ️] Login URL отсутствует — пропускаю авторизацию.")
-            return
-
         # 1) Переход на страницу логина
-        page.goto(login_url, timeout=15000)
+        try:
+            page.goto(login_url, timeout=15000, wait_until="domcontentloaded")
+        except PlaywrightTimeoutError as exc:
+            print(
+                "[⚠️] Страница входа не загрузилась вовремя; "
+                f"пропускаю авторизацию и продолжаю пассивный анализ: {exc}"
+            )
+            return
         page.wait_for_timeout(800)
 
         # 2) AI‑детектор login‑форм
@@ -51,12 +75,12 @@ def perform_login(page, login_config: dict) -> None:
 
         # 3) Заполнение полей
         if user_sel and page.query_selector(user_sel):
-            page.fill(user_sel, login_config.get("username", "admin"))
+            page.fill(user_sel, username)
         else:
             print("[⚠️] Поле username не найдено или не определено — продолжаю только с паролем.")
 
         if pass_sel and page.query_selector(pass_sel):
-            page.fill(pass_sel, login_config.get("password", "admin123"))
+            page.fill(pass_sel, password)
         else:
             print("[⚠️] Поле пароля не найдено — прерываю авторизацию.")
             return

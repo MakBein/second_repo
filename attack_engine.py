@@ -22,9 +22,6 @@ from xss_security_gui.auto_modules.dom_and_endpoints import (
     attack_xss_targets,
 )
 
-from xss_security_gui.auto_modules.auto_modules import brute_force_tokens
-
-
 import xss_security_gui.settings as settings
 
 class AttackEngine:
@@ -483,6 +480,8 @@ class AttackEngine:
         tokens = ctx["secrets"]["tokens"]
         if not tokens:
             return {"status": "skipped", "reason": "no-tokens"}
+
+        from xss_security_gui.auto_modules.auto_modules import brute_force_tokens
 
         results = brute_force_tokens(
             session=self._session,

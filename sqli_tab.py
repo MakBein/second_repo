@@ -14,7 +14,7 @@ from xss_security_gui.threat_analysis.sqli_module import SQLiTester
 
 
 class SQLiTab(ttk.Frame):
-    """Вкладка SQLi з підтримкою WAF-evasion та узгодженими шляхами settings."""
+    """Вкладка SQLi із підтримкою WAF-evasion та узгодженими шляхами settings."""
 
     def __init__(self, parent, url: str, payload_file: str | None = None):
         super().__init__(parent)
@@ -29,6 +29,10 @@ class SQLiTab(ttk.Frame):
         default_file = payload_file or settings.get("payloads.sqli_file") or str(SQLI_PAYLOAD_FILE)
         self.payload_file = str(default_file)
         self.payloads: Dict[str, list] = self._load_payloads(silent=True)
+
+        # === UIQueueBridge для фоновых операций ===
+        from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
+        self._bridge = UIQueueBridge(self, poll_ms=50)
 
         self._build_ui()
 
@@ -117,11 +121,15 @@ class SQLiTab(ttk.Frame):
                 return False
             self.active_tests += 1
 
-        tester = self._make_tester(param, base_value, selected_payloads)
-        tester.start()
+        # Запускаємо в фоне через UIQueueBridge
+        def worker():
+           tester = self._make_tester(param, base_value, selected_payloads)
+           tester.start()
+
+        self._bridge.post_bg(worker)
 
         self._safe_log(
-            f"🔁 Цикл: запущено SQLi-тест (param={param}, category={category}, активних={self.active_tests})\n"
+           f"🔁 Цикл: запущено SQLi-тест (param={param}, category={category}, активних={self.active_tests})\n"
         )
         return True
 

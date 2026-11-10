@@ -1,16 +1,22 @@
 # xss_security_gui/threat_analysis/tester_base.py
 """
-TesterBase (ULTRA Hybrid 6.5+)
-------------------------------
-Базовый класс для всех тестеров (SQLi, XSS, CSRF, SSRF, LFI, RCE).
+TesterBase 11.0 — Combat Edition
+================================
+Базовий клас для всіх тестерів (SQLi, XSS, CSRF, SSRF, LFI, RCE).
 
-• Гибридные настройки (таймауты, ретраи, User-Agent) через settings.
-• Централизованная отправка артефактов в ThreatConnector.
-• Единый, расширяемый формат результата.
-• Безопасный вызов output_callback (GUI не падает из-за тестера).
-• Адаптивный троттлинг и детектор стабильности ответа.
-• Управляемый жизненный цикл (stop/abort), хуки до/после payload.
+• Повна сумісність з ThreatConnector 11.0
+• Повна сумісність з SQLiTester 11.0 / XSS / CSRF / SSRF / LFI / RCE
+• Адаптивний троттлінг (anti‑WAF)
+• Stability‑window (детекція однакових відповідей)
+• Ретраї, таймаути, User-Agent, проксі, SSL‑verify
+• Хуки до/після payload
+• Повна fault‑tolerance (ніколи не падає)
+• Повна cancellation‑safety
+• Повна thread‑safety
+• Уніфікований ThreatConnector‑friendly формат результатів
 """
+
+from __future__ import annotations
 
 import threading
 import logging
@@ -23,7 +29,7 @@ from xss_security_gui.settings import settings
 
 
 class TesterBase(threading.Thread):
-    """Базовый класс для тестеров уязвимостей."""
+    """Базовий клас для тестерів уразливостей (11.0)."""
 
     def __init__(
         self,
@@ -46,7 +52,7 @@ class TesterBase(threading.Thread):
         self.results: List[Dict[str, Any]] = []
 
         # ================================
-        # Гибридные настройки ULTRA 6.5+
+        # Hybrid Settings 11.0
         # ================================
         self.timeout: int = int(settings.get("http.request_timeout", 7))
         self.max_retries: int = int(settings.get("network.max_retries", 3))
@@ -54,17 +60,15 @@ class TesterBase(threading.Thread):
 
         # User-Agent
         self.default_headers: Dict[str, str] = {
-            "User-Agent": settings.get("http.default_user_agent", "XSS-Security-GUI/6.5")
+            "User-Agent": settings.get("http.default_user_agent", "XSS-Security-GUI/11.0")
         }
 
-        # Логирование
+        # Logging
         self.logger = logging.getLogger(f"{__name__}.{self.module_name}")
         log_level = settings.get("logging.level", "INFO").upper()
         self.logger.setLevel(getattr(logging, log_level, logging.INFO))
 
-        # -----------------------------
-        # Механизмы стабильности/троттлинга
-        # -----------------------------
+        # Stability / Throttle
         self.last_hashes: List[str] = []
         self.throttle_delay: float = 0.0
         self._stability_window: int = int(settings.get("analysis.stability_window", 10))
@@ -72,27 +76,27 @@ class TesterBase(threading.Thread):
         self._throttle_step_down: float = float(settings.get("analysis.throttle_step_down", 0.1))
         self._throttle_max: float = float(settings.get("analysis.throttle_max", 2.0))
 
-        # Управление жизненным циклом
+        # Lifecycle
         self._stop_event = threading.Event()
 
     # ============================================================
-    #  Управление жизненным циклом
+    # Lifecycle
     # ============================================================
     def stop(self) -> None:
-        """Запрашивает остановку тестера (мягкий abort)."""
-        self.logger.info("[%s] Получен запрос на остановку", self.module_name)
+        """М'яка зупинка тестера."""
+        self.logger.info("[%s] Stop requested", self.module_name)
         self._stop_event.set()
 
     def is_stopped(self) -> bool:
         return self._stop_event.is_set()
 
     # ============================================================
-    #  Основной поток тестирования
+    # Main testing loop
     # ============================================================
     def run(self) -> None:
         total_payloads = sum(len(v) for v in self.payloads.values())
         self.logger.info(
-            "[%s] Запуск тестирования для %s (payloads=%d)",
+            "[%s] Starting test for %s (payloads=%d)",
             self.module_name,
             self.base_url,
             total_payloads,
@@ -102,7 +106,7 @@ class TesterBase(threading.Thread):
             for payload in plist:
                 if self.is_stopped():
                     self.logger.info(
-                        "[%s] Тестирование прервано пользователем (category=%s, payload=%r)",
+                        "[%s] Aborted by user (category=%s, payload=%r)",
                         self.module_name,
                         category,
                         payload,
@@ -112,7 +116,7 @@ class TesterBase(threading.Thread):
 
                 full_value = f"{self.base_value}{payload}"
 
-                # Хук перед payload (можно переопределить в модуле)
+                # Before hook
                 self._before_payload(category, payload, full_value)
 
                 result = self._execute_with_retries(category, payload, full_value)
@@ -120,48 +124,55 @@ class TesterBase(threading.Thread):
                     self.results.append(result)
                     self._safe_emit(result)
 
-                # Хук после payload
+                # After hook
                 self._after_payload(category, payload, full_value, result)
 
         self._flush_results()
 
+    # ============================================================
+    # Flush results to ThreatConnector
+    # ============================================================
     def _flush_results(self) -> None:
-        """Отправка артефактов в ThreatConnector."""
         if not self.results:
             return
         try:
             self.connector.add_artifact(self.module_name, self.base_url, self.results)
             self.logger.info(
-                "[%s] %d результатов отправлено в ThreatConnector",
+                "[%s] %d results sent to ThreatConnector",
                 self.module_name,
                 len(self.results),
             )
         except Exception as e:
             self.logger.error(
-                "[%s] Ошибка отправки артефактов в ThreatConnector: %s",
+                "[%s] Failed to send artifacts to ThreatConnector: %s",
                 self.module_name,
                 e,
             )
 
     # ============================================================
-    #  Безопасный вызов output_callback
+    # Safe GUI callback
     # ============================================================
     def _safe_emit(self, result: Dict[str, Any]) -> None:
         if not self.output_callback:
             return
         try:
-            self.output_callback(result)
+            cb = self.output_callback
+            owner = getattr(cb, "__self__", None)
+            after = getattr(owner, "after", None)
+            if callable(after):
+                after(0, lambda r=result: cb(r))
+            else:
+                cb(result)
         except Exception as e:
-            # Никогда не валим поток из-за GUI/логики вывода
             self.logger.error(
-                "[%s] Ошибка в output_callback: %s (result=%r)",
+                "[%s] output_callback error: %s (result=%r)",
                 self.module_name,
                 e,
                 result,
             )
 
     # ============================================================
-    #  Ретраи (повторные попытки)
+    # Retry engine
     # ============================================================
     def _execute_with_retries(
         self,
@@ -173,21 +184,14 @@ class TesterBase(threading.Thread):
 
         for attempt in range(1, self.max_retries + 1):
             if self.is_stopped():
-                self.logger.debug(
-                    "[%s] Прерывание перед попыткой payload=%r",
-                    self.module_name,
-                    payload,
-                )
                 return None
 
             start = time.monotonic()
             try:
                 result = self._test_single(category, payload, full_value)
-                # Подкласс может вернуть None, если считает payload нерелевантным
                 if result is None:
                     return None
 
-                # Гарантируем базовые поля и duration
                 duration = time.monotonic() - start
                 result.setdefault("duration", duration)
                 result.setdefault("module", self.module_name)
@@ -202,7 +206,7 @@ class TesterBase(threading.Thread):
             except Exception as e:
                 last_error = e
                 self.logger.error(
-                    "[%s] Ошибка payload=%r (попытка %d/%d): %s",
+                    "[%s] Error payload=%r (attempt %d/%d): %s",
                     self.module_name,
                     payload,
                     attempt,
@@ -212,22 +216,15 @@ class TesterBase(threading.Thread):
                 if attempt < self.max_retries and not self.is_stopped():
                     time.sleep(self.retry_delay)
 
-        # Все попытки провалились — возвращаем унифицированный error-result
         if last_error is not None:
             return self._format_error_result(category, payload, last_error)
 
         return None
 
     # ============================================================
-    #  Универсальный тест одного payload
+    # Single payload test
     # ============================================================
     def _test_single(self, category: str, payload: str, full_value: str) -> Dict[str, Any]:
-        """
-        Базовая реализация, завязанная на:
-        • send_request (реализует подкласс)
-        • _analyze_response (реализует подкласс)
-        • _check_stability / _apply_throttle (реализованы здесь)
-        """
         self._apply_throttle()
 
         response = self.send_request(full_value)
@@ -252,11 +249,11 @@ class TesterBase(threading.Thread):
 
         analysis = self._analyze_response(text, headers_lower, response)
 
-        # Стабильность ответа
+        # Stability detection
         if self._check_stability(response.text):
             analysis["severity"] = "INFO"
             analysis["filtered"] = True
-            analysis["note"] = "Сервер повертає однакову відповідь — фільтр активний."
+            analysis["note"] = "Server returns identical responses — filter active."
             self.throttle_delay = min(self.throttle_delay + self._throttle_step_up, self._throttle_max)
         else:
             self.throttle_delay = max(self.throttle_delay - self._throttle_step_down, 0.0)
@@ -269,7 +266,7 @@ class TesterBase(threading.Thread):
         )
 
     # ============================================================
-    #  Throttle + stability helpers
+    # Throttle + stability
     # ============================================================
     def _apply_throttle(self) -> None:
         if self.throttle_delay > 0:
@@ -286,10 +283,9 @@ class TesterBase(threading.Thread):
         return len(self.last_hashes) >= 2 and len(set(self.last_hashes)) == 1
 
     # ============================================================
-    #  Хуки (могут быть переопределены в модулях)
+    # Hooks
     # ============================================================
     def _before_payload(self, category: str, payload: str, full_value: str) -> None:
-        """Хук перед отправкой payload (для модулей, если нужно)."""
         pass
 
     def _after_payload(
@@ -299,18 +295,13 @@ class TesterBase(threading.Thread):
         full_value: str,
         result: Optional[Dict[str, Any]],
     ) -> None:
-        """Хук после обработки payload (для модулей, если нужно)."""
         pass
 
     # ============================================================
-    #  Методы, которые должен реализовать подкласс
+    # Methods to override
     # ============================================================
     def send_request(self, full_value: str):
-        """
-        Должен быть реализован в модуле (SQLi/XSS/SSRF и т.д.).
-        Должен вернуть либо requests.Response, либо dict со статусом 'blocked'.
-        """
-        raise NotImplementedError("Подкласс должен реализовать send_request()")
+        raise NotImplementedError("send_request() must be implemented in subclass")
 
     def _analyze_response(
         self,
@@ -318,15 +309,10 @@ class TesterBase(threading.Thread):
         headers_lower: Dict[str, str],
         response,
     ) -> Dict[str, Any]:
-        """
-        Анализирует ответ и возвращает dict с полями:
-        • severity
-        • http_status / response_length / body_hit / header_hit / и т.д.
-        """
-        raise NotImplementedError("Подкласс должен реализовать _analyze_response()")
+        raise NotImplementedError("_analyze_response() must be implemented in subclass")
 
     # ============================================================
-    #  Унифицированный формат успешного результата
+    # Unified result formats
     # ============================================================
     def _format_result(
         self,
@@ -336,7 +322,6 @@ class TesterBase(threading.Thread):
         details: Any,
         **extra: Any,
     ) -> Dict[str, Any]:
-        """Базовый формат результата, который можно расширять через extra."""
         base: Dict[str, Any] = {
             "module": self.module_name,
             "url": self.base_url,
@@ -350,19 +335,12 @@ class TesterBase(threading.Thread):
         base.update(extra)
         return base
 
-    # ============================================================
-    #  Унифицированный формат ошибки
-    # ============================================================
     def _format_error_result(
         self,
         category: str,
         payload: str,
         error: Exception,
     ) -> Dict[str, Any]:
-        """
-        Стандартизованный error-result, чтобы GUI/ThreatConnector
-        могли обрабатывать ошибки так же, как и успехи.
-        """
         return {
             "module": self.module_name,
             "url": self.base_url,

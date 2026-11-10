@@ -6,9 +6,12 @@ import datetime
 import json
 import logging
 import re
+import os
+import secrets
 import threading
-from typing import Optional, List, Dict, Any
-from urllib.parse import urljoin
+from collections import deque
+from typing import Optional, List, Dict, Any, Callable
+from urllib.parse import urljoin, urldefrag
 
 # === Внешние библиотеки ===
 import requests
@@ -17,7 +20,14 @@ from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 
 # === Локальные утилиты ===
-from xss_security_gui.utils.core_utils import normalize_url
+from xss_security_gui.auto_recon.scope import (
+    RequestBudget,
+    is_target_authorized,
+    normalize_http_url,
+    RequestBudgetExceeded,
+    same_origin,
+    scoped_request,
+)
 from xss_security_gui.settings import LOG_DIR
 
 # === Локальные модули ===
@@ -35,25 +45,21 @@ def create_retry_session(
     status_forcelist: tuple = (429, 500, 502, 503, 504),
 ) -> requests.Session:
     """
-    Создаёт HTTP-сессию с автоматическим повтором запросов.
+    Создаёт HTTP-сессию без повторных запросов, чтобы сетевой бюджет был точным.
 
     Args:
-        total: общее количество попыток.
-        backoff_factor: задержка между попытками.
-        status_forcelist: коды ответов, при которых выполняется повтор.
+        total, backoff_factor, status_forcelist: retained for API compatibility.
     """
     retry = Retry(
-        total=total,
-        connect=total,
-        read=total,
-        status=total,
-        backoff_factor=backoff_factor,
+        total=0,
+        connect=0,
+        read=0,
+        status=0,
+        backoff_factor=0,
         status_forcelist=status_forcelist,
-        allowed_methods=frozenset(
-            ["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "TRACE", "PATCH"]
-        ),
+        allowed_methods=frozenset(["GET"]),
         raise_on_status=False,
-        respect_retry_after_header=True,
+        respect_retry_after_header=False,
     )
 
     adapter = HTTPAdapter(max_retries=retry)
@@ -61,6 +67,36 @@ def create_retry_session(
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
+
+
+def _read_bounded_response(response: requests.Response, max_bytes: int) -> str:
+    if not callable(getattr(response, "iter_content", None)):
+        return str(getattr(response, "text", ""))[:max_bytes]
+    chunks: list[bytes] = []
+    byte_count = 0
+    for chunk in response.iter_content(chunk_size=64 * 1024):
+        if not chunk:
+            continue
+        remaining = max_bytes - byte_count
+        chunks.append(chunk[:remaining])
+        byte_count += min(len(chunk), remaining)
+        if byte_count >= max_bytes:
+            break
+    return b"".join(chunks).decode(response.encoding or "utf-8", errors="replace")
+
+
+def _safe_response_excerpt(html: str, limit: int = 2000) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    for field in soup.find_all(["input", "textarea"]):
+        name = str(field.get("name") or "").lower()
+        field_type = str(field.get("type") or "").lower()
+        if field_type in {"password", "file"} or any(
+            marker in name
+            for marker in ("password", "passwd", "secret", "token", "cookie", "auth")
+        ):
+            field.attrs.pop("value", None)
+            field.clear()
+    return str(soup)[:limit]
 
 
 # ============================================================
@@ -76,13 +112,80 @@ class EndpointScanner:
     • Поддерживает XSS-сканирование
     """
 
-    def __init__(self, target_url: str, gui_callback: Optional[callable] = None):
+    def __init__(
+        self,
+        target_url: str,
+        gui_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        opsec_mode: str = "standard",
+        timeout: int = 5,
+        active_request_budget: Optional[RequestBudget] = None,
+        active_testing: bool = False,
+        max_pages: int = 100,
+        max_response_bytes: int = 1024 * 1024,
+    ):
         self.session = create_retry_session()
-        self.target = target_url.rstrip("/")
+        self.target = normalize_http_url(target_url)
+        self.authorized = is_target_authorized(self.target)
+        self.timeout = min(max(timeout, 1), 5)
+        self.active_request_budget = active_request_budget or RequestBudget(200)
+        self.active_testing = active_testing is True
+        self.max_pages = min(max(int(max_pages), 1), 100)
+        self.max_response_bytes = min(max(int(max_response_bytes), 1024), 1024 * 1024)
         self.headers = {"User-Agent": "AutoReconScanner/2.0"}
         self.endpoints: List[Dict[str, Any]] = []
         self.gui_callback = gui_callback
+        self.opsec_mode = opsec_mode or "standard"
         self.detector = XSSDetector()
+
+    @staticmethod
+    def _timestamp() -> str:
+        return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Consume the shared request budget and follow only in-scope redirects."""
+        if not is_target_authorized(url) or not same_origin(url, self.target):
+            raise requests.exceptions.InvalidURL("Request URL is outside the authorized origin")
+        if not self.active_request_budget.try_consume():
+            raise RequestBudgetExceeded("AutoRecon request budget exhausted")
+        kwargs.setdefault("stream", True)
+        return scoped_request(
+            self.session,
+            method,
+            url,
+            root_url=self.target,
+            timeout=self.timeout,
+            request_budget=self.active_request_budget,
+            initial_budget_consumed=True,
+            **kwargs,
+        )
+
+    def _read_response(self, response: requests.Response) -> str:
+        """Read at most the configured response cap, including compressed bodies."""
+        return _read_bounded_response(response, self.max_response_bytes)
+
+    @staticmethod
+    def _safe_headers(headers: Any) -> Dict[str, str]:
+        hidden = {"authorization", "proxy-authorization", "cookie", "set-cookie"}
+        return {
+            str(key): ("[redacted]" if str(key).lower() in hidden else str(value))
+            for key, value in dict(headers or {}).items()
+        }
+
+    @staticmethod
+    def _sensitive_field(name: str, field_type: str = "") -> bool:
+        key = f"{name} {field_type}".lower().replace("-", "_")
+        return field_type.lower() in {"password", "file"} or any(
+            marker in key
+            for marker in ("password", "passwd", "secret", "token", "cookie", "auth")
+        )
+
+    @staticmethod
+    def _canary() -> str:
+        return f"AUTORECON-CANARY-{secrets.token_hex(8)}"
+
+    @staticmethod
+    def _response_excerpt(html: str, limit: int = 2000) -> str:
+        return _safe_response_excerpt(html, limit)
 
     # --------------------------------------------------------
     # Вспомогательный метод: отправка событий в GUI
@@ -100,71 +203,163 @@ class EndpointScanner:
     # --------------------------------------------------------
 
     def scan(self) -> List[Dict[str, Any]]:
-        """Сканирует целевую страницу и извлекает формы, JS и XHR."""
-        try:
-            response = self.session.get(self.target, headers=self.headers, timeout=10)
-            response.raise_for_status()
-        except requests.exceptions.RequestException as e:
-            self._report_gui({"error": f"Failed to fetch target: {e}"})
-            logging.error(f"[EndpointScanner] Failed to fetch target {self.target}: {e}")
+        """Crawl same-origin pages and discover forms, scripts, and API endpoints."""
+        if not self.authorized:
+            self._report_gui(
+                {
+                    "status": "blocked",
+                    "error": "Target blocked by ALLOW_REAL_RUN/ALLOWED_TARGETS",
+                }
+            )
             return []
+        pending = deque([self.target])
+        queued = {self.target}
+        visited: set[str] = set()
+        discovered: list[Dict[str, Any]] = []
+        scripts: set[str] = set()
+        pages_read = 0
 
-        soup = BeautifulSoup(response.text, "html.parser")
+        while pending and pages_read < self.max_pages:
+            page_url = pending.popleft()
+            if page_url in visited:
+                continue
+            visited.add(page_url)
+            response: Optional[requests.Response] = None
+            try:
+                response = self._request(
+                    "GET",
+                    page_url,
+                    headers=self.headers,
+                )
+                if response.is_redirect or not same_origin(response.url, self.target):
+                    self._report_gui(
+                        {"status": "blocked", "url": page_url, "reason": "redirect_scope"}
+                    )
+                    continue
+                response.raise_for_status()
+                content_type = response.headers.get("Content-Type", "").lower()
+                if content_type and not any(
+                    media_type in content_type
+                    for media_type in ("text/html", "application/xhtml+xml")
+                ):
+                    continue
+                html = self._read_response(response)
+                page_url = response.url
+                pages_read += 1
+                soup = BeautifulSoup(html, "html.parser")
+                discovered.append(
+                    {
+                        "url": page_url,
+                        "method": "GET",
+                        "params": {},
+                        "source": "page",
+                        "status": response.status_code,
+                        "headers": self._safe_headers(response.request.headers),
+                        "response_headers": self._safe_headers(response.headers),
+                        "full_response": self._response_excerpt(html),
+                        "timestamp": self._timestamp(),
+                    }
+                )
+                discovered.extend(self.extract_forms(soup, page_url))
+                scripts.update(self.extract_js_links(soup, page_url))
 
-        forms = self.extract_forms(soup)
-        js_links = self.extract_js_links(soup)
-        apis = self.extract_xhr(js_links)
+                for anchor in soup.find_all("a", href=True):
+                    candidate = urljoin(page_url, str(anchor.get("href", "")))
+                    candidate, _fragment = urldefrag(candidate)
+                    if (
+                        candidate
+                        and same_origin(candidate, self.target)
+                        and candidate not in queued
+                    ):
+                        queued.add(candidate)
+                        pending.append(candidate)
+            except RequestBudgetExceeded as exc:
+                self._report_gui({"status": "limited", "reason": str(exc)})
+                break
+            except requests.exceptions.RequestException as exc:
+                self._report_gui({"warning": f"Failed to fetch page {page_url}: {exc}"})
+                logging.warning("[EndpointScanner] Failed to fetch %s: %s", page_url, exc)
+            finally:
+                if response is not None:
+                    response.close()
 
-        root_entry: Dict[str, Any] = {
-            "url": self.target,
-            "method": "GET",
-            "params": {},
-            "source": "root",
-            "status": response.status_code,
-            "headers": dict(response.request.headers),
-            "response_headers": dict(response.headers),
-            "full_response": response.text[:2000],
-            "timestamp": datetime.datetime.utcnow().isoformat(),
-        }
-
-        self.endpoints = [root_entry] + forms + apis
+        discovered.extend(self.extract_xhr(sorted(scripts)))
+        self.endpoints = self._deduplicate_endpoints(discovered)
         self._report_gui({"info": f"Discovered {len(self.endpoints)} endpoints"})
 
         # Отправляем артефакты в ThreatConnector
         try:
-            THREAT_CONNECTOR.add_artifact("EndpointScanner", self.target, self.endpoints)
+            if self.endpoints:
+                THREAT_CONNECTOR.add_artifact(
+                    "EndpointScanner",
+                    self.target,
+                    self.endpoints,
+                )
         except Exception as e:
             logging.error(f"[EndpointScanner] ThreatConnector error: {e}", exc_info=True)
 
         return self.endpoints
 
+    @staticmethod
+    def _deduplicate_endpoints(
+        endpoints: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        unique: dict[tuple[str, str, str], Dict[str, Any]] = {}
+        for endpoint in endpoints:
+            key = (
+                str(endpoint.get("url", "")),
+                str(endpoint.get("method", "GET")).upper(),
+                str(endpoint.get("source", "")),
+            )
+            unique.setdefault(key, endpoint)
+        return list(unique.values())
+
     # --------------------------------------------------------
     # Формы
     # --------------------------------------------------------
 
-    def extract_forms(self, soup: BeautifulSoup) -> List[Dict[str, Any]]:
+    def extract_forms(
+        self,
+        soup: BeautifulSoup,
+        page_url: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """Извлекает HTML-формы и превращает их в эндпоинты."""
         result: List[Dict[str, Any]] = []
+        source_url = page_url or self.target
 
         for form in soup.find_all("form"):
-            action = urljoin(self.target, form.get("action", ""))
+            action = urljoin(source_url, form.get("action", ""))
+            if not same_origin(action, self.target):
+                continue
             method = form.get("method", "GET").upper()
+            if method not in {"GET", "POST"}:
+                continue
 
-            params = {
-                inp.get("name"): ""
-                for inp in form.find_all("input")
-                if inp.get("name")
-            }
+            fields = []
+            params: Dict[str, str] = {}
+            for field in form.find_all(["input", "textarea", "select", "button"]):
+                name = str(field.get("name") or "").strip()
+                if not name:
+                    continue
+                field_type = str(field.get("type") or (
+                    "textarea" if field.name == "textarea" else
+                    "select" if field.name == "select" else "text"
+                )).lower()
+                fields.append({"name": name, "type": field_type})
+                if not self._sensitive_field(name, field_type):
+                    params.setdefault(name, "")
 
             result.append({
                 "url": action,
                 "method": method,
                 "params": params,
+                "fields": fields,
+                "page_url": source_url,
                 "source": "form",
                 "status": None,
                 "headers": dict(self.headers),
                 "response_headers": {},
-                "timestamp": datetime.datetime.utcnow().isoformat(),
+                "timestamp": self._timestamp(),
             })
 
         return result
@@ -173,11 +368,17 @@ class EndpointScanner:
     # JS-файлы
     # --------------------------------------------------------
 
-    def extract_js_links(self, soup: BeautifulSoup) -> List[str]:
+    def extract_js_links(
+        self,
+        soup: BeautifulSoup,
+        page_url: Optional[str] = None,
+    ) -> List[str]:
         """Возвращает список абсолютных ссылок на JS-файлы."""
+        source_url = page_url or self.target
         return [
-            urljoin(self.target, s["src"])
+            urljoin(source_url, s["src"])
             for s in soup.find_all("script", src=True)
+            if same_origin(urljoin(source_url, s["src"]), self.target)
         ]
 
     # --------------------------------------------------------
@@ -195,24 +396,35 @@ class EndpointScanner:
         )
 
         for js_url in js_links:
+            if not same_origin(js_url, self.target):
+                continue
             try:
-                resp = self.session.get(js_url, headers=self.headers, timeout=10)
-                js_text = resp.text
+                resp = self._request("GET", js_url, headers=self.headers)
+                if resp.is_redirect or not same_origin(resp.url, self.target):
+                    resp.close()
+                    continue
+                js_text = self._read_response(resp)
                 found = xhr_regex.findall(js_text)
 
                 for _, url in found:
                     full_url = urljoin(self.target, url)
+                    if not same_origin(full_url, self.target):
+                        continue
                     api_patterns.append({
                         "url": full_url,
-                        "method": "POST",
-                        "params": {"key": ""},
+                        "method": "GET",
+                        "params": {},
                         "source": "js",
                         "status": resp.status_code,
-                        "headers": dict(resp.request.headers),
-                        "response_headers": dict(resp.headers),
-                        "timestamp": datetime.datetime.utcnow().isoformat(),
+                        "headers": self._safe_headers(resp.request.headers),
+                        "response_headers": self._safe_headers(resp.headers),
+                        "timestamp": self._timestamp(),
                     })
+                resp.close()
 
+            except RequestBudgetExceeded as e:
+                self._report_gui({"status": "limited", "reason": str(e)})
+                break
             except requests.exceptions.RequestException as e:
                 self._report_gui({"warning": f"Failed to fetch JS {js_url}: {e}"})
                 logging.warning(f"[EndpointScanner] Failed to fetch JS {js_url}: {e}")
@@ -225,49 +437,110 @@ class EndpointScanner:
 
     def scan_xss_on_endpoints(
         self,
-        payload: str = "<img src=x onerror=alert(1)>",
+        payload: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Выполняет простое XSS-сканирование по всем GET-эндпоинтам.
+        Check same-origin GET/POST forms with a non-executable reflection canary.
+
+        Password/file and credential/token forms are never submitted. Supplying a
+        custom canary is supported for correlation, but executable markup is not.
         """
         results: List[Dict[str, Any]] = []
+        if not self.active_testing:
+            self._report_gui({"status": "skipped", "reason": "active_testing_not_confirmed"})
+            return results
+        if not self.authorized:
+            self._report_gui(
+                {"status": "blocked", "reason": "target_not_authorized"}
+            )
+            return results
+        canary = payload or self._canary()
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", canary):
+            raise ValueError("Only inert alphanumeric reflection canaries are accepted")
 
         for ep in self.endpoints:
-            if ep.get("method", "GET").upper() != "GET":
+            method = str(ep.get("method", "GET")).upper()
+            if method not in {"GET", "POST"}:
                 continue
-
-            try:
-                full_url = normalize_url(self.target, ep["url"])
-                response = self.session.get(
-                    full_url,
-                    params=ep.get("params", {}),
-                    headers=self.headers,
-                    timeout=10,
+            if ep.get("source") not in {"form"}:
+                continue
+            fields = ep.get("fields", [])
+            if not isinstance(fields, list) or any(
+                isinstance(field, dict)
+                and self._sensitive_field(
+                    str(field.get("name") or ""),
+                    str(field.get("type") or ""),
                 )
-                html = response.text
-                reflected = payload in html
+                for field in fields
+            ):
+                self._report_gui(
+                    {
+                        "status": "skipped",
+                        "reason": "sensitive_form_fields",
+                        "url": ep.get("url"),
+                    }
+                )
+                continue
+            params = ep.get("params")
+            if not isinstance(params, dict):
+                continue
+            safe_names = [
+                str(name)
+                for name in params
+                if isinstance(name, str) and not self._sensitive_field(name)
+            ]
+            if not safe_names:
+                continue
+            test_params = dict.fromkeys(params, "")
+            test_params[safe_names[0]] = canary
 
-                if reflected:
-                    context = self.detector.detect_xss_context(html, payload)
-                    js_hits = self.detector.scan_inline_js_for_payload(html, payload)
-                else:
-                    context, js_hits = "❌ Not reflected", []
+            response: Optional[requests.Response] = None
+            try:
+                endpoint_url = normalize_http_url(str(ep.get("url") or ""))
+                if not same_origin(endpoint_url, self.target):
+                    continue
+                request_kwargs = (
+                    {"params": test_params}
+                    if method == "GET"
+                    else {"data": test_params}
+                )
+                response = self._request(
+                    method,
+                    endpoint_url,
+                    headers=self.headers,
+                    **request_kwargs,
+                )
+                if response.is_redirect or not same_origin(response.url, self.target):
+                    response.close()
+                    continue
+                html = self._read_response(response)
+                reflected = canary in html
+                context = (
+                    self.detector.detect_xss_context(html, canary)
+                    if reflected
+                    else "Not reflected"
+                )
 
                 result: Dict[str, Any] = {
                     "url": response.url,
-                    "request_url": response.url,
+                    "request_url": endpoint_url,
                     "status": response.status_code,
-                    "method": ep.get("method", "GET"),
-                    "payload": payload,
-                    "context": context or "❓ Unknown",
-                    "category": context if reflected else "none",
-                    "js_hits": js_hits,
-                    "source": ep.get("source", "unknown"),
-                    "full_response": html[:2000],
-                    "headers": dict(response.request.headers),
-                    "response_headers": dict(response.headers),
-                    "timestamp": datetime.datetime.utcnow().isoformat(),
-                    "vulnerable": reflected,
+                    "method": method,
+                    "payload": canary,
+                    "context": (
+                        f"Input reflected (canary only): {context}"
+                        if reflected
+                        else "Not reflected"
+                    ),
+                    "category": "input_reflection" if reflected else "none",
+                    "source": "form_canary",
+                    "full_response": self._response_excerpt(html),
+                    "headers": self._safe_headers(response.request.headers),
+                    "response_headers": self._safe_headers(response.headers),
+                    "timestamp": self._timestamp(),
+                    "reflected": reflected,
+                    "finding_type": "reflection_only",
+                    "vulnerable": False,
                 }
 
                 results.append(result)
@@ -277,7 +550,9 @@ class EndpointScanner:
                     THREAT_CONNECTOR.add_artifact("XSSScanner", response.url, [result])
                 except Exception as e:
                     logging.error(f"[EndpointScanner] ThreatConnector XSS error: {e}", exc_info=True)
-
+            except RequestBudgetExceeded as e:
+                self._report_gui({"status": "limited", "reason": str(e)})
+                break
             except requests.exceptions.RequestException as e:
                 error_result = {
                     "url": ep.get("url"),
@@ -288,121 +563,192 @@ class EndpointScanner:
                 results.append(error_result)
                 self._report_gui(error_result)
                 logging.error(f"[EndpointScanner] XSS scan error for {ep.get('url')}: {e}")
+            finally:
+                if response is not None:
+                    response.close()
 
         return results
 
-    def fuzz_xss_parameters(self, base_params: Optional[Dict[str, Any]] = None, method: str = "GET") -> List[Dict[str, Any]]:
+    def fuzz_xss_parameters(
+            self,
+            base_params: Optional[Dict[str, Any]] = None,
+            method: str = "GET",
+    ) -> List[Dict[str, Any]]:
         """
-        Выполняет XSS‑fuzzing параметров.
-
-        Args:
-            base_params: словарь базовых параметров
-            method: HTTP‑метод (GET/POST)
-
-        Returns:
-            Список результатов fuzzing в формате, совместимом с AutoReconAnalyzerV2.
+        REAL XSS fuzzing (variant 4):
+        - Uses real XSS payloads (not canaries)
+        - Loads additional payloads from real_payloads.txt
+        - Detects reflection AND execution context
+        - Marks vulnerable=True only when execution is possible
         """
         results: List[Dict[str, Any]] = []
+
+        # Active testing required
+        if not self.active_testing:
+            self._report_gui({"status": "skipped", "reason": "active_testing_not_confirmed"})
+            return results
+
+        # Target must be authorized
+        if not self.authorized:
+            self._report_gui({"status": "blocked", "reason": "target_not_authorized"})
+            return results
+
+        method = method.upper()
+        if method not in {"GET", "POST"}:
+            raise ValueError("Only GET and POST are supported")
+
         base_params = base_params or {}
+        if not isinstance(base_params, dict):
+            raise TypeError("base_params must be a dictionary")
 
-        # Генерация payload‑ов через XSSDetector
-        generated = self.detector.fuzz_xss_parameters(
-            self.target,
-            base_params,
-            method,
-        )
+        # Filter out sensitive fields
+        safe_params = {
+            str(name): value
+            for name, value in base_params.items()
+            if isinstance(name, str)
+               and name
+               and not self._sensitive_field(name)
+        }
 
-        for entry in generated:
-            try:
-                # ------------------------------------------------------------
-                # 1. Определяем тип запроса
-                # ------------------------------------------------------------
-                if method.upper() == "GET" and isinstance(entry, str):
-                    full_url = normalize_url(self.target, entry)
-                    response = self.session.get(
-                        full_url,
-                        headers=self.headers,
-                        timeout=10,
-                    )
-                    payload_str = entry
+        if not safe_params:
+            return results
 
-                elif isinstance(entry, dict):
-                    url = normalize_url(self.target, entry.get("url", self.target))
-                    response = self.session.post(
-                        url,
-                        json=entry.get("json", {}),
-                        headers=self.headers,
-                        timeout=10,
-                    )
-                    payload_str = json.dumps(entry.get("json", {}), ensure_ascii=False)
+        # BUILT-IN REAL XSS PAYLOADS
+        builtin_payloads = [
+            '"><script>alert(1)</script>',
+            '"><img src=x onerror=alert(1)>',
+            '"><svg onload=alert(1)>',
+            '"><iframe src=javascript:alert(1)>',
+            "';alert(1);//",
+            "\"><body onload=alert(1)>",
+            "<script>alert(1)</script>",
+            "javascript:alert(1)",
+        ]
 
-                else:
-                    continue
+        # LOAD EXTERNAL PAYLOADS FROM FILE
+        external_payloads = []
+        try:
+            payload_file = os.path.join(
+                os.path.dirname(os.path.dirname(__file__)),
+                "auto_recon",
+                "target",
+                "real_payloads.txt"
+            )
 
-                html = response.text
-                reflected = payload_str in html
+            with open(payload_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        external_payloads.append(line)
+        except Exception as e:
+            logging.error(f"[XSSFuzzer] Failed to load external payloads: {e}", exc_info=True)
 
-                # ------------------------------------------------------------
-                # 2. Анализ отражения
-                # ------------------------------------------------------------
-                if reflected:
-                    context = self.detector.detect_xss_context(html, payload_str)
-                    js_hits = self.detector.scan_inline_js_for_payload(html, payload_str)
-                else:
-                    context, js_hits = "❌ Not reflected", []
+        # MERGE PAYLOADS
+        xss_payloads = builtin_payloads + external_payloads
 
-                # ------------------------------------------------------------
-                # 3. Формирование результата
-                # ------------------------------------------------------------
-                result = {
-                    "module": "XSSFuzzer",
-                    "url": response.url,
-                    "request_url": response.url,
-                    "status": response.status_code,
-                    "method": method.upper(),
-                    "payload": payload_str,
-                    "context": context or "❓ Unknown",
-                    "category": context if reflected else "none",
-                    "js_hits": js_hits,
-                    "source": "xss_fuzzer",
-                    "full_response": html[:2000],
-                    "headers": dict(response.request.headers),
-                    "response_headers": dict(response.headers),
-                    "response_length": len(html),
-                    "timestamp": datetime.datetime.utcnow().isoformat(),
-                    "vulnerable": reflected,
-                    "severity": "high" if reflected else "info",
-                }
+        # MAIN LOOP — test each parameter with each payload
+        for name in safe_params:
+            for payload in xss_payloads:
 
-                results.append(result)
-                self._report_gui(result)
+                params = dict(safe_params)
+                params[name] = payload
+
+                response: Optional[requests.Response] = None
 
                 try:
-                    THREAT_CONNECTOR.add_artifact("XSSFuzzer", result["url"], [result])
-                except Exception as e:
-                    logging.error(f"[XSSFuzzer] ThreatConnector error: {e}", exc_info=True)
+                    request_kwargs = {"params": params} if method == "GET" else {"data": params}
 
-            except requests.exceptions.RequestException as e:
-                # ------------------------------------------------------------
-                # Ошибка запроса
-                # ------------------------------------------------------------
-                error_result = {
-                    "module": "XSSFuzzer",
-                    "url": entry if isinstance(entry, str) else entry.get("url", self.target),
-                    "error": str(e),
-                    "source": "xss_fuzzer",
-                    "timestamp": datetime.datetime.utcnow().isoformat(),
-                    "severity": "error",
-                    "vulnerable": False,
-                }
+                    response = self._request(
+                        method,
+                        self.target,
+                        headers=self.headers,
+                        **request_kwargs,
+                    )
 
-                results.append(error_result)
-                self._report_gui(error_result)
+                    # Redirects or cross-origin responses are ignored
+                    if response.is_redirect or not same_origin(response.url, self.target):
+                        response.close()
+                        continue
 
-                try:
-                    THREAT_CONNECTOR.add_artifact("XSSFuzzer", error_result["url"], [error_result])
-                except Exception as e2:
-                    logging.error(f"[XSSFuzzer] ThreatConnector error: {e2}", exc_info=True)
+                    html = self._read_response(response)
+
+                    # Reflection detection
+                    reflected = payload in html
+
+                    # Context detection
+                    if reflected:
+                        context = self.detector.detect_xss_context(html, payload)
+                    else:
+                        context = "Not reflected"
+
+                    # Execution detection
+                    executable_contexts = {
+                        "JS Context",
+                        "Attribute Injection",
+                        "HTML Body",
+                        "URL Parameter",
+                    }
+
+                    vulnerable = reflected and context in executable_contexts
+
+                    result = {
+                        "module": "XSSFuzzer",
+                        "url": response.url,
+                        "request_url": self.target,
+                        "status": response.status_code,
+                        "method": method,
+                        "parameter": name,
+                        "payload": payload,
+                        "context": context,
+                        "category": "xss" if vulnerable else ("input_reflection" if reflected else "none"),
+                        "source": "xss_real_payloads",
+                        "full_response": self._response_excerpt(html),
+                        "headers": self._safe_headers(response.request.headers),
+                        "response_headers": self._safe_headers(response.headers),
+                        "response_length": len(html),
+                        "timestamp": self._timestamp(),
+                        "reflected": reflected,
+                        "finding_type": "xss_executable" if vulnerable else (
+                            "xss_reflection" if reflected else "none"
+                        ),
+                        "vulnerable": vulnerable,
+                        "severity": "high" if vulnerable else ("medium" if reflected else "info"),
+                    }
+
+                    results.append(result)
+                    self._report_gui(result)
+
+                    try:
+                        THREAT_CONNECTOR.add_artifact("XSSFuzzer", result["url"], [result])
+                    except Exception as e:
+                        logging.error(f"[XSSFuzzer] ThreatConnector error: {e}", exc_info=True)
+
+                except RequestBudgetExceeded as e:
+                    self._report_gui({"status": "limited", "reason": str(e)})
+                    break
+
+                except requests.exceptions.RequestException as e:
+                    error_result = {
+                        "module": "XSSFuzzer",
+                        "url": self.target,
+                        "error": str(e),
+                        "source": "xss_real_payloads",
+                        "timestamp": self._timestamp(),
+                        "severity": "error",
+                        "vulnerable": False,
+                    }
+
+                    results.append(error_result)
+                    self._report_gui(error_result)
+
+                    try:
+                        THREAT_CONNECTOR.add_artifact("XSSFuzzer", error_result["url"], [error_result])
+                    except Exception as e2:
+                        logging.error(f"[XSSFuzzer] ThreatConnector error: {e2}", exc_info=True)
+
+                finally:
+                    if response is not None:
+                        response.close()
 
         return results
 
@@ -453,20 +799,66 @@ def suggest_payload_by_category(category: str) -> str:
     return mapping.get(category, "<img src=x onerror=alert(1)>")
 
 
-def scan_url(url: str) -> Dict[str, Any]:
+def scan_url(
+    url: str,
+    request_budget: Optional[RequestBudget] = None,
+    max_response_bytes: int = 1024 * 1024,
+) -> Dict[str, Any]:
     """Минимальный сканер одного URL."""
+    budget = request_budget or RequestBudget(200)
+    response: Optional[requests.Response] = None
+    session = create_retry_session()
     try:
-        r = requests.get(url, timeout=5)
+        normalized_url = normalize_http_url(url)
+        if not is_target_authorized(normalized_url):
+            return {
+                "module": "URLScanner",
+                "url": url,
+                "text": "",
+                "headers": {},
+                "status": "blocked",
+                "error": "Target is outside ALLOW_REAL_RUN/ALLOWED_TARGETS",
+                "source": "scan_url",
+                "timestamp": datetime.datetime.utcnow().isoformat(),
+            }
+        if not budget.try_consume():
+            raise RequestBudgetExceeded("AutoRecon request budget exhausted")
+        response = scoped_request(
+            session,
+            "GET",
+            normalized_url,
+            root_url=normalized_url,
+            timeout=5,
+            stream=True,
+            request_budget=budget,
+            initial_budget_consumed=True,
+        )
+        if response.is_redirect or not same_origin(response.url, normalized_url):
+            return {
+                "module": "URLScanner",
+                "url": url,
+                "text": "",
+                "headers": {},
+                "status": "blocked",
+                "error": "Redirect target is outside the authorized origin",
+                "source": "scan_url",
+                "timestamp": datetime.datetime.utcnow().isoformat(),
+            }
+        response.raise_for_status()
+        text = _read_bounded_response(
+            response,
+            min(max(int(max_response_bytes), 1024), 1024 * 1024),
+        )
         return {
             "module": "URLScanner",
-            "url": url,
-            "text": r.text[:2000],
-            "headers": dict(r.headers),
-            "status": r.status_code,
+            "url": response.url,
+            "text": _safe_response_excerpt(text),
+            "headers": EndpointScanner._safe_headers(response.headers),
+            "status": response.status_code,
             "source": "scan_url",
             "timestamp": datetime.datetime.utcnow().isoformat(),
         }
-    except Exception as e:
+    except (requests.exceptions.RequestException, ValueError, TypeError) as e:
         return {
             "module": "URLScanner",
             "url": url,
@@ -477,11 +869,31 @@ def scan_url(url: str) -> Dict[str, Any]:
             "source": "scan_url",
             "timestamp": datetime.datetime.utcnow().isoformat(),
         }
+    finally:
+        if response is not None:
+            response.close()
+        session.close()
 
 
-def scan_multiple(urls: List[str]) -> List[Dict[str, Any]]:
-    """Сканирует список URL и возвращает список структур."""
-    return [scan_url(u) for u in urls]
+def scan_multiple(
+    urls: List[str],
+    max_requests: int = 200,
+    max_response_bytes: int = 1024 * 1024,
+) -> List[Dict[str, Any]]:
+    """Scan authorized URLs with one shared request and response-size budget."""
+    budget = RequestBudget(min(max(int(max_requests), 0), 200))
+    results = []
+    for url in urls:
+        if budget.used >= budget.limit:
+            break
+        results.append(
+            scan_url(
+                url,
+                request_budget=budget,
+                max_response_bytes=max_response_bytes,
+            )
+        )
+    return results
 
 # ============================================================
 #  NDJSON логирование XSS
@@ -585,5 +997,3 @@ if __name__ == "__main__":
 
     for r in responses[:3]:
         print(r.get("url"), r.get("category"), r.get("context"))
-
-

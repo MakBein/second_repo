@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict
+import json
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -70,6 +71,12 @@ class AITrainingTab(ttk.Frame):
 
         ttk.Button(
             bottom,
+            text="🔬 Test model (live)",
+            command=self._on_test_model,
+        ).pack(side="left", padx=5)
+
+        ttk.Button(
+            bottom,
             text="📄 Open training_report.json",
             command=self._open_training_report,
         ).pack(side="left", padx=5)
@@ -103,6 +110,43 @@ class AITrainingTab(ttk.Frame):
             on_done=lambda _task_id, report: self._update_metrics(report),
             on_error=lambda _task_id, err: self._on_training_error(err),
         )
+
+    def _on_test_model(self) -> None:
+        """Live-test trained model on a JS snippet (runs in background)."""
+        from tkinter import simpledialog
+
+        raw_js = simpledialog.askstring("Test model", "Вставте JS-код для live-тесту:")
+        if not raw_js:
+            return
+
+        self.status_label.config(text="Testing model…")
+        self.progress.start(10)
+
+        import threading
+
+        def worker():
+            try:
+                from xss_security_gui.js_inspector import extract_js_insights
+                from xss_security_gui.ai_core.risk_engine import analyze_security_risk
+
+                js_insights = extract_js_insights(raw_js)
+                res = analyze_security_risk(js_insights, raw_js)
+            except Exception as e:
+                res = {"error": str(e)}
+
+            def on_done():
+                self.progress.stop()
+                self.status_label.config(text="Idle")
+                if "error" in res:
+                    messagebox.showerror("Model Test", f"Error: {res['error']}")
+                    self._append_metrics_text(f"Test error: {res['error']}\n")
+                else:
+                    pretty = json.dumps(res, ensure_ascii=False, indent=2)
+                    self._append_metrics_text("=== Live test result ===\n" + pretty + "\n")
+
+            self._root.after(1, on_done)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _on_training_error(self, e: Exception) -> None:
         self.progress.stop()

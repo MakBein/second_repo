@@ -89,6 +89,24 @@
     "max_size_mb": 20
   },
 
+  "autorecon": {
+  "allow_real_run": true,
+  "allowed_targets": [
+    "localhost",
+    "gazprombank.ru",
+    "https://gazprombank.ru"
+    ],
+  "disallowed_targets": ["https://disallowed.com"],
+  "max_concurrent_scans": 10,
+  "scan_timeout": 10,
+  "scan_types": ["xss", "sqli", "lfi", "ssrf", "idor"],
+  "scan_depth": 10,
+  "scan_interval": 10,
+  "report_format": "json",
+  "report_path": "LOG_DIR/autorecon_report.json",
+  "notification_email": "bambook@mailfence.com"
+  },
+
   "threat_intel": {
     "enable": false,
     "elk_url": "",

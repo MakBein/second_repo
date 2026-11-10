@@ -77,7 +77,12 @@ from .recon_pipeline import (
 # Full AutoRecon runner
 # =========================================================
 from .run_full_autorecon import (
+    run_full_autorecon as run_legacy_autorecon,
+)
+from .orchestrator import (
+    AutoReconOrchestrator,
     run_full_autorecon,
+    run_aggressive_scan,
 )
 
 # =========================================================
@@ -126,6 +131,9 @@ __all__ = [
 
     # Full AutoRecon
     "run_full_autorecon",
+    "run_legacy_autorecon",
+    "run_aggressive_scan",
+    "AutoReconOrchestrator",
 
     # GUI Elements
     "build_auto_recon_panel",

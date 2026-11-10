@@ -70,10 +70,6 @@ def warmup_model_async() -> None:
     threading.Thread(target=_load_model_background, daemon=True, name="AICoreModelWarmup").start()
 
 
-# Важливо: не блокуємо GUI на імпорті ai_core
-warmup_model_async()
-
-
 # ============================================================
 #  Публічний API
 # ============================================================
@@ -99,4 +95,3 @@ __all__ = [
     "_MODEL_LOADING",
     "warmup_model_async",
 ]
-

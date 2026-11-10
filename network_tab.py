@@ -12,6 +12,7 @@ from tkinter import ttk, filedialog, messagebox
 
 from xss_security_gui.network_checker import NetworkChecker
 from xss_security_gui.settings import LOG_DIR
+from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
 
 
 class NetworkTab(ttk.Frame):
@@ -30,6 +31,8 @@ class NetworkTab(ttk.Frame):
 
         # Последний успешный профиль (для экспорта)
         self.last_results: Dict[str, Any] = {}
+        self._bridge = UIQueueBridge(self, poll_ms=50)
+        self._pg_hba_report: Dict[str, Any] = {}
 
         # Гарантируем существование каталога логов
         try:
@@ -53,6 +56,7 @@ class NetworkTab(ttk.Frame):
         self.domain_entry.pack(side="left", padx=5)
 
         ttk.Button(top, text="🚀 Запустить проверку", command=self.run_scan).pack(side="left", padx=5)
+        ttk.Button(top, text="🔍 Поиск pg_hba.conf", command=self.run_pg_hba_scan).pack(side="left", padx=5)
         ttk.Button(top, text="🧹 Очистить вывод", command=self.clear_output).pack(side="left", padx=5)
         ttk.Button(top, text="💾 Сохранить данные", command=self.save_text).pack(side="left", padx=5)
         ttk.Button(top, text="📤 Экспорт JSON", command=self.export_json).pack(side="left", padx=5)
@@ -71,6 +75,37 @@ class NetworkTab(ttk.Frame):
     # ---------------------------------------------------------
     # Запуск NetworkChecker
     # ---------------------------------------------------------
+    def run_pg_hba_scan(self) -> None:
+        """Сетевой read-only поиск pg_hba.conf (PostgreSQL)."""
+        domain = self.domain_entry.get().strip()
+        if not domain:
+            messagebox.showerror("Ошибка", "Введите домен или URL")
+            return
+        if " " in domain:
+            messagebox.showerror("Ошибка", "Некорректный домен")
+            return
+
+        self.safe_log(f"🔍 Старт поиска pg_hba.conf для {domain}")
+
+        def worker() -> None:
+            try:
+                checker = NetworkChecker(domain, log_fn=self.safe_log)
+                report = checker.check_pg_hba_exposure()
+                self._bridge.post_ui(self._store_pg_hba_report, report)
+            except Exception as e:
+                self.safe_log(f"❌ Ошибка поиска pg_hba.conf: {e!r}")
+
+        self._bridge.post_bg(worker)
+
+    def _store_pg_hba_report(self, report: Dict[str, Any]) -> None:
+        self._pg_hba_report = report
+        if report.get("findings"):
+            self.last_results = {
+                "domain": report.get("domain"),
+                "timestamp": datetime.now(UTC).isoformat(),
+                "pg_hba_scan": report,
+            }
+
     def run_scan(self) -> None:
         domain = self.domain_entry.get().strip()
 
@@ -288,3 +323,10 @@ class NetworkTab(ttk.Frame):
             md += "_Нет результатов для отображения._\n"
 
         return md
+
+    def destroy(self) -> None:
+        try:
+            self._bridge.stop()
+        except Exception:
+            pass
+        super().destroy()
