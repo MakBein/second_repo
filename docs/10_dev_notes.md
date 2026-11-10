@@ -40,6 +40,7 @@ git log origin/main --oneline
 ###############################################################
 # cd C:\Users\sanch\PycharmProjects\itproger\xss_security_gui
 # показует все файлы проекта dir -Recurse
+# Get-ChildItem -Recurse -Filter *.py | Select-String -Pattern "post_bg" - показует все упоминания post_bg в коде
 ##############################################################
 Следующий шаг
 Теперь можешь запустить краулер:
@@ -881,3 +882,228 @@ git push
 
 Теперь твой движок будет запускать автоатаки в авторизованной сессии. Это позволит корректно тестировать 
 CSRF‑пейлоады из  и другие атаки, которые требуют входа в систему.
+
+############################################################################################
+1. ThreatDataLoader: загружено 12 артефактов
+ThreatDataLoader: сохранено 14 артефактов
+[ThreatIntel] Flushed 2 artifacts >>>>
+
+RealTimeWatcher дodав 2 нових артефакти
+
+ThreatConnector передав їх у AnalyzerJsonBackend
+
+AnalyzerJsonBackend дodав їх у analyzer1.json
+
+ThreatDataLoader тепер бачить 14 артефактів
+
+
+2. Система Threat Intel тепер працює як єдиний бойовий pipeline
+🔗 Повний ланцюг:
+RealTimeWatcher → ThreatConnector → AnalyzerJsonBackend → analyzer1.json → ThreatDataLoader → ThreatAnalysisTab
+
+############################################################################################
+
+🧠 1. Головний модуль, який витягує PII з HTML/JS/Headers
+✅ xss_security_gui/threat_analysis/account_extractor.py
+Це твій AccountExtractor 10.0, який:
+
+сканує HTML (full_response)
+
+витягує email, телефони, кредитки, токени
+
+парсить <script> → JSON → window.user / window.profile
+
+читає cookies (Set-Cookie)
+
+аналізує API JSON (api_response)
+
+витягує логіни/паролі з форм (params)
+
+Це основний модуль, який перетворює будь-який артефакт на акаунти.
+
+🧠 2. Модуль, який збирає артефакти з сайту
+✅ xss_security_gui/auto_recon/scanner.py → EndpointScanner
+Саме він:
+
+робить GET/POST запити
+
+отримує HTML
+
+отримує заголовки
+
+отримує cookies
+
+зберігає full_response
+
+зберігає response_headers
+
+зберігає params
+
+І передає це в ThreatConnector → AccountExtractor.
+
+🧠 3. Модуль, який робить глибокий аналіз сайту
+✅ xss_security_gui/deep_crawler.py → Deep Crawler 5.0
+Він витягує:
+
+всі форми
+
+всі скрипти
+
+всі мета-теги
+
+всі JSON-LD
+
+всі OpenGraph
+
+всі JS-файли
+
+всі API endpoints
+
+всі посилання
+
+всі технології (CMS, JS frameworks)
+
+CSP
+
+ризики сторінок
+
+І передає це в Threat Intel як артефакти.
+
+🧠 4. Модуль, який витягує PII з тексту
+✅ xss_security_gui/crawler.py → build_final_dict()
+Тут є твій старий PII‑екстрактор:
+
+email
+
+телефони
+
+токени
+
+JWT
+
+IP
+
+MAC
+
+API keys
+
+credit cards
+
+passwords
+
+secrets
+
+Це працює під час XSSAnalyzerApp та Deep Crawl.
+
+🧠 5. Модуль, який витягує email/password витоки
+✅ xss_security_gui/integrations/email_leak_worker.py → EmailLeakWorker
+Він шукає:
+
+email
+
+password
+
+phone
+
+address
+
+credit cards
+
+CVV
+
+expiry
+
+І додає в result["email_leak"].
+
+🧠 6. Модуль, який витягує SQL витоки
+✅ xss_security_gui/sqli_tab.py + SQLi Scanner
+Він додає:
+
+result["user_passwords"]
+
+result["db_leak"]
+
+result["credentials"]
+
+🧠 7. Модуль, який витягує LFI витоки
+✅ xss_security_gui/lfi_tab.py
+Він додає:
+
+файли з паролями
+
+конфіги
+
+токени
+
+ключі
+
+🧠 8. Модуль, який витягує SSRF витоки
+✅ xss_security_gui/ssrf_tab.py
+Він додає:
+
+внутрішні API
+
+внутрішні email
+
+внутрішні токени
+
+внутрішні конфіги
+
+🧠 9. Модуль, який збирає ВСІ артефакти
+✅ xss_security_gui/threat_analysis/threat_connector.py
+Це головний “мозок” Threat Intel:
+
+приймає артефакти від усіх модулів
+
+додає їх у ThreatDataLoader
+
+запускає AccountExtractor
+
+запускає AccountAggregator
+
+🧠 10. Модуль, який зберігає артефакти
+✅ xss_security_gui/threat_data_loader.py
+Він:
+
+читає analyzer1.json
+
+зберігає артефакти
+
+відновлює файл при пошкодженні
+
+🧠 11. Модуль, який витягує акаунти з артефактів
+✅ xss_security_gui/threat_analysis/account_aggregator.py
+Він:
+
+збирає акаунти з усіх джерел
+
+уникає дублікатів
+
+рахує risk score
+
+🧠 12. Модуль, який показує акаунти в GUI
+✅ xss_security_gui/threat_analysis/accounts_tab.py
+
+#######################################################################################################
+
+
+RealTimeWatcher
+    ↓
+Crawler / JSInspector / APIInspector
+    ↓
+PII Aggregator (цей файл)
+    ↓
+ThreatDataLoader.save()
+    ↓
+AccountExtractor
+    ↓
+AccountAggregator
+    ↓
+Account Intelligence Tab
+
+Тобто:
+
+🔥 PII Aggregator → створює артефакт email_leak
+🔥 AccountExtractor → витягує акаунти з email_leak
+🔥 AccountAggregator → об’єднує акаунти
+🔥 Account Intelligence → показує акаунти, домени, кореляції

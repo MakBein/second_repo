@@ -1,11 +1,23 @@
 # xss_security_gui/dom_parser.py
 """
+<<<<<<<< HEAD:dom_parser/parser.py
 DOMParser ULTRA 6.1
+========
+DOMParser ULTRA 7.0 — Backward Compatibility Layer
+>>>>>>>> origin/main:dom_parser.py
 Парсер DOM для XSS Security Suite:
 - Извлечение форм, скриптов, событий, медиа и др.
 - Интеграция с settings.py и ThreatConnector
+- Асинхронизация, кэширование, оптимизация производительности
+
+Для нового кода используйте:
+    from xss_security_gui.dom_parser import DOMParser, DOMParserAsync
+    
+Для старого кода остается полная обратная совместимость:
+    from xss_security_gui.dom_parser import DOMParser
 """
 
+<<<<<<<< HEAD:dom_parser/parser.py
 import os
 import json
 from bs4 import BeautifulSoup, Comment
@@ -259,3 +271,31 @@ class DOMParser:
             self._safe_log(f"[⚠️] Ошибка записи лога DOMParser: {e}")
 
         return results
+========
+# Re-export из нового пакета
+from xss_security_gui.dom_parser.parser import DOMParser, DOMParserAsync
+from xss_security_gui.dom_parser import (
+    DOMParserException,
+    HTMLSizeExceeded,
+    ParseTimeout,
+    InvalidHTML,
+    AsyncExecutor,
+    DOMParserCache,
+    MetricsCollector,
+    ProgressTracker,
+)
+
+__all__ = [
+    "DOMParser",
+    "DOMParserAsync",
+    "DOMParserException",
+    "HTMLSizeExceeded",
+    "ParseTimeout",
+    "InvalidHTML",
+    "AsyncExecutor",
+    "DOMParserCache",
+    "MetricsCollector",
+    "ProgressTracker",
+]
+
+>>>>>>>> origin/main:dom_parser.py

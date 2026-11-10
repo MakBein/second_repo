@@ -1,18 +1,23 @@
 # xss_security_gui/threat_analysis/engine.py
 """
-ThreatEngine (ULTRA Hybrid 6.5)
--------------------------------
-Оркестратор для модулей анализа угроз:
-• CSPAnalyzer
-• DOMEventMapper
-• CookieTracer
-• DOMXSSDetector (если подключён)
-• Любые другие анализаторы (plug-and-play)
-• Полностью устойчив к ошибкам и не ломает GUI
+ThreatEngine 11.0 — Combat Edition
+==================================
+Оркестратор для модулів аналізу загроз:
+• CSPAnalyzer 11.0
+• DOMEventMapper 11.0
+• CookieTracer 11.0
+• DOMXSSDetector 11.0 (якщо підключено)
+• Plug-and-play модулі
+• Повністю fault-tolerant
+• Асинхронний safe‑wait без блокування GUI
+• ThreatConnector-friendly структура
 """
 
+from __future__ import annotations
+
 import traceback
-from typing import Any, Dict, Callable
+import time
+from typing import Any, Dict
 
 from .csp_module import CSPAnalyzer
 from .dom_events_module import DOMEventMapper
@@ -20,10 +25,10 @@ from .cookie_tracer import CookieTracer
 
 
 class ThreatEngine:
-    """Управляет запуском всех модулей анализа угроз (устойчивый, расширяемый)."""
+    """Управляє запуском всіх модулів аналізу загроз (стабільний, розширюваний, бойовий)."""
 
     def __init__(self) -> None:
-        # Все модули должны иметь метод run(page_data)
+        # Модулі повинні мати run(page_data) або run_async(page_data, callback)
         self.modules: Dict[str, Any] = {
             "csp": CSPAnalyzer(),
             "dom_events": DOMEventMapper(),
@@ -31,30 +36,30 @@ class ThreatEngine:
         }
 
     # ---------------------------------------------------------
-    # Регистрация модулей
+    # Реєстрація модулів
     # ---------------------------------------------------------
     def register_module(self, name: str, module: Any) -> None:
         """
-        Регистрирует новый модуль анализа.
-        Модуль должен иметь метод run(page_data) или run_async(page_data, callback).
+        Реєструє новий модуль аналізу.
+        Модуль повинен мати run(page_data) або run_async(page_data, callback).
         """
         self.modules[name] = module
 
     # ---------------------------------------------------------
-    # Запуск всех модулей
+    # Запуск всіх модулів
     # ---------------------------------------------------------
     def run_all(self, page_data: dict) -> Dict[str, Any]:
         """
-        Запускает все зарегистрированные модули анализа.
+        Запускає всі зареєстровані модулі аналізу.
 
-        :param page_data: данные страницы (HTML, заголовки, скрипты)
-        :return: словарь с результатами по каждому модулю
+        :param page_data: дані сторінки (HTML, заголовки, скрипти)
+        :return: словник з результатами по кожному модулю
         """
         results: Dict[str, Any] = {}
 
         for name, module in self.modules.items():
             try:
-                # === Асинхронный модуль ===
+                # === Асинхронний модуль ===
                 if hasattr(module, "run_async"):
                     container = {"done": False, "result": None}
 
@@ -64,11 +69,11 @@ class ThreatEngine:
 
                     module.run_async(page_data, callback)
 
-                    # Ждём завершения (но не блокируем GUI)
-                    # Минимальный safe‑wait, чтобы не зависнуть
-                    for _ in range(200):
+                    # Safe‑wait: не блокує GUI, не зависає
+                    for _ in range(300):
                         if container["done"]:
                             break
+                        time.sleep(0.01)
 
                     results[name] = {
                         "status": "success",
@@ -76,7 +81,7 @@ class ThreatEngine:
                     }
                     continue
 
-                # === Обычный модуль ===
+                # === Синхронний модуль ===
                 if hasattr(module, "run") and callable(module.run):
                     data = module.run(page_data)
                     results[name] = {
@@ -90,7 +95,7 @@ class ThreatEngine:
                     }
 
             except Exception as e:
-                # Модуль упал — но движок и GUI продолжают работать
+                # Модуль упав — але ThreatEngine і GUI продовжують працювати
                 results[name] = {
                     "status": "error",
                     "error": str(e),
@@ -105,7 +110,7 @@ class ThreatEngine:
     # ---------------------------------------------------------
     def run_single(self, name: str, page_data: dict) -> Dict[str, Any]:
         """
-        Запускает один модуль по имени.
+        Запускає один модуль за ім'ям.
         """
         module = self.modules.get(name)
         if not module:

@@ -429,6 +429,18 @@ class Settings:
         return v
 
 
+    def __getitem__(self, key: str) -> Any:
+        value = self.get(key, None)
+        if value is None and key not in self.data:
+            raise KeyError(key)
+        return value
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self.data[key] = value
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.data or self._KEY_ALIASES.get(key) in self.data or self._KEY_ALIASES_REVERSE.get(key) in self.data
+
     def get(self, key: str, default: Any = None) -> Any:
         """
         Универсальный getter:

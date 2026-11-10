@@ -1,18 +1,23 @@
 # xss_security_gui/threat_analysis/csp_module.py
 """
-CSPAnalyzer (ULTRA Hybrid 6.5)
-------------------------------
-• Повний парсинг CSP (включно з nonce, hash, report-uri, report-to)
-• Виявлення слабких місць у всіх ключових директивах
+CSPAnalyzer 11.0 — Combat Edition
+=================================
+• Повний парсинг CSP (nonce, hash, report-uri, report-to)
+• Виявлення слабких місць у ключових директивах
 • Severity-оцінка у стилі ZAP / Mozilla Observatory
-• Threat Intel-friendly структура
+• ThreatConnector / Threat Intel-friendly структура
+• Підтримка асинхронного запуску (ThreadWorker 10.0)
 """
 
-from typing import Dict, Any, List
+from __future__ import annotations
+from typing import Dict, Any, List, Optional, Callable
+
+from xss_security_gui.utils.thread_worker import run_in_thread
+from xss_security_gui.utils.safe_call import safe_invoke
 
 
 class CSPAnalyzer:
-    """Поглиблений модуль аналізу CSP."""
+    """Поглиблений модуль аналізу CSP (11.0, ThreatConnector-ready)."""
 
     DEFAULT_WEAK_SOURCES = ["data:", "blob:", "*"]
     DEFAULT_DANGEROUS_FLAGS = ["'unsafe-inline'", "'unsafe-eval'"]
@@ -26,18 +31,18 @@ class CSPAnalyzer:
 
     def __init__(
         self,
-        threat_tab=None,
-        weak_sources: List[str] | None = None,
-        dangerous_flags: List[str] | None = None,
+        threat_connector: Any | None = None,
+        weak_sources: Optional[List[str]] = None,
+        dangerous_flags: Optional[List[str]] = None,
     ):
-        self.threat_tab = threat_tab
+        self.threat_connector = threat_connector
         self.WEAK_SOURCES = weak_sources or self.DEFAULT_WEAK_SOURCES
         self.DANGEROUS_FLAGS = dangerous_flags or self.DEFAULT_DANGEROUS_FLAGS
 
     # ---------------------------------------------------------
     # Основний метод
     # ---------------------------------------------------------
-    def run(self, page_data: Dict[str, Any]) -> Dict[str, Any]:
+    def analyze(self, page_data: Dict[str, Any]) -> Dict[str, Any]:
         headers = page_data.get("headers", {})
         csp = headers.get("Content-Security-Policy", "")
 
@@ -49,6 +54,8 @@ class CSPAnalyzer:
                 "issues": ["CSP header missing"],
                 "directives": {},
                 "raw": "",
+                "category": "csp_intel",
+                "module": "CSPAnalyzer",
             }
             self._report(result)
             return result
@@ -64,6 +71,8 @@ class CSPAnalyzer:
             "issues": issues,
             "directives": directives,
             "raw": csp,
+            "category": "csp_intel",
+            "module": "CSPAnalyzer",
         }
 
         self._report(result)
@@ -90,14 +99,14 @@ class CSPAnalyzer:
     # Аналіз директив
     # ---------------------------------------------------------
     def _analyze_directives(self, directives: Dict[str, List[str]]) -> List[str]:
-        issues = []
+        issues: List[str] = []
 
-        # === 1. Перевірка required-директив ===
+        # 1. Required директиви
         for required in self.REQUIRED_DIRECTIVES:
             if required not in directives:
                 issues.append(f"MISSING: {required} directive missing")
 
-        # === 2. Аналіз script-src ===
+        # 2. script-src / default-src
         script_src = directives.get("script-src") or directives.get("default-src") or []
 
         for flag in self.DANGEROUS_FLAGS:
@@ -108,30 +117,30 @@ class CSPAnalyzer:
             if weak in script_src:
                 issues.append(f"WEAK_SOURCE: script-src contains {weak}")
 
-        # === 3. Аналіз object-src ===
+        # 3. object-src
         object_src = directives.get("object-src", [])
         if not object_src or object_src == ["*"]:
             issues.append("WEAK: object-src is missing or too permissive")
 
-        # === 4. Аналіз base-uri ===
+        # 4. base-uri
         base_uri = directives.get("base-uri", [])
         if not base_uri or "*" in base_uri:
             issues.append("WEAK: base-uri missing or wildcard")
 
-        # === 5. Аналіз frame-ancestors ===
+        # 5. frame-ancestors
         frame_anc = directives.get("frame-ancestors", [])
         if not frame_anc or "*" in frame_anc:
             issues.append("WEAK: frame-ancestors missing or wildcard")
 
-        # === 6. Mixed content ===
+        # 6. Mixed content
         if "upgrade-insecure-requests" not in directives:
             issues.append("MISSING: upgrade-insecure-requests")
 
-        # === 7. Nonce/hash перевірка ===
-        if not any("nonce-" in v or "sha256-" in v for v in script_src):
+        # 7. nonce/hash
+        if not any("nonce-" in v or "sha256-" in v or "sha384-" in v or "sha512-" in v for v in script_src):
             issues.append("WEAK: no nonce/hash in script-src")
 
-        # === 8. report-uri/report-to ===
+        # 8. reporting
         if "report-uri" not in directives and "report-to" not in directives:
             issues.append("INFO: no reporting endpoint configured")
 
@@ -152,17 +161,49 @@ class CSPAnalyzer:
         return "LOW"
 
     # ---------------------------------------------------------
-    # Threat Intel інтеграція
+    # ThreatConnector інтеграція
     # ---------------------------------------------------------
     def _report(self, result: Dict[str, Any]) -> None:
-        if not self.threat_tab:
+        if not self.threat_connector:
             return
 
-        self.threat_tab.add_threat({
-            "type": "CSP",
-            "severity": result["severity"],
-            "issues": result["issues"],
-            "directives": result["directives"],
-            "raw": result["raw"],
-            "source": "CSPAnalyzer",
-        })
+        try:
+            self.threat_connector.add_artifact({
+                "type": "CSP",
+                "category": "csp_intel",
+                "severity": result["severity"],
+                "issues": result["issues"],
+                "directives": result["directives"],
+                "raw": result["raw"],
+                "source": "CSPAnalyzer",
+            })
+        except Exception:
+            pass
+
+    # ---------------------------------------------------------
+    # Async / ThreadWorker інтеграція
+    # ---------------------------------------------------------
+    def analyze_async(
+        self,
+        page_data: Dict[str, Any],
+        callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> None:
+        def work_fn(progress, is_cancelled):
+            return self.analyze(page_data)
+
+        def on_success(result: Dict[str, Any]) -> None:
+            if callback:
+                safe_invoke(callback, result)
+
+        def on_error(e: Exception) -> None:
+            if callback:
+                safe_invoke(callback, {"status": "error", "error": str(e)})
+
+        run_in_thread(
+            work_fn,
+            name="CSPAnalyzer",
+            on_success=on_success,
+            on_progress=None,
+            on_error=on_error,
+            on_finally=None,
+        )

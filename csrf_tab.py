@@ -6,6 +6,7 @@ from typing import Any, Dict
 
 from xss_security_gui.settings import PAYLOADS_DIR, THREAT_INTEL_ARTIFACT_PATH
 from xss_security_gui.threat_analysis.csrf_module import CSRFTester
+from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
 
 
 class CSRFTab(tk.Frame):
@@ -21,6 +22,9 @@ class CSRFTab(tk.Frame):
 
         # === Загрузка payload-ов ===
         self.payloads: Dict[str, list] = self._load_payloads()
+
+        # === UIQueueBridge для фоновых операций ===
+        self._bridge = UIQueueBridge(self, poll_ms=50)
 
         # === UI ===
         self._build_ui()
@@ -74,7 +78,7 @@ class CSRFTab(tk.Frame):
         self.output.tag_config("INFO", foreground="white")
         self.output.tag_config("ERROR", foreground="red")
 
-    # ============================================================
+     # ============================================================
     #  Запуск тестов
     # ============================================================
     def run_tests(self) -> None:
@@ -95,17 +99,21 @@ class CSRFTab(tk.Frame):
         else:
             selected_payloads = {category: self.payloads.get(category, [])}
 
-        tester = CSRFTester(
-            base_url=self.url,
-            param=param,
-            base_value=base_value,
-            payloads=selected_payloads,
-            output_callback=self.display_result,
-        )
-        tester.start()
+        self._safe_log(f"🚀 Запущено CSRF-тестирование для {self.url} (param={param})\n")
         self.active_tests += 1
 
-        self._safe_log(f"🚀 Запущено CSRF-тестирование для {self.url} (param={param})\n")
+        # Запускаем в фоне через UIQueueBridge
+        def worker():
+            tester = CSRFTester(
+                base_url=self.url,
+                param=param,
+                base_value=base_value,
+                payloads=selected_payloads,
+                output_callback=self.display_result,
+            )
+            tester.start()
+
+        self._bridge.post_bg(worker)
 
     # ============================================================
     #  Потокобезопасный логгер в Text

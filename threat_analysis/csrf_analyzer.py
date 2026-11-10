@@ -1,28 +1,41 @@
 # xss_security_gui/threat_analysis/csrf_analyzer.py
 """
-CSRFAnalyzer (ULTRA Hybrid 6.5)
--------------------------------
-• Розширений пошук CSRF-токенів (input, meta, JS, hidden fields, SPA-фреймворки)
-• Аналіз заголовків на наявність CSRF-захисту (SameSite, Secure, Origin/Referer policy)
-• Уніфікований формат результатів (Threat Intel + TesterBase-сумісний)
+CSRFAnalyzer 11.0 — Combat Edition
+==================================
+• Розширений пошук CSRF-токенів (input, meta, JS, hidden, SPA)
+• Аналіз заголовків на CSRF-захист (SameSite, Secure, Origin/Referer, CORS)
+• ThreatConnector / Threat Intel-friendly формат результатів
 • ZAP-рівень точності та структурованості
+• Підтримка асинхронного запуску (ThreadWorker 10.0)
 """
 
+from __future__ import annotations
+
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Callable
+
 from bs4 import BeautifulSoup
+from xss_security_gui.utils.thread_worker import run_in_thread
+from xss_security_gui.utils.safe_call import safe_invoke
 
 
 class CSRFAnalyzer:
-    """Поглиблений модуль аналізу CSRF-токенів та заголовків."""
+    """Поглиблений модуль аналізу CSRF-токенів та заголовків (11.0, ThreatConnector-ready)."""
 
     DEFAULT_KEYWORDS = ["csrf", "xsrf", "token", "auth", "secure"]
 
-    def __init__(self, html: str, source_url: str = "unknown", keywords: List[str] | None = None):
+    def __init__(
+        self,
+        html: str,
+        source_url: str = "unknown",
+        keywords: Optional[List[str]] = None,
+        threat_connector: Any | None = None,
+    ):
         self.html = html or ""
         self.soup = BeautifulSoup(self.html, "html.parser")
         self.source_url = source_url
         self.keywords = keywords if keywords is not None else self.DEFAULT_KEYWORDS
+        self.threat_connector = threat_connector
 
     # ---------------------------------------------------------
     # Token Extraction
@@ -30,7 +43,7 @@ class CSRFAnalyzer:
     def extract_tokens(self) -> List[Dict[str, Any]]:
         tokens: List[Dict[str, Any]] = []
 
-        # === input-теги ===
+        # input-теги
         for input_tag in self.soup.find_all("input"):
             name = (input_tag.get("name") or "").lower()
             if any(k in name for k in self.keywords):
@@ -40,7 +53,7 @@ class CSRFAnalyzer:
                     "value": input_tag.get("value"),
                 })
 
-        # === hidden-поля ===
+        # hidden-поля
         for hidden in self.soup.find_all("input", {"type": "hidden"}):
             name = (hidden.get("name") or "").lower()
             if any(k in name for k in self.keywords):
@@ -50,7 +63,7 @@ class CSRFAnalyzer:
                     "value": hidden.get("value"),
                 })
 
-        # === meta-теги ===
+        # meta-теги
         for meta in self.soup.find_all("meta"):
             name = (meta.get("name") or "").lower()
             if any(k in name for k in self.keywords):
@@ -60,7 +73,7 @@ class CSRFAnalyzer:
                     "value": meta.get("content"),
                 })
 
-        # === JS-токени ===
+        # JS-токени
         for script in self.soup.find_all("script"):
             text = script.string or ""
             lower = text.lower()
@@ -70,8 +83,8 @@ class CSRFAnalyzer:
                     "snippet": lower[:200],
                 })
 
-        # === SPA-фреймворки (Angular, React, Vue) ===
-        if "window.__initial_state__" in self.html.lower():
+        # SPA-фреймворки
+        if "window.__initial_state__" in self.html.lower() or "window.__INITIAL_STATE__" in self.html:
             tokens.append({
                 "type": "spa",
                 "snippet": "window.__INITIAL_STATE__ detected",
@@ -85,7 +98,6 @@ class CSRFAnalyzer:
     # ---------------------------------------------------------
     def analyze_headers(self, headers: Dict[str, str]) -> Dict[str, Any]:
         issues: List[Dict[str, Any]] = []
-        headers_lower = {k.lower(): v for k, v in headers.items()}
 
         for k, v in headers.items():
             lk = k.lower()
@@ -103,7 +115,7 @@ class CSRFAnalyzer:
             if "access-control" in lk:
                 issues.append({"header": k, "value": v, "info": "cors-policy"})
 
-            # SameSite cookie
+            # SameSite / Secure / HttpOnly у Set-Cookie
             if "set-cookie" in lk:
                 if "samesite" not in lv:
                     issues.append({"header": k, "value": v, "warning": "missing SameSite"})
@@ -118,7 +130,7 @@ class CSRFAnalyzer:
         return {"issues": issues, "headers_checked": len(headers)}
 
     # ---------------------------------------------------------
-    # Full Analysis
+    # Full Analysis (ThreatConnector-friendly)
     # ---------------------------------------------------------
     def run_analysis(self, headers: Dict[str, str]) -> Dict[str, Any]:
         tokens = self.extract_tokens()
@@ -127,7 +139,8 @@ class CSRFAnalyzer:
         severity = self._assess_severity(tokens, header_analysis["issues"])
 
         result = {
-            "module": "CSRF",
+            "module": "CSRFAnalyzer",
+            "category": "csrf_intel",
             "url": self.source_url,
             "severity": severity,
             "status": "secure" if severity == "SECURE" else "potential-risk",
@@ -142,6 +155,14 @@ class CSRFAnalyzer:
         logging.info(
             f"[CSRFAnalyzer] Analysis complete: {result['status']} for {self.source_url}"
         )
+
+        # ThreatConnector інтеграція
+        if self.threat_connector:
+            try:
+                self.threat_connector.add_artifact(result)
+            except Exception:
+                pass
+
         return result
 
     # ---------------------------------------------------------
@@ -156,3 +177,31 @@ class CSRFAnalyzer:
         if tokens and not issues:
             return "SECURE"
         return "LOW"
+
+    # ---------------------------------------------------------
+    # Async / ThreadWorker інтеграція
+    # ---------------------------------------------------------
+    def run_analysis_async(
+        self,
+        headers: Dict[str, str],
+        callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> None:
+        def work_fn(progress, is_cancelled):
+            return self.run_analysis(headers)
+
+        def on_success(result: Dict[str, Any]) -> None:
+            if callback:
+                safe_invoke(callback, result)
+
+        def on_error(e: Exception) -> None:
+            if callback:
+                safe_invoke(callback, {"status": "error", "error": str(e)})
+
+        run_in_thread(
+            work_fn,
+            name="CSRFAnalyzer",
+            on_success=on_success,
+            on_progress=None,
+            on_error=on_error,
+            on_finally=None,
+        )

@@ -8,6 +8,8 @@ from tkinter import ttk
 
 from PIL import Image, ImageTk
 
+from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
+
 
 class SVGViewer(ttk.Frame):
     """
@@ -33,6 +35,7 @@ class SVGViewer(ttk.Frame):
         self._last_mtime = 0
         self._lock = threading.Lock()
         self._auto_reload = auto_reload
+        self._bridge = UIQueueBridge(self, poll_ms=100)
 
         # Верхня панель
         top = ttk.Frame(self)
@@ -66,7 +69,7 @@ class SVGViewer(ttk.Frame):
     def refresh(self):
         """Асинхронно оновлює PNG і відображає його."""
         self.status.set("Конвертация SVG…")
-        threading.Thread(target=self._convert_worker, daemon=True).start()
+        self._bridge.post_bg(self._convert_worker)
 
     # ============================================================
     # Асинхронна конвертація
@@ -211,4 +214,4 @@ class SVGViewer(ttk.Frame):
                 except Exception:
                     time.sleep(2)
 
-        threading.Thread(target=watcher, daemon=True, name="SVGWatcher").start()
+        self._bridge.post_bg(watcher)
