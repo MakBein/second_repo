@@ -22,6 +22,7 @@ import time
 from urllib.parse import urljoin, urlparse
 
 import requests
+from bs4 import BeautifulSoup
 from pythonping import ping
 
 from xss_security_gui.settings import settings, LOG_DIR
@@ -70,6 +71,57 @@ PG_HBA_AUTH_METHODS = (
     "ldap",
     "radius",
 )
+
+KNOWN_SERVICES = {
+    21: "FTP",
+    22: "SSH",
+    25: "SMTP",
+    53: "DNS",
+    80: "WEB",
+    81: "WEB",
+    443: "WEB",
+    465: "SMTPS",
+    587: "SMTP",
+    8080: "WEB",
+    8443: "WEB",
+    9443: "WEB",
+    1433: "MSSQL",
+    1521: "Oracle",
+    3306: "MySQL",
+    5432: "PostgreSQL",
+    6379: "Redis",
+    27017: "MongoDB",
+    3389: "RDP",
+    5601: "Kibana",
+    9200: "Elasticsearch",
+    2375: "Docker",
+    2376: "Docker TLS",
+}
+
+WEB_PORTS = {
+    80: "http",
+    81: "http",
+    443: "https",
+    8080: "http",
+    8443: "https",
+    9443: "https",
+}
+
+SERVICE_VALIDATORS = {
+    22: "_validate_ssh",
+    25: "_validate_smtp",
+    465: "_validate_smtp",
+    587: "_validate_smtp",
+    6379: "_validate_redis",
+    2375: "_validate_docker",
+    2376: "_validate_docker_tls",
+    9200: "_validate_elasticsearch",
+    3389: "_validate_rdp",
+    3306: "_validate_mysql",
+    27017: "_validate_mongodb",
+    5432: "_validate_postgresql",
+
+}
 
 
 def _hostname_from_target(target: str) -> str:
@@ -144,10 +196,24 @@ WAF_SIGNATURES = {
 
 def check_url_alive(url: str):
     try:
-        r = requests.head(url, timeout=5, allow_redirects=True)
-        return True, r.status_code
+        r = requests.get(url, timeout=10)
+        soup = BeautifulSoup(r.text, "html.parser")
+        forms = []
+        for form in soup.find_all("form"):
+            inputs = []
+            for inp in form.find_all(["input", "textarea", "select"]):
+                inputs.append({
+                    "name": inp.get("name"),
+                    "type": inp.get("type", "text")
+                })
+            forms.append({
+                "action": form.get("action", ""),
+                "method": form.get("method", "GET"),
+                "inputs": inputs
+            })
+        return forms
     except Exception:
-        return False, None
+        return []
 
 
 def check_ssl_valid(url: str):
@@ -185,10 +251,102 @@ class NetworkChecker:
         log_fn: Optional[Callable[[str], None]] = None,
     ):
         self.domain = domain.strip()
+
+        self.target_ip = None
+
+        try:
+
+            self.target_ip = socket.gethostbyname(
+                self.domain
+            )
+
+        except Exception:
+            pass
+
+        self.open_ports = []
+
+        self.scan_context = {
+            "open_ports": [],
+            "confirmed_services": [],
+            "possible_services": [],
+            "service_evidence": {},
+
+            "http": {},
+            "tls": {},
+            "icmp": {},
+            "waf": {},
+
+            "assessment_findings": [],
+
+            "started_at": None,
+            "finished_at": None,
+            "scan_duration": None,
+            "completed": False,
+        }
+
+        # ----------------------------------------------------
+        # Runtime findings
+        # ----------------------------------------------------
+
+        self.target_hostname = None
+
+        self.icmp_available = False
+
+        self.tls_version = None
+
+        self.alpn_protocol = None
+
+        self.waf_detected = False
+
+        self.waf_vendors = []
+
+        self.csp_header = None
+
+        self.hsts_enabled = False
+
+        self.http_server = None
+
+        self.content_type = None
+
+        self.geoip_data = {}
+
+        # ----------------------------------------------------
+        # UI / logging
+        # ----------------------------------------------------
+
         self.gui_output = gui_output
+
         self.log_fn = log_fn
-        self.user_agent = settings.get("crawl.user_agent", "Mozilla/5.0")
-        self.request_timeout = float(settings.get("http.default_timeout", 8))
+
+        # ----------------------------------------------------
+        # Settings
+        # ----------------------------------------------------
+
+        self.user_agent = settings.get(
+            "crawl.user_agent",
+            "Mozilla/5.0"
+        )
+
+        self.request_timeout = float(
+            settings.get(
+                "http.default_timeout",
+                8
+            )
+        )
+
+        self.connect_timeout = float(
+            settings.get(
+                "http.connect_timeout",
+                5
+            )
+        )
+
+        self.read_timeout = float(
+            settings.get(
+                "http.read_timeout",
+                8
+            )
+        )
 
     # ---------------------------------------------------------
     # Thread-safe log
@@ -223,207 +381,1292 @@ class NetworkChecker:
     # Run all checks async
     # ---------------------------------------------------------
     def run_all_checks(self):
-        threading.Thread(target=self._worker, daemon=True).start()
+        threading.Thread(
+            target=self._worker,
+            daemon=True
+        ).start()
+
+    def _safe_run(
+            self,
+            name: str,
+            func
+    ):
+
+        try:
+
+            func()
+
+        except Exception as e:
+
+            self._log(
+                f"❌ {name}: {type(e).__name__}: {e}"
+            )
 
     def _worker(self):
-        self._log(f"🌐 Запуск сетевых проверок для {self.domain}")
-        self.check_icmp()
-        self.check_http()
-        self.check_waf()
-        self.check_tls_and_alpn()
-        self.check_ports()
-        self.check_dns()
-        self.check_whois()
-        self.check_asn_geoip()
-        self._log("✔️ Сетевые проверки завершены.")
+
+        scan_started = time.time()
+
+        self.scan_context["started_at"] = (
+            datetime.now().isoformat()
+        )
+
+        self.scan_context["completed"] = False
+
+        self._log(
+            f"🌐 Запуск сетевых проверок для "
+            f"{self.domain}"
+        )
+
+        if self.target_ip:
+            self._log(
+                f"🎯 Target IP: "
+                f"{self.target_ip}"
+            )
+
+        # -------------------------------------------------
+        # Core Network Checks
+        # -------------------------------------------------
+
+        self._safe_run(
+            "ICMP",
+            self.check_icmp
+        )
+
+        self._safe_run(
+            "HTTP",
+            self.check_http
+        )
+
+        self._safe_run(
+            "WAF",
+            self.check_waf
+        )
+
+        self._safe_run(
+            "TLS",
+            self.check_tls_and_alpn
+        )
+
+        # -------------------------------------------------
+        # TCP Scan
+        # -------------------------------------------------
+
+        self._safe_run(
+            "PortScan",
+            self.check_ports
+        )
+
+        # -------------------------------------------------
+        # Service Discovery
+        # -------------------------------------------------
+
+        self._safe_run(
+            "ServiceDiscovery",
+            self.service_discovery
+        )
+
+        # -------------------------------------------------
+        # Infrastructure
+        # -------------------------------------------------
+
+        self._safe_run(
+            "DNS",
+            self.check_dns
+        )
+
+        self._safe_run(
+            "WHOIS",
+            self.check_whois
+        )
+
+        self._safe_run(
+            "GeoIP",
+            self.check_asn_geoip
+        )
+
+        # -------------------------------------------------
+        # PostgreSQL
+        # -------------------------------------------------
+
+        self._safe_run(
+            "PostgreSQLAudit",
+            self.check_pg_hba_exposure
+        )
+
+        # -------------------------------------------------
+        # AI Assessment
+        # -------------------------------------------------
+
+        self._safe_run(
+            "Assessment",
+            self.network_assessment
+        )
+
+        duration = round(
+            time.time() - scan_started,
+            2
+        )
+
+        self.scan_context[
+            "scan_duration"
+        ] = duration
+
+        self.scan_context["finished_at"] = (
+            datetime.now().isoformat()
+        )
+
+        self.scan_context[
+            "completed"
+        ] = True
+
+        self._log(
+            f"⏱ Scan duration: "
+            f"{duration:.2f}s"
+        )
+
+        self._log(
+            "✔️ Сетевые проверки завершены."
+        )
 
 
     # ---------------------------------------------------------
     # ICMP
     # ---------------------------------------------------------
     def check_icmp(self):
+
+        icmp_available: bool = False
+
+        avg_rtt: Optional[float] = None
+        packet_loss: Optional[float] = None
+
+        sent: Optional[int] = None
+        lost: Optional[int] = None
+
+        evidence: Dict[str, Any] = {
+            "reachable": False,
+            "avg_rtt_ms": None,
+            "packet_loss": None,
+            "packets_sent": None,
+            "packets_lost": None,
+            "method": "pythonping",
+        }
+
         try:
-            response = ping(self.domain, count=2, timeout=2)
-            if response.success():
-                status = f"✅ ICMP доступен: {response.rtt_avg_ms} ms"
-            else:
-                status = "⚠️ ICMP заблокирован или нет ответа"
-        except Exception:
-            cmd = ["ping", "-c", "2", self.domain] if os.name != "nt" else ["ping", "-n", "2", self.domain]
+
+            response = ping(
+                self.domain,
+                count=3,
+                timeout=2,
+            )
+
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=4)
-                status = result.stdout.strip() or "❌ Ошибка ICMP"
+
+                avg_rtt = round(
+                    float(response.rtt_avg_ms),
+                    2,
+                )
+
+            except Exception:
+
+                avg_rtt = None
+
+            try:
+
+                sent = getattr(
+                    response,
+                    "packets_sent",
+                    None,
+                )
+
+                lost = getattr(
+                    response,
+                    "packets_lost",
+                    None,
+                )
+
+                if (
+                        sent is not None
+                        and lost is not None
+                        and sent > 0
+                ):
+
+                    packet_loss = round(
+                        (lost / sent) * 100,
+                        1,
+                    )
+
+                else:
+
+                    packet_loss = None
+
+            except Exception:
+
+                packet_loss = None
+
+            # --------------------------------------
+            # Fallback for pythonping versions
+            # --------------------------------------
+
+            if packet_loss is None:
+
+                try:
+
+                    icmp_available = bool(
+                        response.success()
+                    )
+
+                except Exception:
+
+                    icmp_available = False
+
+                packet_loss = (
+                    0.0
+                    if icmp_available
+                    else 100.0
+                )
+
+            else:
+
+                icmp_available = (
+                        packet_loss < 100
+                )
+
+        except Exception:
+
+            evidence["method"] = "system_ping"
+
+            cmd = (
+                ["ping", "-n", "3", self.domain]
+                if os.name == "nt"
+                else ["ping", "-c", "3", self.domain]
+            )
+
+            try:
+
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                )
+
+                output = (
+                        result.stdout or ""
+                )
+
+                # =====================================
+                # Windows
+                # =====================================
+
+                if os.name == "nt":
+
+                    sent_match = re.search(
+                        r"Sent\s*=\s*(\d+)",
+                        output,
+                        re.I,
+                    )
+
+                    lost_match = re.search(
+                        r"Lost\s*=\s*(\d+)",
+                        output,
+                        re.I,
+                    )
+
+                    if (
+                            sent_match
+                            and lost_match
+                    ):
+
+                        sent = int(
+                            sent_match.group(1)
+                        )
+
+                        lost = int(
+                            lost_match.group(1)
+                        )
+
+                        if sent > 0:
+                            packet_loss = round(
+                                (
+                                        lost / sent
+                                ) * 100,
+                                1,
+                            )
+
+                    rtt_match = re.search(
+                        r"Average\s*=\s*(\d+)ms",
+                        output,
+                        re.I,
+                    )
+
+                    if rtt_match:
+                        avg_rtt = float(
+                            rtt_match.group(1)
+                        )
+
+                # =====================================
+                # Linux/macOS
+                # =====================================
+
+                else:
+
+                    loss_match = re.search(
+                        r"(\d+(?:\.\d+)?)%\s*packet loss",
+                        output,
+                        re.I,
+                    )
+
+                    if loss_match:
+                        packet_loss = float(
+                            loss_match.group(1)
+                        )
+
+                    rtt_match = re.search(
+                        r"min/avg/max(?:/mdev)?"
+                        r"\s*=\s*"
+                        r"[\d\.]+/"
+                        r"([\d\.]+)/",
+                        output,
+                        re.I,
+                    )
+
+                    if rtt_match:
+                        avg_rtt = float(
+                            rtt_match.group(1)
+                        )
+
+                if packet_loss is None:
+                    packet_loss = 100.0
+
+                icmp_available = (
+                        packet_loss < 100
+                )
+
             except Exception as e:
-                status = f"❌ Ошибка ICMP: {e}"
+
+                status = (
+                    f"❌ Ошибка ICMP: {e}"
+                )
+
+                self._log(status)
+
+                THREAT_CONNECTOR.emit(
+                    module="NetworkChecker",
+                    target=self.domain,
+                    result={
+                        "check": "icmp",
+                        "status": status,
+                    },
+                )
+
+                return
+
+        # ===========================================
+        # Status generation
+        # ===========================================
+
+        if packet_loss >= 100:
+
+            status = (
+                "⚠️ ICMP заблокирован "
+                "или нет ответа"
+            )
+
+        elif packet_loss > 0:
+
+            status = (
+                f"⚠️ ICMP частично доступен"
+                f" | Loss={packet_loss}%"
+                f" | AvgRTT={avg_rtt}ms"
+            )
+
+        else:
+
+            if avg_rtt is not None:
+
+                status = (
+                    f"✅ ICMP доступен"
+                    f" | AvgRTT={avg_rtt}ms"
+                )
+
+            else:
+
+                status = (
+                    "✅ ICMP доступен"
+                )
+
+        self.icmp_available = (
+            icmp_available
+        )
+
+        self.scan_context["icmp"] = {
+            "reachable": icmp_available,
+            "avg_rtt_ms": avg_rtt,
+            "packet_loss": packet_loss,
+            "packets_sent": sent,
+            "packets_lost": lost,
+        }
+
+        evidence["reachable"] = (
+            icmp_available
+        )
+
+        evidence["avg_rtt_ms"] = (
+            avg_rtt
+        )
+
+        evidence["packet_loss"] = (
+            packet_loss
+        )
+
+        evidence["packets_sent"] = (
+            sent
+        )
+
+        evidence["packets_lost"] = (
+            lost
+        )
 
         self._log(status)
+
         THREAT_CONNECTOR.emit(
             module="NetworkChecker",
             target=self.domain,
-            result={"check": "icmp", "status": status},
+            result={
+                "check": "icmp",
+                "status": status,
+                "reachable": icmp_available,
+                "avg_rtt_ms": avg_rtt,
+                "packet_loss": packet_loss,
+                "packets_sent": sent,
+                "packets_lost": lost,
+                "evidence": evidence,
+            },
         )
 
     # ---------------------------------------------------------
     # HTTP HEAD fingerprint
     # ---------------------------------------------------------
     def check_http(self):
-        try:
-            headers = {"User-Agent": self.user_agent}
-            r = requests.head(
-                f"http://{self.domain}",
-                timeout=5,
-                headers=headers,
-                allow_redirects=True,
-            )
 
-            status = f"HTTP/{r.status_code} {r.reason}"
-            server = r.headers.get("Server", "Unknown")
-            csp = r.headers.get("Content-Security-Policy", "None")
-            cookies = r.headers.get("Set-Cookie", "None")
-
-            details = f"{status} | Server={server} | CSP={csp} | Cookies={cookies}"
-
-        except Exception as e:
-            details = f"❌ Ошибка HTTP: {e}"
-
-        self._log(details)
-        THREAT_CONNECTOR.emit(
-            module="NetworkChecker",
-            target=self.domain,
-            result={"check": "http", "status": details},
+        self.scan_context.setdefault(
+            "http",
+            {}
         )
+
+        headers = {
+            "User-Agent": self.user_agent
+        }
+
+        for scheme in ("http", "https"):
+
+            try:
+
+                try:
+
+                    r = requests.head(
+                        f"{scheme}://{self.domain}",
+                        timeout=8,
+                        headers=headers,
+                        allow_redirects=True,
+                    )
+
+                    if r.status_code in (
+                            403,
+                            405,
+                            501,
+                    ):
+                        raise Exception()
+
+                except Exception:
+
+                    r = requests.get(
+                        f"{scheme}://{self.domain}",
+                        timeout=8,
+                        headers=headers,
+                        allow_redirects=True,
+                        stream=True,
+                    )
+
+                server = r.headers.get(
+                    "Server",
+                    "Unknown",
+                )
+
+                csp = r.headers.get(
+                    "Content-Security-Policy"
+                )
+
+                hsts = r.headers.get(
+                    "Strict-Transport-Security"
+                )
+
+                xfo = r.headers.get(
+                    "X-Frame-Options"
+                )
+
+                xcto = r.headers.get(
+                    "X-Content-Type-Options"
+                )
+
+                referrer = r.headers.get(
+                    "Referrer-Policy"
+                )
+
+                permissions = r.headers.get(
+                    "Permissions-Policy"
+                )
+
+                content_type = r.headers.get(
+                    "Content-Type",
+                    "Unknown",
+                )
+
+                cookies = r.headers.get_all(
+                    "Set-Cookie",
+                    []
+                ) if hasattr(
+                    r.headers,
+                    "get_all"
+                ) else [
+                    r.headers.get(
+                        "Set-Cookie",
+                        ""
+                    )
+                ]
+
+                self.scan_context[
+                    "http"
+                ][scheme] = {
+
+                    "status_code": r.status_code,
+
+                    "server": server,
+
+                    "csp": csp,
+
+                    "hsts": hsts,
+
+                    "xfo": xfo,
+
+                    "xcto": xcto,
+
+                    "referrer_policy": referrer,
+
+                    "permissions_policy": permissions,
+
+                    "content_type": content_type,
+                }
+
+                if scheme == "https":
+                    self.csp_header = csp
+
+                details = (
+                    f"{scheme.upper()}/"
+                    f"{r.status_code} "
+                    f"{r.reason}"
+                    f" | Server={server}"
+                    f" | CSP={'YES' if csp else 'NO'}"
+                    f" | HSTS={'YES' if hsts else 'NO'}"
+                    f" | XFO={'YES' if xfo else 'NO'}"
+                    f" | XCTO={'YES' if xcto else 'NO'}"
+                    f" | Content-Type={content_type}"
+                )
+
+                self._log(details)
+
+                for cookie in cookies:
+
+                    if not cookie:
+                        continue
+
+                    attrs = []
+
+                    low = cookie.lower()
+
+                    if "secure" in low:
+                        attrs.append("Secure")
+
+                    if "httponly" in low:
+                        attrs.append("HttpOnly")
+
+                    same_site = re.search(
+                        r"samesite=([^;]+)",
+                        cookie,
+                        re.I,
+                    )
+
+                    if same_site:
+                        attrs.append(
+                            f"SameSite="
+                            f"{same_site.group(1)}"
+                        )
+
+                    parts = cookie.split(
+                        ";",
+                        1,
+                    )
+
+                    self._log(
+                        f"🍪 {scheme.upper()} | "
+                        f"{parts[0]}"
+                        f" | "
+                        f"{', '.join(attrs)}"
+                    )
+
+                THREAT_CONNECTOR.emit(
+                    module="NetworkChecker",
+                    target=self.domain,
+                    result={
+                        "check": f"{scheme}_http",
+                        "status": details,
+                        "server": server,
+                        "content_type": content_type,
+                        "csp": bool(csp),
+                        "hsts": bool(hsts),
+                    },
+                )
+
+            except Exception as e:
+
+                self._log(
+                    f"❌ "
+                    f"{scheme.upper()} "
+                    f"error: {e}"
+                )
 
     # ---------------------------------------------------------
     # WAF fingerprinting (по HTTP-ответу)
     # ---------------------------------------------------------
     def check_waf(self):
-        try:
-            headers = {"User-Agent": self.user_agent}
-            r = requests.get(
-                f"http://{self.domain}",
-                timeout=7,
-                headers=headers,
-                allow_redirects=True,
-            )
 
-            banner = " ".join(
-                [
-                    r.headers.get("Server", ""),
-                    r.headers.get("X-Powered-By", ""),
-                    r.headers.get("Set-Cookie", ""),
-                ]
-            ).lower()
+        waf_detected = []
 
-            detected = []
-            for waf_name, sigs in WAF_SIGNATURES.items():
-                if any(sig in banner for sig in sigs):
-                    detected.append(waf_name)
+        self.scan_context.setdefault(
+            "waf",
+            {}
+        )
 
-            if detected:
-                status = f"🛡 Обнаружены признаки WAF: {', '.join(sorted(set(detected)))}"
-            else:
-                status = "ℹ️ Явных признаков WAF не обнаружено"
+        headers = {
+            "User-Agent": self.user_agent
+        }
 
-        except Exception as e:
-            status = f"❌ Ошибка WAF-анализа: {e}"
+        for scheme in (
+                "http",
+                "https",
+        ):
 
-        self._log(status)
+            try:
+
+                r = requests.get(
+                    f"{scheme}://{self.domain}",
+                    timeout=10,
+                    headers=headers,
+                    allow_redirects=True,
+                )
+
+                fingerprint = " ".join(
+
+                    [
+                        r.headers.get(
+                            "Server",
+                            ""
+                        ),
+
+                        r.headers.get(
+                            "Set-Cookie",
+                            ""
+                        ),
+
+                        r.headers.get(
+                            "X-Powered-By",
+                            ""
+                        ),
+
+                        r.headers.get(
+                            "CF-Ray",
+                            ""
+                        ),
+
+                        r.headers.get(
+                            "X-Sucuri-ID",
+                            ""
+                        ),
+
+                        r.headers.get(
+                            "X-Iinfo",
+                            ""
+                        ),
+
+                        r.headers.get(
+                            "Server-Timing",
+                            ""
+                        ),
+                    ]
+                ).lower()
+
+                local_hits = []
+
+                for (
+                        waf_name,
+                        signatures
+                ) in WAF_SIGNATURES.items():
+
+                    if any(
+                            sig.lower()
+                            in fingerprint
+                            for sig in signatures
+                    ):
+                        local_hits.append(
+                            waf_name
+                        )
+
+                        waf_detected.append(
+                            waf_name
+                        )
+
+                self.scan_context[
+                    "waf"
+                ][scheme] = {
+                    "status_code":
+                        r.status_code,
+                    "detections":
+                        local_hits,
+                }
+
+                if local_hits:
+
+                    self._log(
+                        f"🛡 {scheme.upper()}"
+                        f": "
+                        f"{', '.join(local_hits)}"
+                    )
+
+                else:
+
+                    self._log(
+                        f"ℹ️ {scheme.upper()}: "
+                        f"Явных признаков "
+                        f"WAF не обнаружено"
+                    )
+
+            except Exception as e:
+
+                self._log(
+                    f"❌ {scheme.upper()} "
+                    f"WAF error: {e}"
+                )
+
+        waf_detected = sorted(
+            set(waf_detected)
+        )
+
+        self.waf_detected = bool(
+            waf_detected
+        )
+
+        self.scan_context[
+            "waf_detected"
+        ] = waf_detected
+
         THREAT_CONNECTOR.emit(
             module="NetworkChecker",
             target=self.domain,
-            result={"check": "waf", "status": status},
+            result={
+                "check":
+                    "waf_detection",
+                "detected":
+                    waf_detected,
+                "count":
+                    len(waf_detected),
+            },
         )
 
     # ---------------------------------------------------------
     # TLS/SSL + HTTP/2 ALPN
     # ---------------------------------------------------------
     def check_tls_and_alpn(self):
+
+        tls_version = None
+        alpn = None
+
+        self.scan_context.setdefault(
+            "tls",
+            {}
+        )
+
         try:
+
             ctx = ssl.create_default_context()
 
-            # Попытка согласовать ALPN (h2 / http1.1)
             try:
-                ctx.set_alpn_protocols(["h2", "http/1.1"])
+
+                ctx.set_alpn_protocols(
+                    [
+                        "h2",
+                        "http/1.1",
+                    ]
+                )
+
             except Exception:
-                pass  # ALPN может быть недоступен
+                pass
 
-            with socket.create_connection((self.domain, 443), timeout=5) as sock:
-                with ctx.wrap_socket(sock, server_hostname=self.domain) as ssock:
+            with socket.create_connection(
+                    (
+                            self.domain,
+                            443,
+                    ),
+                    timeout=8,
+            ) as sock:
 
-                    # --- TLS версия ---
-                    tls_version = ssock.version() or "unknown"
+                with ctx.wrap_socket(
+                        sock,
+                        server_hostname=self.domain,
+                ) as ssock:
 
-                    # --- ALPN ---
-                    try:
-                        alpn = ssock.selected_alpn_protocol() or "unknown"
-                    except Exception:
-                        alpn = "unknown"
+                    # ==========================================
+                    # TLS Version
+                    # ==========================================
 
-                    # --- Сертификат ---
-                    cert = ssock.getpeercert() or {}
-
-                    # Expiry
-                    not_after = cert.get("notAfter")
-                    try:
-                        expiry = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
-                        exp_str = expiry.strftime("%Y-%m-%d")
-                    except Exception:
-                        exp_str = "Unknown"
-
-                    # Subject (надёжный парсер)
-                    subject_parts = []
-                    for item in cert.get("subject", []):
-                        # item = [(("key","value"),)]
-                        for pair in item:
-                            if isinstance(pair, tuple) and len(pair) == 2:
-                                key, value = pair
-                                subject_parts.append(f"{key}={value}")
-
-                    subject = ", ".join(subject_parts) if subject_parts else "Unknown"
-
-                    # --- Финальный вывод ---
-                    details = (
-                        f"🧪 TLS={tls_version}, ALPN={alpn}, "
-                        f"CN={subject}, Expiry={exp_str}"
+                    tls_version = (
+                            ssock.version()
+                            or "unknown"
                     )
 
-        except Exception as e:
-            details = f"❌ Ошибка TLS/ALPN: {e}"
+                    self.tls_version = (
+                        tls_version
+                    )
 
-        # Логирование и отправка в Threat Intel
+                    # ==========================================
+                    # ALPN
+                    # ==========================================
+
+                    try:
+
+                        alpn = (
+                                ssock.selected_alpn_protocol()
+                                or "unknown"
+                        )
+
+                    except Exception:
+
+                        alpn = "unknown"
+
+                    # ==========================================
+                    # Cipher
+                    # ==========================================
+
+                    try:
+
+                        cipher = (
+                            ssock.cipher()
+                        )
+
+                        cipher_name = (
+                            cipher[0]
+                            if cipher
+                            else "Unknown"
+                        )
+
+                    except Exception:
+
+                        cipher_name = (
+                            "Unknown"
+                        )
+
+                    # ==========================================
+                    # Certificate
+                    # ==========================================
+
+                    cert = (
+                            ssock.getpeercert()
+                            or {}
+                    )
+
+                    # ------------------------------------------
+                    # Subject
+                    # ------------------------------------------
+
+                    subject_parts = []
+
+                    for item in cert.get(
+                            "subject",
+                            [],
+                    ):
+
+                        for pair in item:
+
+                            if (
+                                    isinstance(
+                                        pair,
+                                        tuple,
+                                    )
+                                    and len(pair) == 2
+                            ):
+                                key, value = pair
+
+                                subject_parts.append(
+                                    f"{key}={value}"
+                                )
+
+                    subject = (
+                        ", ".join(
+                            subject_parts
+                        )
+                        if subject_parts
+                        else "Unknown"
+                    )
+
+                    # ------------------------------------------
+                    # Issuer
+                    # ------------------------------------------
+
+                    issuer_parts = []
+
+                    for item in cert.get(
+                            "issuer",
+                            [],
+                    ):
+
+                        for pair in item:
+
+                            if (
+                                    isinstance(
+                                        pair,
+                                        tuple,
+                                    )
+                                    and len(pair) == 2
+                            ):
+                                key, value = pair
+
+                                issuer_parts.append(
+                                    f"{key}={value}"
+                                )
+
+                    issuer = (
+                        ", ".join(
+                            issuer_parts
+                        )
+                        if issuer_parts
+                        else "Unknown"
+                    )
+
+                    # ------------------------------------------
+                    # Expiry
+                    # ------------------------------------------
+
+                    not_after = cert.get(
+                        "notAfter"
+                    )
+
+                    exp_str = "Unknown"
+                    days_left = None
+
+                    try:
+
+                        expiry = datetime.strptime(
+                            not_after,
+                            "%b %d %H:%M:%S %Y %Z",
+                        )
+
+                        exp_str = (
+                            expiry.strftime(
+                                "%Y-%m-%d"
+                            )
+                        )
+
+                        days_left = (
+                                expiry
+                                - datetime.utcnow()
+                        ).days
+
+                    except Exception:
+                        pass
+
+                    # ------------------------------------------
+                    # SAN
+                    # ------------------------------------------
+
+                    san_list = []
+
+                    try:
+
+                        san_entries = cert.get(
+                            "subjectAltName",
+                            []
+                        )
+
+                        for san_type, san_value in san_entries:
+
+                            if (
+                                    san_type.lower()
+                                    == "dns"
+                            ):
+                                san_list.append(
+                                    san_value
+                                )
+
+                    except Exception:
+                        pass
+
+                    # ==========================================
+                    # Risk indicators
+                    # ==========================================
+
+                    warnings = []
+
+                    if tls_version in {
+                        "TLSv1",
+                        "TLSv1.1",
+                    }:
+                        warnings.append(
+                            "Legacy TLS version"
+                        )
+
+                    if (
+                            days_left is not None
+                            and days_left < 30
+                    ):
+                        warnings.append(
+                            "Certificate expires soon"
+                        )
+
+                    # ==========================================
+                    # Save for AI assessment
+                    # ==========================================
+
+                    self.scan_context[
+                        "tls"
+                    ] = {
+
+                        "version":
+                            tls_version,
+
+                        "alpn":
+                            alpn,
+
+                        "cipher":
+                            cipher_name,
+
+                        "subject":
+                            subject,
+
+                        "issuer":
+                            issuer,
+
+                        "expiry":
+                            exp_str,
+
+                        "days_left":
+                            days_left,
+
+                        "warnings":
+                            warnings,
+
+                        "san":
+                            san_list[:15],
+                    }
+
+                    details = (
+                        f"🧪 TLS={tls_version}, "
+                        f"ALPN={alpn}, "
+                        f"Cipher={cipher_name}, "
+                        f"CN={subject}, "
+                        f"Expiry={exp_str}"
+                    )
+
+                    if days_left is not None:
+                        details += (
+                            f", DaysLeft={days_left}"
+                        )
+
+                    if warnings:
+                        details += (
+                                " | Warnings="
+                                + ",".join(
+                            warnings
+                        )
+                        )
+
+        except Exception as e:
+
+            details = (
+                f"❌ Ошибка TLS/ALPN: {e}"
+            )
+
         self._log(details)
+
         THREAT_CONNECTOR.emit(
             module="NetworkChecker",
             target=self.domain,
-            result={"check": "tls_alpn", "status": details},
+            result={
+                "check": "tls_alpn",
+                "status": details,
+                "tls_version": tls_version,
+                "alpn": alpn,
+                "tls_data": self.scan_context.get(
+                    "tls",
+                    {},
+                ),
+            },
         )
 
     # ---------------------------------------------------------
     # Port scan
     # ---------------------------------------------------------
     def check_ports(self):
-        ports = [443, 80, 8443, 8080, 9443]
+
+        self.open_ports = []
+
+        ports = [
+            80,
+            443,
+            8080,
+            8443,
+            9443,
+            22,
+            21,
+            25,
+            465,
+            587,
+            53,
+            1433,
+            1521,
+            3306,
+            5432,
+            6379,
+            27017,
+            3389,
+            5900,
+            9200,
+            5601,
+            2375,
+            2376,
+        ]
+
+        self._log("")
+        self._log("🔍 Starting TCP Port Scan")
+
+        web_count = 0
+        service_count = 0
 
         for port in ports:
+
             try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+                start = time.time()
+
+                sock = socket.socket(
+                    socket.AF_INET,
+                    socket.SOCK_STREAM,
+                )
+
                 sock.settimeout(2)
-                result = sock.connect_ex((self.domain, port))
+
+                target = (
+                        self.target_ip
+                        or self.domain
+                )
+
+                result = sock.connect_ex(
+                    (
+                        target,
+                        port,
+                    )
+                )
+
+                rtt = (
+                              time.time() - start
+                      ) * 1000
+
                 sock.close()
 
                 if result == 0:
-                    status = f"✅ Порт {port} открыт"
-                else:
-                    status = f"❌ Порт {port} закрыт/недоступен"
 
-            except Exception as e:
-                status = f"❌ Ошибка проверки порта {port}: {e}"
+                    self.open_ports.append(
+                        port
+                    )
+
+                    service = KNOWN_SERVICES.get(
+                        port,
+                        "Unknown"
+                    )
+
+                    category = (
+                        "web"
+                        if port in WEB_PORTS
+                        else "service"
+                    )
+
+                    if category == "web":
+                        web_count += 1
+                    else:
+                        service_count += 1
+
+                    status = (
+                        f"🟡 TCP Reachable"
+                        f" | Port={port}"
+                        f" | Category={category}"
+                        f" | Service={service}"
+                        f" | RTT={rtt:.1f}ms"
+                    )
+
+                else:
+
+                    continue
+
+            except Exception:
+                continue
 
             self._log(status)
+
             THREAT_CONNECTOR.emit(
                 module="NetworkChecker",
                 target=self.domain,
-                result={"check": f"port{port}", "status": status},
+                result={
+                    "check": "port_scan",
+                    "port": port,
+                    "reachable": True,
+                    "service": KNOWN_SERVICES.get(
+                        port,
+                        "Unknown"
+                    ),
+                },
+            )
+
+        self.scan_context["open_ports"] = list(
+            self.open_ports
+        )
+
+        self._log("")
+        self._log("=" * 60)
+        self._log("📊 Port Scan Summary")
+        self._log("=" * 60)
+
+        self._log(
+            f"TCP Reachable : "
+            f"{len(self.open_ports)}"
+        )
+
+        self._log(
+            f"Web Ports     : "
+            f"{web_count}"
+        )
+
+        self._log(
+            f"Service Ports : "
+            f"{service_count}"
+        )
+
+        if self.open_ports:
+            self._log(
+                "Open Ports    : "
+                + ", ".join(
+                    map(
+                        str,
+                        self.open_ports
+                    )
+                )
             )
 
     # ---------------------------------------------------------
@@ -696,3 +1939,1110 @@ class NetworkChecker:
 
         self._log("✔️ Поиск pg_hba.conf завершён")
         return report
+
+    def service_discovery(self):
+
+        self._log("")
+        self._log("🔎 Service Discovery...")
+
+        self.scan_context.setdefault(
+            "service_evidence",
+            {}
+        )
+
+        confirmed_services = self.scan_context.setdefault(
+            "confirmed_services",
+            []
+        )
+
+        possible_services = self.scan_context.setdefault(
+            "possible_services",
+            []
+        )
+
+        for port in self.open_ports:
+
+            service = KNOWN_SERVICES.get(
+                port,
+                "Unknown"
+            )
+
+            validator_name = SERVICE_VALIDATORS.get(
+                port
+            )
+
+            validator_confirmed = False
+            validator_evidence = ""
+
+            if validator_name:
+
+                validator = getattr(
+                    self,
+                    validator_name,
+                    None,
+                )
+
+                if callable(validator):
+
+                    try:
+
+                        (
+                            validator_confirmed,
+                            validator_evidence,
+                        ) = validator(port)
+
+                    except Exception:
+                        pass
+
+            if (
+                    service != "Unknown"
+                    and service not in possible_services
+            ):
+                possible_services.append(
+                    service
+                )
+
+            # =====================================================
+            # NON-WEB SERVICES
+            # =====================================================
+
+            if port not in WEB_PORTS:
+
+                banner = ""
+
+                try:
+
+                    sock = socket.socket(
+                        socket.AF_INET,
+                        socket.SOCK_STREAM,
+                    )
+
+                    sock.settimeout(3)
+
+                    if sock.connect_ex(
+                            (
+                                    self.domain,
+                                    port,
+                            )
+                    ) == 0:
+
+                        try:
+
+                            banner = (
+                                sock.recv(1024)
+                                .decode(
+                                    "utf-8",
+                                    errors="ignore",
+                                )
+                                .strip()
+                            )
+
+                        except Exception:
+                            pass
+
+                    sock.close()
+
+                except Exception:
+                    pass
+
+                status = (
+                    f"🔹 {port}"
+                    f" | PossibleService={service}"
+                )
+
+                if validator_confirmed:
+                    status += " | CONFIRMED"
+
+                if validator_evidence:
+                    status += (
+                        f" | Evidence="
+                        f"{validator_evidence[:120]}"
+                    )
+
+                if banner:
+                    status += (
+                        f" | Banner="
+                        f"{banner[:120]}"
+                    )
+
+                if validator_confirmed:
+
+                    if (
+                            service
+                            not in confirmed_services
+                    ):
+                        confirmed_services.append(
+                            service
+                        )
+
+                    self.scan_context[
+                        "service_evidence"
+                    ][service] = {
+                        "port": port,
+                        "evidence": validator_evidence,
+                        "confidence": 100,
+                    }
+
+                elif (
+                        service in {
+                    "SMTP",
+                    "SMTPS",
+                }
+                        and "smtp" in banner.lower()
+                ):
+
+                    if (
+                            "SMTP"
+                            not in confirmed_services
+                    ):
+                        confirmed_services.append(
+                            "SMTP"
+                        )
+
+                self._log(status)
+
+                THREAT_CONNECTOR.emit(
+                    module="NetworkChecker",
+                    target=self.domain,
+                    result={
+                        "check": "service_discovery",
+                        "port": port,
+                        "service": service,
+                        "banner": banner,
+                        "confirmed": validator_confirmed,
+                        "evidence": validator_evidence,
+                        "validator_used": validator_name,
+                    },
+                )
+
+                continue
+
+            # =====================================================
+            # WEB SERVICES
+            # =====================================================
+
+            scheme = WEB_PORTS[port]
+
+            if port == 80:
+
+                url = f"http://{self.domain}"
+
+            elif port == 443:
+
+                url = f"https://{self.domain}"
+
+            else:
+
+                url = (
+                    f"{scheme}://"
+                    f"{self.domain}:{port}"
+                )
+
+            try:
+
+                r = requests.get(
+                    url,
+                    timeout=5,
+                    allow_redirects=True,
+                    headers={
+                        "User-Agent": self.user_agent
+                    },
+                    stream=True,
+                )
+
+                server = r.headers.get(
+                    "Server",
+                    "Unknown",
+                )
+
+                powered_by = r.headers.get(
+                    "X-Powered-By",
+                    "",
+                )
+
+                content_type = r.headers.get(
+                    "Content-Type",
+                    "",
+                )
+
+                location = r.headers.get(
+                    "Location",
+                    "",
+                )
+
+                title = ""
+
+                try:
+
+                    body = r.text[:15000]
+
+                    soup = BeautifulSoup(
+                        body,
+                        "html.parser",
+                    )
+
+                    if soup.title:
+                        title = (
+                            soup.title.get_text(
+                                strip=True
+                            )
+                        )
+
+                except Exception:
+                    pass
+
+                if (
+                        "WEB"
+                        not in confirmed_services
+                ):
+                    confirmed_services.append(
+                        "WEB"
+                    )
+
+                self.scan_context[
+                    "service_evidence"
+                ].setdefault(
+                    "WEB",
+                    {
+                        "hosts": [],
+                        "ports": [],
+                        "servers": [],
+                        "titles": [],
+                        "status_codes": [],
+                        "content_types": [],
+                        "powered_by": [],
+                        "confidence": 100,
+                    },
+                )
+
+                web_evidence = (
+                    self.scan_context[
+                        "service_evidence"
+                    ]["WEB"]
+                )
+
+                if (
+                        self.domain
+                        not in web_evidence["hosts"]
+                ):
+                    web_evidence["hosts"].append(
+                        self.domain
+                    )
+
+                if (
+                        port
+                        not in web_evidence["ports"]
+                ):
+                    web_evidence["ports"].append(
+                        port
+                    )
+
+                if (
+                        server
+                        and server
+                        not in web_evidence["servers"]
+                ):
+                    web_evidence["servers"].append(
+                        server
+                    )
+
+                if (
+                        title
+                        and title
+                        not in web_evidence["titles"]
+                ):
+                    web_evidence["titles"].append(
+                        title
+                    )
+
+                if (
+                        r.status_code
+                        not in web_evidence["status_codes"]
+                ):
+                    web_evidence[
+                        "status_codes"
+                    ].append(
+                        r.status_code
+                    )
+
+                if (
+                        content_type
+                        and content_type
+                        not in web_evidence[
+                    "content_types"
+                ]
+                ):
+                    web_evidence[
+                        "content_types"
+                    ].append(
+                        content_type
+                    )
+
+                status = (
+                    f"🔹 {port}"
+                    f" | Service=WEB"
+                    f" | HTTP={r.status_code}"
+                    f" | Server={server}"
+                )
+
+                if title:
+                    status += (
+                        f" | Title={title}"
+                    )
+
+                self._log(status)
+
+            except Exception as e:
+
+                self._log(
+                    f"⚠️ {port}"
+                    f" | {service}"
+                    f" | {e}"
+                )
+
+        confirmed_services = sorted(
+            set(confirmed_services)
+        )
+
+        possible_services = sorted(
+            set(possible_services)
+        )
+
+        self.scan_context[
+            "confirmed_services"
+        ] = confirmed_services
+
+        self.scan_context[
+            "possible_services"
+        ] = possible_services
+
+        self._log("")
+        self._log("=" * 60)
+        self._log("📊 Service Discovery Summary")
+        self._log("=" * 60)
+
+        self._log(
+            f"Possible Services : "
+            f"{len(possible_services)}"
+        )
+
+        self._log(
+            f"Confirmed Services : "
+            f"{len(confirmed_services)}"
+        )
+
+        if confirmed_services:
+            self._log(
+                "✅ Confirmed: "
+                + ", ".join(
+                    confirmed_services
+                )
+            )
+
+        if possible_services:
+            self._log(
+                "⚠️ Possible: "
+                + ", ".join(
+                    possible_services
+                )
+            )
+
+    def network_assessment(self):
+
+        confirmed_services = set(
+            self.scan_context.get(
+                "confirmed_services",
+                [],
+            )
+        )
+
+        possible_services = set(
+            self.scan_context.get(
+                "possible_services",
+                [],
+            )
+        )
+
+        evidence = self.scan_context.get(
+            "service_evidence",
+            {},
+        )
+
+        risk_score = 0
+        findings = []
+
+        # =====================================================
+        # Exposure
+        # =====================================================
+
+        open_ports = len(self.open_ports)
+
+        if open_ports >= 20:
+
+            risk_score += 4
+
+            findings.append(
+                f"{open_ports} TCP endpoints responded"
+            )
+
+            findings.append(
+                "Exposure classification: large"
+            )
+
+        elif open_ports >= 10:
+
+            risk_score += 2
+
+            findings.append(
+                f"{open_ports} TCP endpoints responded"
+            )
+
+        # =====================================================
+        # Service surface
+        # =====================================================
+
+        if len(possible_services) >= 10:
+            risk_score += 2
+
+            findings.append(
+                f"Large service surface ({len(possible_services)})"
+            )
+
+        if "WEB" in confirmed_services:
+            findings.append(
+                "Web service confirmed"
+            )
+
+        # =====================================================
+        # High-risk services
+        # =====================================================
+
+        HIGH_RISK = {
+            "Redis": 4,
+            "MongoDB": 4,
+            "Docker": 5,
+            "Docker TLS": 4,
+            "PostgreSQL": 3,
+            "MySQL": 3,
+            "MSSQL": 3,
+            "RDP": 4,
+            "VNC": 4,
+            "Elasticsearch": 4,
+            "Kibana": 3,
+        }
+
+        for service, score in HIGH_RISK.items():
+
+            if service in confirmed_services:
+                risk_score += score
+
+                findings.append(
+                    f"Confirmed {service} exposure"
+                )
+
+        # =====================================================
+        # Infrastructure fingerprint
+        # =====================================================
+
+        web_info = evidence.get(
+            "WEB",
+            {}
+        )
+
+        servers = web_info.get(
+            "servers",
+            []
+        )
+
+        if servers:
+            findings.append(
+                "Infrastructure: web platform "
+                "or load-balanced infrastructure"
+            )
+
+        # =====================================================
+        # WAF
+        # =====================================================
+
+        try:
+
+            waf_detected = getattr(
+                self,
+                "waf_detected",
+                False,
+            )
+
+            if waf_detected:
+
+                findings.append(
+                    "WAF detected"
+                )
+
+            else:
+
+                risk_score += 1
+
+                findings.append(
+                    "WAF not detected"
+                )
+
+        except Exception:
+            pass
+
+        # =====================================================
+        # TLS
+        # =====================================================
+
+        try:
+
+            tls_version = getattr(
+                self,
+                "tls_version",
+                None,
+            )
+
+            if tls_version:
+
+                findings.append(
+                    f"{tls_version} enabled"
+                )
+
+                if "TLSv1.3" in tls_version:
+                    risk_score -= 1
+
+        except Exception:
+            pass
+
+        # =====================================================
+        # CSP
+        # =====================================================
+
+        try:
+
+            csp = getattr(
+                self,
+                "csp_header",
+                None,
+            )
+
+            if not csp:
+                risk_score += 2
+
+                findings.append(
+                    "CSP missing"
+                )
+
+        except Exception:
+            pass
+
+        # =====================================================
+        # ICMP
+        # =====================================================
+
+        try:
+
+            icmp_available = getattr(
+                self,
+                "icmp_available",
+                None,
+            )
+
+            if icmp_available is False:
+                findings.append(
+                    "ICMP filtered or blocked"
+                )
+
+        except Exception:
+            pass
+
+        # =====================================================
+        # Risk normalization
+        # =====================================================
+
+        risk_score = max(
+            0,
+            min(
+                100,
+                risk_score,
+            ),
+        )
+
+        if risk_score >= 20:
+
+            risk_level = "CRITICAL"
+
+        elif risk_score >= 15:
+
+            risk_level = "HIGH"
+
+        elif risk_score >= 8:
+
+            risk_level = "MEDIUM"
+
+        else:
+
+            risk_level = "LOW"
+
+        confirmed_count = len(
+            confirmed_services
+        )
+
+        possible_count = len(
+            possible_services
+        )
+
+        confidence = 0.0
+
+        if possible_count:
+            confidence = round(
+                (
+                        confirmed_count
+                        / possible_count
+                ) * 100,
+                1,
+            )
+
+        self.scan_context[
+            "risk_score"
+        ] = risk_score
+
+        self.scan_context[
+            "risk_level"
+        ] = risk_level
+
+        self.scan_context[
+            "assessment_findings"
+        ] = findings
+
+        self._log("")
+        self._log("=" * 60)
+        self._log("🧠 AI Network Assessment")
+        self._log("=" * 60)
+
+        self._log(
+            f"Risk Level : {risk_level}"
+        )
+
+        self._log(
+            f"Risk Score : {risk_score}"
+        )
+
+        self._log(
+            f"Summary    : "
+            f"Risk={risk_level}, "
+            f"Score={risk_score}, "
+            f"Confirmed={confirmed_count}, "
+            f"Possible={possible_count}, "
+            f"Confidence={confidence}%, "
+            f"TCP={open_ports}"
+        )
+
+        self._log("")
+        self._log("Findings:")
+
+        for finding in findings:
+            self._log(
+                f" • {finding}"
+            )
+
+        if confirmed_services:
+            self._log(
+                "✅ Confirmed Services: "
+                + ", ".join(
+                    sorted(
+                        confirmed_services
+                    )
+                )
+            )
+
+        if possible_services:
+            self._log(
+                "⚠️ Possible Services: "
+                + ", ".join(
+                    sorted(
+                        possible_services
+                    )
+                )
+            )
+
+        THREAT_CONNECTOR.emit(
+            module="NetworkChecker",
+            target=self.domain,
+            result={
+                "check": "network_assessment",
+                "risk_level": risk_level,
+                "risk_score": risk_score,
+                "confirmed_services": list(
+                    confirmed_services
+                ),
+                "possible_services": list(
+                    possible_services
+                ),
+                "confidence": confidence,
+                "findings": findings,
+            },
+        )
+
+    def _validate_ssh(self, port: int):
+
+        try:
+
+            sock = socket.create_connection(
+                (self.domain, port),
+                timeout=5,
+            )
+
+            banner = sock.recv(256).decode(
+                "utf-8",
+                errors="ignore",
+            )
+
+            sock.close()
+
+            if banner.startswith("SSH-"):
+                return True, banner.strip()
+
+        except Exception:
+            pass
+
+        return False, ""
+
+    def _validate_smtp(self, port: int):
+
+        try:
+
+            sock = socket.create_connection(
+                (self.domain, port),
+                timeout=5,
+            )
+
+            banner = sock.recv(512).decode(
+                "utf-8",
+                errors="ignore",
+            )
+
+            sock.close()
+
+            low = banner.lower()
+
+            if (
+                    "smtp" in low
+                    or banner.startswith("220")
+            ):
+                return True, banner.strip()
+
+        except Exception:
+            pass
+
+        return False, ""
+
+    def _validate_redis(self, port: int):
+
+        try:
+
+            sock = socket.create_connection(
+                (self.domain, port),
+                timeout=5,
+            )
+
+            sock.sendall(b"PING\r\n")
+
+            response = sock.recv(128)
+
+            sock.close()
+
+            if b"+PONG" in response:
+                return True, response.decode(
+                    errors="ignore"
+                )
+
+        except Exception:
+            pass
+
+        return False, ""
+
+    def _validate_docker(self, port: int):
+
+        try:
+
+            url = (
+                f"http://{self.domain}:{port}/version"
+            )
+
+            r = requests.get(
+                url,
+                timeout=5,
+            )
+
+            text = r.text.lower()
+
+            if (
+                    r.status_code == 200
+                    and "docker" in text
+            ):
+                return True, "Docker API"
+
+        except Exception:
+            pass
+
+        return False, ""
+
+    def _validate_docker_tls(self, port: int):
+
+        try:
+
+            url = (
+                f"https://{self.domain}:{port}/version"
+            )
+
+            r = requests.get(
+                url,
+                timeout=5,
+                verify=False,
+            )
+
+            text = r.text.lower()
+
+            if (
+                    r.status_code == 200
+                    and "docker" in text
+            ):
+                return True, "Docker TLS API"
+
+        except Exception:
+            pass
+
+        return False, ""
+
+    def _validate_elasticsearch(
+            self,
+            port: int
+    ):
+
+        try:
+
+            url = (
+                f"http://{self.domain}:{port}/"
+            )
+
+            r = requests.get(
+                url,
+                timeout=5,
+            )
+
+            text = r.text.lower()
+
+            if (
+                    "cluster_name" in text
+                    or "elasticsearch" in text
+                    or "lucene" in text
+            ):
+                return True, "Elasticsearch"
+
+        except Exception:
+            pass
+
+        return False, ""
+
+    def _validate_postgresql(
+            self,
+            port: int
+    ):
+
+        try:
+
+            sock = socket.create_connection(
+                (
+                    self.domain,
+                    port,
+                ),
+                timeout=5,
+            )
+
+            startup = (
+                b"\x00\x00\x00\x08"
+                b"\x04\xd2\x16\x2f"
+            )
+
+            sock.sendall(startup)
+
+            response = sock.recv(512)
+
+            sock.close()
+
+            if response:
+                return (
+                    True,
+                    "PostgreSQL protocol response"
+                )
+
+        except Exception:
+            pass
+
+        return (
+            False,
+            ""
+        )
+
+    def _validate_mysql(
+            self,
+            port: int
+    ):
+
+        try:
+
+            sock = socket.create_connection(
+                (
+                    self.domain,
+                    port,
+                ),
+                timeout=5,
+            )
+
+            banner = sock.recv(
+                512
+            ).decode(
+                "latin1",
+                errors="ignore",
+            )
+
+            sock.close()
+
+            if (
+                    "mariadb" in banner.lower()
+                    or "mysql" in banner.lower()
+            ):
+                return (
+                    True,
+                    banner[:150]
+                )
+
+        except Exception:
+            pass
+
+        return (
+            False,
+            ""
+        )
+
+    def _validate_mongodb(
+            self,
+            port: int
+    ):
+
+        try:
+
+            sock = socket.create_connection(
+                (
+                    self.target_ip
+                    or self.domain,
+                    port,
+                ),
+                timeout=5,
+            )
+
+            sock.settimeout(5)
+
+            # MongoDB OP_QUERY isMaster
+
+            payload = bytes.fromhex(
+                "3a000000"
+                "00000000"
+                "00000000"
+                "d4070000"
+                "00000000"
+                "61646d696e2e24636d6400"
+                "00000000"
+                "ffffffff"
+                "13000000"
+                "1069734d61737465720001000000"
+                "00"
+            )
+
+            sock.sendall(
+                payload
+            )
+
+            data = sock.recv(
+                4096
+            )
+
+            sock.close()
+
+            if not data:
+                return (
+                    False,
+                    ""
+                )
+
+            low = data.lower()
+
+            signatures = (
+                b"ismaster",
+                b"maxwireversion",
+                b"maxbsonobjectsize",
+                b"logicalsessiontimeoutminutes",
+                b"mongodb",
+            )
+
+            if any(
+                    sig in low
+                    for sig in signatures
+            ):
+                return (
+                    True,
+                    "MongoDB protocol response"
+                )
+
+        except Exception:
+            pass
+
+        return (
+            False,
+            ""
+        )
+
+    def _validate_rdp(
+            self,
+            port: int
+    ):
+
+        try:
+
+            sock = socket.create_connection(
+                (
+                    self.domain,
+                    port,
+                ),
+                timeout=5,
+            )
+
+            sock.sendall(
+                bytes.fromhex(
+                    "030000130ee0000000000001000800000000"
+                )
+            )
+
+            response = sock.recv(
+                64
+            )
+
+            sock.close()
+
+            if response:
+                return (
+                    True,
+                    "RDP handshake"
+                )
+
+        except Exception:
+            pass
+
+        return (
+            False,
+            ""
+        )
+
+
+
+

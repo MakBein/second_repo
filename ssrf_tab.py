@@ -1,42 +1,42 @@
 # xss_security_gui/ssrf_tab.py
+
+from __future__ import annotations
+
 import json
 import os
+import threading
 import tkinter as tk
-from datetime import datetime, timezone
 from tkinter import ttk, messagebox, filedialog
 from typing import Any, Dict, List
 
 from xss_security_gui.settings import settings
 from xss_security_gui.threat_analysis.ssrf_module import SSRFTester
-from xss_security_gui.utils.threat_sender import normalize_threat_artifact, emit_threat_event
 
 
 class SSRFTab(ttk.Frame):
     """
-    SSRFTab ULTRA 7.0 Pro
-    ---------------------
+    SSRFTab (ULTRA Hybrid 6.5+)
+    ---------------------------
     • Гнучке завантаження payload-файлу (settings / аргумент / дефолт)
     • Потокобезпечний лог (через .after)
     • Кольорові теги (HIGH / INFO / ERROR)
     • Контроль потоків (active_tests, max_workers)
-    • Розширені SSRF payload-и:
-        - file:// (локальні файли, .env, /etc/passwd)
-        - AWS/GCP/Azure metadata
-        - Docker / Kubernetes / internal services
-    • ThreatConnector 7.0 (normalize_threat_artifact + emit_threat_event)
-    • Уніфікований формат результатів для cross‑module heatmap + timeline
+    • Уніфікований формат результатів (TesterBase + Threat Intel)
+    • Стабільність GUI навіть при помилках
     """
 
-    def __init__(self, parent, url: str | None = None, payload_file=None):
+    MAX_CYCLE_RUNS = 3
+
+    def __init__(self, parent, url: str, payload_file: str | None = None) -> None:
         super().__init__(parent)
 
-        # 🔥 Захист від падіння, якщо URL не передали
-        self.url = url or "http://127.0.0.1"
-
-        self.payload_file = payload_file
+        self.url = url
         self.loop_running = False
         self.active_tests = 0
         self.max_workers = 5
+        self._cycle_runs = 0
+        self._cycle_budget: RequestBudget | None = None
+        self._active_tester: SSRFTester | None = None
 
         default_file = (
             settings.get("ssrf.payload_file")
@@ -47,18 +47,12 @@ class SSRFTab(ttk.Frame):
         self.payload_file: str = payload_file or default_file
         self.payloads: Dict[str, List[str]] = self._load_payloads()
 
-        # === UIQueueBridge для фоновых операций ===
-        from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
-        self._bridge = UIQueueBridge(self, poll_ms=50)
-
         self._build_ui()
 
     # ---------------------------------------------------------
-    # Payload loader + enrichment
+    # Payload loader
     # ---------------------------------------------------------
     def _load_payloads(self) -> Dict[str, List[str]]:
-        base: Dict[str, List[str]] = {}
-
         try:
             with open(self.payload_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -66,60 +60,17 @@ class SSRFTab(ttk.Frame):
             if not isinstance(data, dict):
                 raise ValueError("Файл payload-ів повинен містити JSON-об'єкт з категоріями")
 
+            normalized: Dict[str, List[str]] = {}
             for k, v in data.items():
                 if isinstance(v, list):
-                    base[k] = v
+                    normalized[k] = v
                 else:
-                    base[k] = [str(v)]
+                    normalized[k] = [str(v)]
+            return normalized
+
         except Exception as e:
             messagebox.showerror("Помилка", f"Не вдалося завантажити SSRF payload-и:\n{e}")
-            base = {}
-
-        # Додаємо Pro-набір
-        pro = self._build_pro_payloads()
-        for cat, lst in pro.items():
-            base.setdefault(cat, [])
-            for p in lst:
-                if p not in base[cat]:
-                    base[cat].append(p)
-
-        return base
-
-    def _build_pro_payloads(self) -> Dict[str, List[str]]:
-        """Додає Pro-набір SSRF payload-ів (file://, metadata, internal)."""
-        return {
-            "file_env": [
-                "file:///var/www/html/.env",
-                "file:///var/www/app/.env",
-                "file:///var/www/.env",
-                "file:///home/www-data/.env",
-                "file:///.env",
-            ],
-            "file_passwd": [
-                "file:///etc/passwd",
-                "file:///etc/shadow",
-            ],
-            "aws_metadata": [
-                "http://169.254.169.254/latest/meta-data/",
-                "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
-            ],
-            "gcp_metadata": [
-                "http://metadata.google.internal/computeMetadata/v1/",
-            ],
-            "azure_metadata": [
-                "http://169.254.169.254/metadata/instance?api-version=2021-02-01",
-            ],
-            "docker_internal": [
-                "http://docker.for.win.localhost/",
-                "http://host.docker.internal/",
-            ],
-            "kubernetes_internal": [
-                "https://kubernetes.default.svc/",
-            ],
-            "redis_internal": [
-                "redis://127.0.0.1:6379/",
-            ],
-        }
+            return {}
 
     # ---------------------------------------------------------
     # UI builder
@@ -165,12 +116,14 @@ class SSRFTab(ttk.Frame):
         self.category_combo.grid(row=2, column=1, sticky="w", padx=5)
 
         # Ліміт потоків
-        ttk.Label(top, text="Макс. потоків:").grid(row=3, column=0, sticky="w", padx=5)
-        self.workers_var = tk.IntVar(value=self.max_workers)
+        ttk.Label(top, text="Паралельні тести (фіксовано 1):").grid(
+            row=3, column=0, sticky="w", padx=5
+        )
+        self.workers_var = tk.IntVar(value=1)
         workers_spin = ttk.Spinbox(
             top,
             from_=1,
-            to=50,
+            to=1,
             textvariable=self.workers_var,
             width=5,
             command=self._update_workers,
@@ -240,36 +193,70 @@ class SSRFTab(ttk.Frame):
     # Workers
     # ---------------------------------------------------------
     def _update_workers(self) -> None:
-        value = self.workers_var.get()
-        if value < 1:
-            value = 1
-        self.max_workers = value
-        self.workers_var.set(value)
-        self._safe_log(f"⚙️ Макс. потоків встановлено: {self.max_workers}\n")
+        self.max_workers = 1
+        self.workers_var.set(self.max_workers)
 
     # ---------------------------------------------------------
     # URL update
     # ---------------------------------------------------------
     def update_url(self) -> None:
-        self.url = self.url_var.get().strip()
-        self._safe_log(f"🔄 URL оновлено: {self.url}\n")
+        from xss_security_gui.auto_recon.scope import (
+            is_target_authorized,
+            normalize_http_url,
+        )
+
+        try:
+            self.url = normalize_http_url(self.url_var.get())
+        except ValueError as exc:
+            self._safe_log((f"❌ Некоректний URL: {exc}\n", "ERROR"))
+            return
+
+        if not is_target_authorized(self.url):
+            self._safe_log(
+                (
+                    "🚫 Реальні запити вимкнені: ціль має бути дозволена "
+                    "через ALLOW_REAL_RUN і ALLOWED_TARGETS.\n",
+                    "ERROR",
+                )
+            )
+            return
+        self._safe_log(f"🔄 Авторизовану ціль оновлено: {self.url}\n")
 
     # ---------------------------------------------------------
     # Single run
     # ---------------------------------------------------------
     def run_tests(self) -> None:
+        from xss_security_gui.auto_recon.scope import (
+            is_target_authorized,
+            normalize_http_url,
+        )
+
         if not self.payloads:
             messagebox.showerror("Помилка", "Payload-и не завантажені")
             return
 
-        if self.active_tests >= self.max_workers:
-            self._safe_log("⚠️ Досягнуто ліміт потоків, дочекайтесь завершення\n")
+        if self.active_tests:
+            self._safe_log("⚠️ Дочекайтесь завершення поточного SSRF-запуску\n")
             return
 
         param = self.param_entry.get().strip()
         base_value = self.value_entry.get().strip()
         category = self.category_var.get()
 
+        try:
+            target = normalize_http_url(self.url_var.get())
+        except ValueError as exc:
+            self._safe_log((f"❌ Некоректний URL: {exc}\n", "ERROR"))
+            return
+        if not is_target_authorized(target):
+            self._safe_log(
+                (
+                    f"🚫 Запуск заблоковано: {target} не дозволений "
+                    "політикою ALLOW_REAL_RUN/ALLOWED_TARGETS.\n",
+                    "ERROR",
+                )
+            )
+            return
         if not param:
             self._safe_log("⚠️ Параметр не може бути порожнім\n")
             return
@@ -279,51 +266,73 @@ class SSRFTab(ttk.Frame):
         else:
             selected_payloads = {category: self.payloads.get(category, [])}
 
-        self._safe_log(f"🚀 Запущено SSRF-тестування для {self.url} (param={param})\n")
-        self.active_tests += 1
-
-        # Запускаємо в фоне через UIQueueBridge
-        def worker():
-            tester = SSRFTester(
-                base_url=self.url,
-                param=param,
-                base_value=base_value,
-                payloads=selected_payloads,
-                output_callback=self._on_test_finish,
-            )
-            tester.start()
-
-        self._bridge.post_bg(worker)
+        self.url = target
+        self._start_tester(target, param, base_value, selected_payloads)
 
     # ---------------------------------------------------------
     # Loop mode
     # ---------------------------------------------------------
     def start_loop(self) -> None:
+        from xss_security_gui.auto_recon.scope import (
+            RequestBudget,
+            is_target_authorized,
+            normalize_http_url,
+        )
+
         if self.loop_running:
             return
         if not self.payloads:
             self._safe_log("❌ Payload-и не завантажені — цикл не запущено\n")
             return
 
+        try:
+            self.url = normalize_http_url(self.url_var.get())
+        except ValueError as exc:
+            self._safe_log((f"❌ Некоректний URL: {exc}\n", "ERROR"))
+            return
+        if not is_target_authorized(self.url):
+            self._safe_log(
+                (
+                    "🚫 Цикл заблоковано: потрібні ALLOW_REAL_RUN і "
+                    "дозволений хост у ALLOWED_TARGETS.\n",
+                    "ERROR",
+                )
+            )
+            return
+
         self.loop_running = True
-        self._safe_log("🔁 Цикл SSRF запущено\n")
+        self._cycle_runs = 0
+        self._cycle_budget = RequestBudget(
+            SSRFTester.MAX_REQUESTS * self.MAX_CYCLE_RUNS
+        )
+        self._safe_log(
+            f"🔁 Цикл SSRF запущено (ліміт {self.MAX_CYCLE_RUNS} проходи, "
+            f"до {self._cycle_budget.limit} запитів)\n"
+        )
         self._run_ssrf_cycle()
 
     def stop_loop(self) -> None:
         if self.loop_running:
             self._safe_log("⛔ Цикл зупинено\n")
         self.loop_running = False
+        tester = self._active_tester
+        if tester is not None and tester.is_alive():
+            tester.stop()
+            self._safe_log("⏹️ Надіслано запит на зупинку активного тесту\n")
 
     def _run_ssrf_cycle(self) -> None:
         if not self.loop_running:
             return
 
-        if self.active_tests < self.max_workers:
+        if self.active_tests == 0:
             self._try_start_test_from_cycle()
 
-        self.after(300, self._run_ssrf_cycle)
+        if self.loop_running:
+            self.after(300, self._run_ssrf_cycle)
 
     def _try_start_test_from_cycle(self) -> bool:
+        from xss_security_gui.auto_recon.scope import is_target_authorized
+
         if not self.payloads:
             self._safe_log("⚠️ Цикл: payload-и не завантажені, запуск неможливий\n")
             return False
@@ -345,73 +354,94 @@ class SSRFTab(ttk.Frame):
                 return False
             selected_payloads = {category: cat_payloads}
 
-        tester = SSRFTester(
-            base_url=self.url,
-            param=param,
-            base_value=base_value,
-            payloads=selected_payloads,
-            output_callback=self._on_test_finish,
-        )
-        tester.start()
-        self.active_tests += 1
+        if self.active_tests:
+            return False
+        if not is_target_authorized(self.url):
+            self._safe_log(("🚫 Ціль втратила дозвіл; цикл зупинено.\n", "ERROR"))
+            self.stop_loop()
+            return False
 
-        self._safe_log(
-            f"🔁 Цикл: запущено SSRF-тест (param={param}, category={category}, активних={self.active_tests})\n"
+        budget = self._cycle_budget
+        if budget is None or budget.used >= budget.limit:
+            self.stop_loop()
+            return False
+        self._cycle_runs += 1
+        self._start_tester(
+            self.url, param, base_value, selected_payloads, request_budget=budget
         )
         return True
 
-    def run_attack(self, url: str) -> Dict[str, Any]:
-        """
-        Запускає одну SSRF‑атаку і повертає артефакт:
-        - category: ssrf_candidate
-        - url: атакований URL
-        - final_host: кінцевий хост
-        - internal_port_scan: список портів
-        """
-        if not self._tester:
-            self._tester = self._build_tester()
+    def _start_tester(
+        self,
+        target: str,
+        param: str,
+        base_value: str,
+        payloads: Dict[str, List[str]],
+        request_budget: RequestBudget | None = None,
+    ) -> None:
+        tester = SSRFTester(
+            base_url=target,
+            param=param,
+            base_value=base_value,
+            payloads=payloads,
+            output_callback=self._on_test_finish,
+            request_budget=request_budget,
+        )
+        self.active_tests = 1
+        try:
+            tester.start()
+        except RuntimeError as exc:
+            self.active_tests = 0
+            self._safe_log((f"❌ Не вдалося запустити SSRF-тест: {exc}\n", "ERROR"))
+            return
+        self._active_tester = tester
+        threading.Thread(
+            target=self._watch_tester,
+            args=(tester,),
+            daemon=True,
+        ).start()
+        self._safe_log(
+            f"🚀 SSRF-тест запущено для {target}; ліміт запитів: "
+            f"{request_budget.limit if request_budget else SSRFTester.MAX_REQUESTS}\n"
+        )
 
-        self._attack_counter += 1
-        attack_label = f"Attack #{self._attack_counter}"
+    def _watch_tester(self, tester: SSRFTester) -> None:
+        tester.join()
+        self.after(0, self._on_tester_finished, tester)
 
-        self.log(f"\n=== ⚡ {attack_label} → {url} ===\n", "INFO")
-
-        # тут реальний SSRF через SSRFTester
-        result = self._tester._run_test(url)
-
-        result["category"] = "ssrf_candidate"
-        result["action"] = "ssrf_attack"
-        result["url"] = url
-        result["payload_meta"] = {
-            "attack_label": attack_label,
-            "payload_value": url,
-        }
-        result["timestamp"] = datetime.now(timezone.utc).isoformat()
-
-        severity = result.get("severity", "INFO").upper()
-        if severity in {"CRITICAL", "HIGH", "MEDIUM", "LOW"}:
-            result["risk"] = severity.lower()
-        else:
-            result["risk"] = "info"
-
-        return result
+    def _on_tester_finished(self, tester: SSRFTester) -> None:
+        if not self.winfo_exists():
+            return
+        self.active_tests = 0
+        if self._active_tester is tester:
+            self._active_tester = None
+        if self.loop_running:
+            if self._cycle_runs >= self.MAX_CYCLE_RUNS:
+                self.stop_loop()
+                self._safe_log("✅ Досягнуто ліміт проходів SSRF-циклу\n")
+            elif (
+                self._cycle_budget is None
+                or self._cycle_budget.used >= self._cycle_budget.limit
+            ):
+                self.stop_loop()
+                self._safe_log("✅ Досягнуто ліміт запитів SSRF-циклу\n")
+        self._safe_log("[INFO] SSRF-тест завершився\n")
 
     # ---------------------------------------------------------
     # Callback from tester
     # ---------------------------------------------------------
     def _on_test_finish(self, result: Dict[str, Any]) -> None:
-        self.active_tests = max(0, self.active_tests - 1)
         self.display_result(result)
 
     # ---------------------------------------------------------
-    # Display result + ThreatConnector
+    # Display result
     # ---------------------------------------------------------
     def display_result(self, result: Dict[str, Any]) -> None:
         if not result:
             self._safe_log("⚠️ Порожній результат від SSRFTester\n")
             return
 
-        details = result.get("details", {}) or {}
+        details = result.get("details", {})
         severity = result.get("severity") or details.get("severity") or "INFO"
 
         category = result.get("category", "?")
@@ -421,45 +451,25 @@ class SSRFTab(ttk.Frame):
         resp_len = details.get("response_length")
         redirected_to_local = details.get("redirected_to_local", False)
         body_hit = details.get("body_hit", False)
+        body_hint = details.get("body_hint", False)
         header_hit = details.get("header_hit", False)
-        raw = details.get("raw") or ""
 
         len_part = f"(len={resp_len})" if isinstance(resp_len, (int, float)) else ""
 
         line = (
             f"[{category}] {payload} → {severity} "
             f"(HTTP {http_status}) {len_part} "
-            f"(body={body_hit}, hdr={header_hit}, local={redirected_to_local})\n"
+            f"(body={body_hit}, hint={body_hint}, hdr={header_hit}, "
+            f"local={redirected_to_local})\n"
         )
 
         tag = "HIGH" if severity == "HIGH" else ("ERROR" if severity == "ERROR" else "INFO")
         self._safe_log((line, tag))
 
-        if self.verbose_var.get() and raw:
-            self._safe_log((f"RAW: {raw[:500]}\n", tag))
-
-        # Threat artifact
-        artifact: Dict[str, Any] = {
-            "type": "SSRF",
-            "module": "ssrf_tab",
-            "url": self.url,
-            "param": self.param_entry.get().strip(),
-            "payload": payload,
-            "category": category,
-            "severity": severity,
-            "http_status": http_status,
-            "response_length": resp_len,
-            "redirected_to_local": redirected_to_local,
-            "body_hit": body_hit,
-            "header_hit": header_hit,
-            "source": "SSRF Scanner Pro",
-        }
-
-        try:
-            norm = normalize_threat_artifact(artifact)
-            emit_threat_event(norm)
-        except Exception as e:
-            self._safe_log(f"[ThreatConnector] Помилка нормалізації/відправки: {e}\n")
+        if self.verbose_var.get():
+            raw = details.get("raw")
+            if raw:
+                self._safe_log((f"RAW: {raw[:500]}\n", tag))
 
     # ---------------------------------------------------------
     # Clear output

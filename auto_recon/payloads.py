@@ -262,22 +262,32 @@ class PayloadGenerator:
             params = ep.get("params", [])
 
             payload = self.mutate_payload(self.preset) if self.use_mutation else self.preset
+            ptype = "xss"
 
             if method == "GET":
-                query = "&".join(f"{k}={payload}" for k in params)
+                keys = params.keys() if isinstance(params, dict) else params
+                query = "&".join(f"{k}={payload}" for k in keys)
                 results.append({
                     "method": "GET",
-                    "url": f"{ep['url']}?{query}",
+                    "url": f"{ep['url']}?{query}" if keys else ep.get("url"),
                     "source": ep.get("source", "unknown"),
+                    "type": ptype,
+                    "payload": payload,
                 })
             elif method == "POST":
-                body = {k: payload for k in params}
-                results.append({
+                keys = params.keys() if isinstance(params, dict) else params
+                body = {k: payload for k in keys}
+                request = {
                     "method": "POST",
                     "url": ep["url"],
                     "json": body,
                     "source": ep.get("source", "unknown"),
-                })
+                    "type": ptype,
+                    "payload": payload,
+                }
+                if ep.get("source") == "form":
+                    request["data"] = body
+                results.append(request)
         return results
 
     def mutate_payload(self, base: str) -> str:

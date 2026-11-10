@@ -266,10 +266,10 @@ def attack_api_endpoints(
     results: List[Dict[str, Any]] = []
 
     try:
-        for ep in endpoints:
+    for ep in endpoints:
             url = _normalize_url(base_url, str(ep))
 
-            for hdr in headers_list:
+        for hdr in headers_list:
                 _safe_log(log, f"[API] GET {url}", "debug")
 
                 r, err = _request_get(session, url, hdr, cfg, log)
@@ -278,26 +278,26 @@ def attack_api_endpoints(
                 # ------------------------------
                 # Ошибка запроса
                 # ------------------------------
-                if r is None:
-                    results.append({
-                        "endpoint": url,
-                        "headers_used": hdr,
+            if r is None:
+                results.append({
+                    "endpoint": url,
+                    "headers_used": hdr,
                         "error": err or "request_failed",
-                        "severity": "error",
+                    "severity": "error",
                         "entropy_score": len(set(str(err))),
                         "pattern_score": 1,
                         "risk_score": 3,
                         "context_score": 0,
                         "total_score": len(set(str(err))) + 4,
                         "fingerprint": hash(str(err)[:200]),
-                    })
-                    continue
+                })
+                continue
 
                 # ------------------------------
                 # Анализ ответа
                 # ------------------------------
                 body = _sample_body(r.text or "", cfg["max_body_sample"])
-                json_body = _extract_json(body)
+            json_body = _extract_json(body)
                 rh = dict(r.headers)
 
                 is_graphql = _looks_like_graphql(url, body, rh)
@@ -337,13 +337,13 @@ def attack_api_endpoints(
                 # Результат
                 # ------------------------------
                 results.append({
-                    "endpoint": url,
-                    "status": r.status_code,
-                    "headers_used": hdr,
-                    "content_type": r.headers.get("Content-Type", ""),
+                "endpoint": url,
+                "status": r.status_code,
+                "headers_used": hdr,
+                "content_type": r.headers.get("Content-Type", ""),
                     "length": len(r.text or ""),
-                    "is_graphql": is_graphql,
-                    "json_detected": json_body is not None,
+                "is_graphql": is_graphql,
+                "json_detected": json_body is not None,
                     "waf_or_block_page": waf,
                     "redirected": redirected,
                     "final_url": r.url,
@@ -431,7 +431,7 @@ def brute_force_tokens(
     attempt_no = 0
 
     try:
-        for token in tokens:
+    for token in tokens:
             if attempt_no >= max_attempts:
                 _safe_log(log, f"[TOKENS] лимит попыток {max_attempts}", "warn")
                 break
@@ -457,7 +457,7 @@ def brute_force_tokens(
                 # ------------------------------
                 # Ошибка запроса
                 # ------------------------------
-                if r is None:
+        if r is None:
                     entropy_score = len(set(str(err)))
                     pattern_score = 1
                     risk_score = 3
@@ -465,11 +465,11 @@ def brute_force_tokens(
                     total_score = entropy_score + pattern_score + risk_score + context_score
                     fingerprint = hash(str(err)[:200])
 
-                    results.append({
+            results.append({
                         "token_preview": masked,
                         "auth_headers": list(hdr.keys()),
                         "error": err or "request_failed",
-                        "severity": "error",
+                "severity": "error",
 
                         # AGGRESSIVE ANALYTICS 4.0
                         "entropy_score": entropy_score,
@@ -480,8 +480,8 @@ def brute_force_tokens(
                         "fingerprint": fingerprint,
                         "token_entropy": token_entropy,
                         "token_length": token_length,
-                    })
-                    continue
+            })
+            continue
 
                 # ------------------------------
                 # Анализ ответа
@@ -524,9 +524,9 @@ def brute_force_tokens(
                 results.append({
                     "token_preview": masked,
                     "auth_headers": list(hdr.keys()),
-                    "status": r.status_code,
+            "status": r.status_code,
                     "length": len(r.text or ""),
-                    "suspicious": suspicious,
+            "suspicious": suspicious,
                     "waf_or_block_page": waf,
                     "not_unauthorized": status_shift,
                     "severity": severity,
@@ -581,7 +581,7 @@ def attack_parameters(
     results: List[Dict[str, Any]] = []
 
     try:
-        for param in parameters:
+    for param in parameters:
             pname = str(param).strip()
             if not pname:
                 continue
@@ -596,7 +596,7 @@ def attack_parameters(
             # ------------------------------
             # Ошибка запроса
             # ------------------------------
-            if r is None:
+        if r is None:
                 entropy_score = len(set(str(err)))
                 pattern_score = 1
                 risk_score = 3
@@ -604,11 +604,11 @@ def attack_parameters(
                 total_score = entropy_score + pattern_score + risk_score + context_score
                 fingerprint = hash(str(err)[:200])
 
-                results.append({
+            results.append({
                     "parameter": pname,
-                    "url": url,
+                "url": url,
                     "error": err or "request_failed",
-                    "severity": "error",
+                "severity": "error",
 
                     # AGGRESSIVE ANALYTICS 4.0
                     "entropy_score": entropy_score,
@@ -617,13 +617,13 @@ def attack_parameters(
                     "context_score": context_score,
                     "total_score": total_score,
                     "fingerprint": fingerprint,
-                })
-                continue
+            })
+            continue
 
             # ------------------------------
             # Анализ ответа
             # ------------------------------
-            body = r.text or ""
+        body = r.text or ""
             reflected = probe in body
 
             enc = quote(probe, safe="")
@@ -664,10 +664,10 @@ def attack_parameters(
 
             results.append({
                 "parameter": pname,
-                "url": url,
-                "status": r.status_code,
+            "url": url,
+            "status": r.status_code,
                 "reflected": reflected or encoded_hit,
-                "length": len(body),
+            "length": len(body),
                 "waf_or_block_page": waf,
                 "severity": severity,
 
@@ -731,7 +731,7 @@ def attack_user_ids(
     results: List[Dict[str, Any]] = []
 
     try:
-        for uid in user_ids:
+    for uid in user_ids:
             for pname in id_param_names:
 
                 url = _merge_query_params(base_url, {pname: str(uid)})
@@ -743,7 +743,7 @@ def attack_user_ids(
                 # ---------------------------------------------------------
                 #  Ошибка запроса
                 # ---------------------------------------------------------
-                if r is None:
+        if r is None:
                     entropy_score = len(set(str(err)))
                     pattern_score = 1
                     risk_score = 3
@@ -751,12 +751,12 @@ def attack_user_ids(
                     total_score = entropy_score + pattern_score + risk_score + context_score
                     fingerprint = hash(str(err)[:200])
 
-                    results.append({
-                        "user_id": uid,
+            results.append({
+                "user_id": uid,
                         "param": pname,
-                        "url": url,
+                "url": url,
                         "error": err or "request_failed",
-                        "severity": "error",
+                "severity": "error",
 
                         # AGGRESSIVE ANALYTICS 4.0
                         "entropy_score": entropy_score,
@@ -765,13 +765,13 @@ def attack_user_ids(
                         "context_score": context_score,
                         "total_score": total_score,
                         "fingerprint": fingerprint,
-                    })
-                    continue
+            })
+            continue
 
                 # ---------------------------------------------------------
                 #  Анализ ответа
                 # ---------------------------------------------------------
-                body = r.text or ""
+        body = r.text or ""
                 body_lower = body.lower()
 
                 leaked_email = bool(
@@ -811,12 +811,12 @@ def attack_user_ids(
                 )
 
                 results.append({
-                    "user_id": uid,
+            "user_id": uid,
                     "param": pname,
-                    "url": url,
-                    "status": r.status_code,
-                    "length": len(body),
-                    "leaked_email": leaked_email,
+            "url": url,
+            "status": r.status_code,
+            "length": len(body),
+            "leaked_email": leaked_email,
                     "substantial_body": substantial_body,
                     "waf_or_block_page": waf,
                     "severity": severity,
@@ -884,11 +884,11 @@ def attack_forms_inputs(
                 fields = form_info.get("fields", [])
                 method = form_info.get("method", "POST").upper()
                 context = form_info.get("context", "generic")
-            else:
+        else:
                 form_url = base_url
                 fields = []
                 method = "POST"
-                context = "generic"
+            context = "generic"
 
             if not fields:
                 fields = ["name", "email", "password", "phone", "address", "credit_card"]
@@ -954,10 +954,10 @@ def attack_forms_inputs(
                         "low"
                     )
 
-                    results.append({
+            results.append({
                         "form_url": form_url,
                         "method": method,
-                        "context": context,
+                "context": context,
                         "test_data": test_data,
                         "status": response.status_code,
                         "length": len(body_full),
@@ -988,7 +988,7 @@ def attack_forms_inputs(
                         "context": context,
                         "test_data": test_data,
                         "error": str(e),
-                        "severity": "error",
+                "severity": "error",
 
                         # AGGRESSIVE ANALYTICS 4.0
                         "entropy_score": entropy_score,
@@ -1088,8 +1088,8 @@ def attack_cors(
                         "context_score": context_score,
                         "total_score": total_score,
                         "fingerprint": fingerprint,
-                    })
-                    continue
+            })
+            continue
 
                 # ---------------------------------------------------------
                 #  Анализ CORS‑заголовков
@@ -1170,7 +1170,7 @@ def attack_cors(
                 # ---------------------------------------------------------
                 #  AGGRESSIVE ANALYTICS 4.0
                 # ---------------------------------------------------------
-                body = r.text or ""
+        body = r.text or ""
                 entropy_score = len(set(body[:500]))
 
                 pattern_score = (
@@ -1209,7 +1209,7 @@ def attack_cors(
                     "acah": acah,
                     "misconfigured": misconfigured,
                     "details": details,
-                    "status": r.status_code,
+            "status": r.status_code,
                     "severity": severity,
 
                     # AGGRESSIVE ANALYTICS 4.0
@@ -1665,7 +1665,7 @@ def attack_path_traversal(
                     "param": param, "payload": payload, "url": url,
                     "status": r.status_code,
                     "traversal_found": traversal_found,
-                    "length": len(body),
+            "length": len(body),
                     "severity": "critical" if traversal_found else "info",
                 })
 

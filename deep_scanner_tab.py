@@ -19,6 +19,11 @@ from datetime import datetime
 import re
 
 from xss_security_gui.deep_crawler import deep_crawl
+from xss_security_gui.auto_recon.scope import (
+    is_target_authorized,
+    normalize_http_url,
+    same_origin,
+)
 from xss_security_gui.utils.threat_sender import ThreatSenderMixin
 from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
 
@@ -166,12 +171,15 @@ class DeepScannerTab(ttk.Frame, ThreatSenderMixin):
         return {"http": p, "https": p} if p else None
 
     def build_login_config(self):
-        if not self.login_url.get().strip():
+        login_url = self.login_url.get().strip()
+        username = self.login_user.get().strip()
+        password = self.login_pass.get()
+        if not login_url or not username or not password:
             return None
         return {
-            "url": self.login_url.get().strip(),
-            "username": self.login_user.get().strip(),
-            "password": self.login_pass.get().strip(),
+            "url": login_url,
+            "username": username,
+            "password": password,
             "selectors": {
                 "username": self.selector_user.get().strip(),
                 "password": self.selector_pass.get().strip(),
@@ -185,6 +193,9 @@ class DeepScannerTab(ttk.Frame, ThreatSenderMixin):
             messagebox.showerror("Ошибка", "Укажи корректный URL")
             return
         try:
+            login_url = self.login_url.get().strip()
+            login_username = self.login_user.get().strip()
+            login_password = self.login_pass.get()
             config = {
                 "use_proxy": self.use_tor.get(),
                 "delay": float(self.delay_entry.get() or 1.0),
@@ -194,7 +205,33 @@ class DeepScannerTab(ttk.Frame, ThreatSenderMixin):
 
             login_cfg = self.build_login_config()
             if login_cfg:
-                config["login"] = login_cfg
+                target_url = normalize_http_url(url)
+                normalized_login_url = normalize_http_url(login_cfg["url"])
+                if not is_target_authorized(target_url) or not same_origin(
+                    normalized_login_url, target_url
+                ):
+                    messagebox.showwarning(
+                        "Авторизация пропущена",
+                        "Вход разрешён только для цели из ALLOW_REAL_RUN / "
+                        "ALLOWED_TARGETS и login URL того же origin. "
+                        "Сканирование продолжится без авторизации.",
+                        parent=self,
+                    )
+                elif messagebox.askyesno(
+                    "Подтверждение входа",
+                    "Будут отправлены введённые учётные данные на разрешённую "
+                    "цель. Продолжить аутентифицированный аудит?",
+                    parent=self,
+                ):
+                    login_cfg["url"] = normalized_login_url
+                    config["login"] = login_cfg
+            elif login_url or login_username or login_password:
+                messagebox.showwarning(
+                    "Авторизация пропущена",
+                    "Для входа необходимо явно заполнить URL, логин и пароль. "
+                    "Сканирование продолжится в пассивном режиме.",
+                    parent=self,
+                )
 
             self.result_box.insert("end", f"\n🛰️ Сканирование: {url}\n")
             self._bridge.post_bg(self._prepare_and_run_scan, url, config)
@@ -244,10 +281,6 @@ class DeepScannerTab(ttk.Frame, ThreatSenderMixin):
                     self.selector_pass.insert(0, form_info.get("password") or "")
                     self.selector_submit.delete(0, "end")
                     self.selector_submit.insert(0, form_info.get("submit") or "")
-                    if not self.login_user.get().strip():
-                        self.login_user.insert(0, "admin")
-                    if not self.login_pass.get().strip():
-                        self.login_pass.insert(0, "admin123")
                 self._bridge.post_ui(apply_form_info)
 
                 browser.close()
@@ -518,4 +551,3 @@ class DeepScannerTab(ttk.Frame, ThreatSenderMixin):
             messagebox.showinfo("✅ PDF сохранён", f"Отчёт сохранён:\n{path}")
         except Exception as e:
             messagebox.showerror("Ошибка PDF", f"Не удалось сохранить PDF:\n{e}")
-

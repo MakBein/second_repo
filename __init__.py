@@ -1,9 +1,9 @@
 # xss_security_gui/__init__.py
 # 🛡️ XSS Security GUI — Core Initialization (v7.0 ULTRA CLEAN)
 
+import importlib
 import os
 import sys
-import json
 import shutil
 import logging
 from datetime import datetime, timezone
@@ -32,10 +32,6 @@ from .settings import (
     EXPORT_DIR,
     PAYLOADS_DIR,
 )
-
-from .payloads import load_payloads
-from .dom_parser import DOMParser
-from .network_checker import NetworkChecker
 
 # ==============================
 #  Unified Version
@@ -114,13 +110,31 @@ def check_dependencies() -> None:
 
 def check_libraries() -> None:
     required = ["requests", "urllib3", "bs4", "pythonping"]
+    missing = []
     for lib in required:
         try:
             __import__(lib)
         except ImportError:
-            logger.error(f"Отсутствует библиотека: {lib}")
-            print(f"[❌] Отсутствует библиотека: {lib}")
-            sys.exit(1)
+            missing.append(lib)
+
+    if missing:
+        logger.warning("Некоторые библиотеки отсутствуют: %s", ", ".join(missing))
+        print(f"[⚠️] Отсутствуют библиотеки: {', '.join(missing)}")
+        return
+
+
+def __getattr__(name: str):
+    if name == "load_payloads":
+        from .payloads import load_payloads
+        return load_payloads
+    if name == "DOMParser":
+        from .dom_parser import DOMParser
+        return DOMParser
+    if name == "NetworkChecker":
+        from .network_checker import NetworkChecker
+        return NetworkChecker
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 # ==============================
 #  AppContext
@@ -158,7 +172,12 @@ def init_environment() -> AppContext:
     check_dependencies()
     check_libraries()
 
-    load_payloads()
+    try:
+        module = importlib.import_module("xss_security_gui.payloads")
+        load_payloads = getattr(module, "load_payloads")
+        load_payloads()
+    except Exception as exc:
+        logger.warning("Failed to load payloads during init: %s", exc)
 
     try:
         from xss_security_gui.payloads import PAYLOADS
@@ -179,7 +198,7 @@ def init_environment() -> AppContext:
 # ==============================
 #  Auto-init
 # ==============================
-AUTO_INIT = os.environ.get("XSS_GUI_AUTO_INIT", "1") == "1"
+AUTO_INIT = os.environ.get("XSS_GUI_AUTO_INIT", "0") == "1"
 CONTEXT = init_environment() if AUTO_INIT else None
 
 # ==============================
@@ -199,4 +218,5 @@ __all__ = [
     "Settings",
     "DOMParser",
     "NetworkChecker",
+    "load_payloads",
 ]

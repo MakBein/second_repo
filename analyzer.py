@@ -24,7 +24,8 @@ from xss_security_gui.payloads import PAYLOADS
 from xss_security_gui.settings import LOG_SUCCESS_PATH, MAX_REPORT_LINE_LENGTH
 from xss_security_gui.attack_engine import AttackEngine
 from xss_security_gui.dom_parser import DOMParser
-from xss_security_gui.crawler import run_crawl_in_background, save_outputs
+from xss_security_gui.crawler import crawl_site, save_outputs
+from xss_security_gui.xss_detector import XSSDetector, DEFAULT_XSS_VECTORS
 
 from fpdf import FPDF
 from fpdf import __version__ as fpdf_version
@@ -40,7 +41,7 @@ class XSSAnalyzerApp(ttk.Frame, ThreatSenderMixin):
 
     def __init__(
         self,
-        parent: tk.Tk,
+        parent: tk.Misc,
         status_var: Optional[tk.StringVar] = None,
         full_analysis_tab: Optional[ttk.Frame] = None,
         threat_tab: Optional[ttk.Frame] = None,
@@ -70,6 +71,7 @@ class XSSAnalyzerApp(ttk.Frame, ThreatSenderMixin):
         )
 
         self.payload_category_var = tk.StringVar(value="XSS")
+        self.payload_selection_var = tk.StringVar()
         self.payload_buttons: List[ttk.Button] = []
 
         self.build_ui()
@@ -111,9 +113,17 @@ class XSSAnalyzerApp(ttk.Frame, ThreatSenderMixin):
 
         ttk.Label(frame, text="Категория payload’ов:").pack(side="left", padx=10)
 
-        categories = sorted(PAYLOADS.keys()) if isinstance(PAYLOADS, dict) else ["XSS"]
+        if hasattr(PAYLOADS, "get_categories"):
+            categories = list(PAYLOADS.get_categories())
+        elif isinstance(PAYLOADS, dict):
+            categories = list(PAYLOADS.keys())
+        else:
+            categories = []
         if "XSS" not in categories:
-            categories.insert(0, "XSS")
+            if categories:
+                self.payload_category_var.set(categories[0])
+            else:
+                categories.insert(0, "XSS")
 
         cat_combo = ttk.Combobox(
             frame,
@@ -123,7 +133,28 @@ class XSSAnalyzerApp(ttk.Frame, ThreatSenderMixin):
             state="readonly",
         )
         cat_combo.pack(side="left", padx=5)
-        cat_combo.bind("<<ComboboxSelected>>", lambda e: self._rebuild_payload_buttons())
+        cat_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda e: self._on_payload_category_changed(),
+        )
+
+        ttk.Label(frame, text="Payload:").pack(side="left", padx=(12, 4))
+        self.payload_combo = ttk.Combobox(
+            frame,
+            textvariable=self.payload_selection_var,
+            width=58,
+            state="readonly",
+        )
+        self.payload_combo.pack(side="left", padx=5, fill=tk.X, expand=True)
+        self.payload_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda e: self._preview_selected_payload(),
+        )
+        ttk.Button(
+            frame,
+            text="Вставить",
+            command=self._insert_selected_payload,
+        ).pack(side="left", padx=5)
 
         self.payload_buttons_frame = ttk.Frame(self)
         self.payload_buttons_frame.pack(pady=5, fill=tk.X)
@@ -186,7 +217,7 @@ class XSSAnalyzerApp(ttk.Frame, ThreatSenderMixin):
         )
 
         category = self.payload_category_var.get()
-        payload_map = PAYLOADS.get(category, {})
+        payload_map = PAYLOADS.get(category, [])
 
         if isinstance(payload_map, dict):
             types = list(payload_map.keys())
@@ -203,6 +234,47 @@ class XSSAnalyzerApp(ttk.Frame, ThreatSenderMixin):
             )
             btn.pack(side="left", padx=2)
             self.payload_buttons.append(btn)
+
+        self._rebuild_payload_selector()
+
+    def _get_category_payloads(self) -> List[str]:
+        category = self.payload_category_var.get()
+        payload_map = PAYLOADS.get(category, [])
+        if isinstance(payload_map, dict):
+            values = list(payload_map.values())
+        elif isinstance(payload_map, (list, tuple, set)):
+            values = list(payload_map)
+        else:
+            values = []
+        return [str(value) for value in values if value is not None and str(value)]
+
+    def _rebuild_payload_selector(self) -> None:
+        values = self._get_category_payloads()
+        self.payload_combo["values"] = values
+        if values:
+            self.payload_selection_var.set(values[0])
+        else:
+            self.payload_selection_var.set("")
+
+    def _on_payload_category_changed(self) -> None:
+        self._rebuild_payload_buttons()
+
+    def _preview_selected_payload(self) -> None:
+        payload = self.payload_selection_var.get()
+        if payload:
+            self.update_status(f"Выбран payload ({len(payload)} символов)")
+
+    def _insert_selected_payload(self) -> None:
+        payload = self.payload_selection_var.get()
+        if not payload:
+            self.log_output(
+                "⚠️ В выбранной категории нет payload’ов.",
+                level="warn",
+            )
+            return
+        self.input_entry.delete(0, tk.END)
+        self.input_entry.insert(0, payload)
+        self.update_status("Payload вставлен в поле URL / Payload")
 
     # ========================================================
     #  DOM / HTML вспомогательные
@@ -439,16 +511,6 @@ class XSSAnalyzerApp(ttk.Frame, ThreatSenderMixin):
                         self.update_from_crawler(data)
                     except Exception as e:
                         self._handle_error("update_from_crawler", e)
-                elif task_id == "crawler_status":
-                    self.update_status(str(data))
-                elif task_id == "crawler_log":
-                    if isinstance(data, tuple) and len(data) == 2:
-                        text, level = data
-                    else:
-                        text, level = data, "info"
-                    self.log_output(str(text), level=str(level))
-                elif task_id == "crawler_summary":
-                    self.send_to_threat_intel("crawler_summary", data)
                 self.data_queue.task_done()
         except Exception as e:
             self._handle_error("обработки очереди", e)
@@ -469,18 +531,38 @@ class XSSAnalyzerApp(ttk.Frame, ThreatSenderMixin):
 
     def update_from_crawler(self, data: Dict[str, Any]) -> None:
         """Обновление GUI и ThreatIntel на основе данных краулера"""
+        if isinstance(data, str):
+            data = {
+                "url": self.crawled_domain or self.input_entry.get().strip(),
+                "error": data,
+            }
+        elif not isinstance(data, dict):
+            data = {
+                "url": self.crawled_domain or self.input_entry.get().strip(),
+                "error": f"unexpected crawler payload: {type(data).__name__}",
+            }
+
         url = data.get("url", "")
-        forms = data.get("forms_count", len(data.get("forms", [])))
-        scripts = len(data.get("scripts", []))
-        api_eps = data.get("api_endpoints", [])
-        events = data.get("events", [])
+        forms_raw = data.get("forms", [])
+        scripts_raw = data.get("scripts", [])
+        api_raw = data.get("api_endpoints", [])
+        events_raw = data.get("events", [])
+        forms = data.get("forms_count", len(forms_raw) if isinstance(forms_raw, (list, tuple, dict, set)) else 0)
+        scripts = len(scripts_raw) if isinstance(scripts_raw, (list, tuple, dict, set)) else 0
+        api_eps = api_raw if isinstance(api_raw, (list, tuple, dict, set)) else []
+        events = events_raw if isinstance(events_raw, (list, tuple, dict, set)) else []
         error = data.get("error")
 
         sensitive = sum(
-            val.get("count", 0) if isinstance(val, dict) else len(val)
+            val.get("count", 0) if isinstance(val, dict)
+            else len(val) if isinstance(val, (list, tuple, dict, set, str))
+            else 0
             for key in ("tokens", "api_keys", "cookies", "headers")
             if (val := data.get(key)) is not None
         )
+
+        self.full_data = dict(data)
+        self.crawled_domain = str(url or self.crawled_domain)
 
         self.log_output(f"🔗 URL: {url}")
         self.log_output(f"   📝 Forms: {forms}")
@@ -491,6 +573,30 @@ class XSSAnalyzerApp(ttk.Frame, ThreatSenderMixin):
 
         if error:
             self.log_output(f"   ❌ Error: {error}", level="error")
+
+        detail_fields = (
+            "pages",
+            "links",
+            "forms",
+            "scripts",
+            "api_endpoints",
+            "events",
+            "CSP",
+            "headers",
+            "technologies",
+            "redirects",
+        )
+        for field in detail_fields:
+            value = data.get(field)
+            if value in (None, [], {}, ""):
+                continue
+            if field in {"headers", "cookies", "tokens", "api_keys"}:
+                value = f"<redacted; items={len(value) if hasattr(value, '__len__') else 1}>"
+            try:
+                rendered = json.dumps(value, ensure_ascii=False, default=str)
+            except (TypeError, ValueError):
+                rendered = str(value)
+            self.log_output(f"   • {field}: {rendered[:MAX_REPORT_LINE_LENGTH]}")
 
         self.log_output("────────────────────────────────────────")
 
@@ -507,6 +613,15 @@ class XSSAnalyzerApp(ttk.Frame, ThreatSenderMixin):
                 "sensitive": sensitive,
                 "error": error,
                 "severity": severity,
+                "details": {
+                    key: (
+                        f"<redacted; items={len(value) if hasattr(value, '__len__') else 1}>"
+                        if key in {"headers", "cookies", "tokens", "api_keys"}
+                        else value
+                    )
+                    for key, value in data.items()
+                    if key not in {"raw_html", "body"}
+                },
             },
         )
 
@@ -515,7 +630,7 @@ class XSSAnalyzerApp(ttk.Frame, ThreatSenderMixin):
     # ========================================================
 
     def run_crawler(self) -> None:
-        """Run the crawler in a background thread without blocking Tkinter."""
+        """Запуск краулера в отдельном потоке"""
         domain = self.input_entry.get().strip()
         if not domain:
             self.log_output("⚠️ Укажите домен или URL для краулинга.", level="warn")
@@ -531,12 +646,14 @@ class XSSAnalyzerApp(ttk.Frame, ThreatSenderMixin):
         def gui_callback(payload: Dict[str, Any]) -> None:
             self.data_queue.put(("crawler", payload))
 
-        def on_result(result: Dict[str, Any]) -> None:
+        def worker() -> None:
             try:
+                result = crawl_site(domain, depth=0, gui_callback=gui_callback, parallel=True)
                 if not isinstance(result, dict):
-                    self.data_queue.put(("crawler_log", ("❌ Краулер вернул неожиданный формат данных.", "error")))
+                    self.after(0, lambda: self.log_output("❌ Краулер вернул неожиданный формат данных.", level="error"))
                     return
 
+                save_outputs(result)
                 self.crawled_scripts = result.get("scripts", [])
                 self.crawled_domain = domain
                 self.full_data = result
@@ -550,33 +667,27 @@ class XSSAnalyzerApp(ttk.Frame, ThreatSenderMixin):
                     "events": len(result.get("events", [])),
                     "sensitive": result.get("sensitive_count", 0),
                 }
-                self.data_queue.put(("crawler_summary", summary))
-                self.data_queue.put(("crawler_status", "✔️ Краулинг завершён."))
+                self.send_to_threat_intel("crawler_summary", summary)
+                self.after(0, lambda: self.update_status("✔️ Краулинг завершён."))
+
+            except requests.Timeout:
+                logger.exception("Таймаут краулера")
+                self.after(0, lambda: self.log_output("❌ Таймаут краулера", level="error"))
+                self.after(0, lambda: self.update_status("⚠️ Ошибка при краулинге."))
             except Exception as e:
-                logger.exception("Ошибка пост-обработки краулера")
-                self.data_queue.put(("crawler_log", (f"❌ Ошибка пост-обработки краулера: {e}", "error")))
+                logger.exception("Ошибка краулера")
+                error_text = str(e)
+                self.after(
+                    0,
+                    lambda message=error_text: self.log_output(
+                        f"❌ Ошибка краулера: {message}", level="error"
+                    ),
+                )
+                self.after(0, lambda: self.update_status("⚠️ Ошибка при краулинге."))
             finally:
                 self._crawler_running = False
 
-        def on_error(exc: Exception) -> None:
-            if isinstance(exc, requests.Timeout):
-                logger.exception("Таймаут краулера")
-                self.data_queue.put(("crawler_log", ("❌ Таймаут краулера", "error")))
-                self.data_queue.put(("crawler_status", "⚠️ Ошибка при краулинге."))
-            else:
-                logger.exception("Ошибка краулера")
-                self.data_queue.put(("crawler_log", (f"❌ Ошибка краулера: {exc}", "error")))
-                self.data_queue.put(("crawler_status", "⚠️ Ошибка при краулинге."))
-            self._crawler_running = False
-
-        run_crawl_in_background(
-            domain,
-            depth=0,
-            gui_callback=gui_callback,
-            parallel=True,
-            on_result=on_result,
-            on_error=on_error,
-        )
+        self._run_in_thread("CrawlerThread", worker)
 
     # ========================================================
     #  Вставка payload'ов
@@ -604,11 +715,40 @@ class XSSAnalyzerApp(ttk.Frame, ThreatSenderMixin):
     # ========================================================
 
     def _get_xsstrike_path(self) -> str:
-        return os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "XSStrike",
-            "xsstrike.py",
+        module_dir = os.path.dirname(os.path.abspath(__file__))
+        candidates = (
+            os.path.join(module_dir, "XSStrike", "xsstrike.py"),
+            os.path.join(os.path.dirname(module_dir), "XSStrike", "xsstrike.py"),
         )
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                return candidate
+        return candidates[0]
+
+    def _run_internal_xss_probe(self, url: str) -> str:
+        """Fallback probe when the optional XSStrike checkout is unavailable."""
+        detector = XSSDetector(threat_tab=self.threat_tab)
+        rows = []
+        for payload in DEFAULT_XSS_VECTORS[:10]:
+            try:
+                started = time.perf_counter()
+                response = requests.get(
+                    url,
+                    params={"q": payload},
+                    timeout=10,
+                    verify=False,
+                    headers={"User-Agent": "XSS-Security-GUI/6.5"},
+                )
+                elapsed = time.perf_counter() - started
+                context = detector.detect_xss_context(response.text or "", payload)
+                if context:
+                    rows.append(
+                        f"[potential] {context} payload={payload!r} "
+                        f"status={response.status_code} time={elapsed:.2f}s"
+                    )
+            except requests.RequestException as exc:
+                rows.append(f"[network] {type(exc).__name__}: {exc}")
+        return "\n".join(rows) or "Internal XSS probe completed: no reflected payloads confirmed."
 
     def _filter_xsstrike_output(self, output: str, selected: str) -> str:
         if selected == "All":
@@ -631,7 +771,20 @@ class XSSAnalyzerApp(ttk.Frame, ThreatSenderMixin):
             try:
                 xsstrike_path = self._get_xsstrike_path()
                 if not os.path.exists(xsstrike_path):
-                    raise FileNotFoundError(f"XSStrike не найден: {xsstrike_path}")
+                    output = self._run_internal_xss_probe(url)
+                    selected = self.filter_var.get()
+                    output = self._filter_xsstrike_output(output, selected)
+
+                    def update_fallback() -> None:
+                        self.log_output(
+                            f"⚠️ XSStrike не найден; использован встроенный probe.\n{output}",
+                            level="warn",
+                        )
+                        self.log = output
+                        self.update_status("✔️ Встроенный XSS probe завершён")
+
+                    self.after(0, update_fallback)
+                    return
 
                 result = subprocess.run(
                     [sys.executable, xsstrike_path, "-u", url],
@@ -640,6 +793,7 @@ class XSSAnalyzerApp(ttk.Frame, ThreatSenderMixin):
                     timeout=120,
                     encoding="utf-8",
                     errors="replace",
+                    cwd=os.path.dirname(os.path.dirname(xsstrike_path)),
                 )
 
                 output = result.stdout or result.stderr or ""
@@ -680,11 +834,23 @@ class XSSAnalyzerApp(ttk.Frame, ThreatSenderMixin):
                 self.after(0, lambda: self.update_status("⚠️ XSStrike завис"))
             except FileNotFoundError as e:
                 logger.exception("XSStrike не найден")
-                self.after(0, lambda: self.log_output(f"❌ {e}", level="error"))
+                error_text = str(e)
+                self.after(
+                    0,
+                    lambda message=error_text: self.log_output(
+                        f"❌ {message}", level="error"
+                    ),
+                )
                 self.after(0, lambda: self.update_status("❌ XSStrike не найден"))
             except Exception as e:
                 logger.exception("Ошибка XSStrike")
-                self.after(0, lambda: self.log_output(f"❌ Ошибка XSStrike:\n{e}", level="error"))
+                error_text = str(e)
+                self.after(
+                    0,
+                    lambda message=error_text: self.log_output(
+                        f"❌ Ошибка XSStrike:\n{message}", level="error"
+                    ),
+                )
                 self.after(0, lambda: self.update_status("❌ Ошибка при анализе"))
 
         self._run_in_thread(name="XSStrikeThread", target=worker)
@@ -847,7 +1013,13 @@ class XSSAnalyzerApp(ttk.Frame, ThreatSenderMixin):
                 self.after(0, update_gui)
             except Exception as e:
                 logger.exception("Ошибка фуззинга")
-                self.after(0, lambda: self.log_output(f"❌ Ошибка фуззинга: {e}", level="error"))
+                error_text = str(e)
+                self.after(
+                    0,
+                    lambda message=error_text: self.log_output(
+                        f"❌ Ошибка фуззинга: {message}", level="error"
+                    ),
+                )
                 self.after(0, lambda: self.update_status("⚠️ Ошибка при фуззинге."))
 
         self._run_in_thread("FuzzingThread", worker)
@@ -877,5 +1049,11 @@ class XSSAnalyzerApp(ttk.Frame, ThreatSenderMixin):
 
     def _handle_error(self, context: str, e: Exception) -> None:
         logger.exception(f"Ошибка {context}")
-        self.after(0, lambda: self.log_output(f"❌ Ошибка {context}: {e}", level="error"))
+        error_text = str(e)
+        self.after(
+            0,
+            lambda message=error_text: self.log_output(
+                f"❌ Ошибка {context}: {message}", level="error"
+            ),
+        )
         self.after(0, lambda: self.update_status(f"⚠️ Ошибка при {context.lower()}"))

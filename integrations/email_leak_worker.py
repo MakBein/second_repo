@@ -1,909 +1,765 @@
 # xss_security_gui/integrations/email_leak_worker.py
-"""
-EmailLeakWorker 13.0 ULTRA‑MODE (GOD‑ENGINE)
 
-- Full state machine (atomic transitions, watchdog, heartbeat)
-- SQLite + ThreatConnector ingestion (batch + bulk)
-- Thread‑safe, GUI‑safe, restart‑safe
-- Adaptive throttling 2.0 (load‑aware)
-- ML‑classification + anomaly detection hooks
-- Entropy + risk scoring + heatmap aggregation
-- Live‑stream events for ThreatAnalysisTab
-- Leak viewer (emails/passwords/tokens/secrets/pii) with export
-"""
+from __future__ import annotations
 
+import logging
+import os
+import random
+import re
 import threading
 import time
-import logging
-from typing import Optional, Callable, List, Dict, Any
+from collections import deque
+from datetime import datetime, timezone
+from typing import Any, Callable, Optional
+from urllib.parse import urljoin, urlparse
 
-from xss_security_gui.threat_data_loader import ThreatRisk
-from xss_security_gui.threat_analysis.threat_connector import THREAT_CONNECTOR, ThreatConnector
+import requests
+from bs4 import BeautifulSoup
+
+from xss_security_gui.auto_recon.scope import (
+    RequestBudget,
+    is_target_authorized,
+    normalize_http_url,
+    same_origin,
+    scoped_request,
+)
+from xss_security_gui.settings import settings
+from xss_security_gui.threat_analysis.threat_connector import THREAT_CONNECTOR
+from xss_security_gui.utils.pii_aggregator import build_email_leak_artifact
 
 logger = logging.getLogger(__name__)
 
+CRAWLER_ERROR_LOG = settings.get("crawl.error_log")
+RATE_LIMIT = float(settings.get("crawl.max_rps", 2.0) or 2.0)
+AGGRESSIVE_HEADERS = bool(settings.get("http.aggressive_headers", True))
+
+# -----------------------------------------
+# ADD THESE THREE LINES
+# -----------------------------------------
+COMMON_USER_AGENTS = []
+COMMON_REFERERS = []
+COMMON_LANGUAGES = []
+
+# ---------------------------------------------------------------------
+# Common JA3 fingerprints (real browser TLS ClientHello fingerprints)
+# ---------------------------------------------------------------------
+JA3_FINGERPRINTS = [
+    # Chrome 120 (Windows)
+    "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,0-23-65281-10-11-13-16-5,23-24,0",
+    # Firefox 121 (Windows)
+    "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,0-23-65281-10-11-13-16-5,23-24,0",
+    # Safari 17.2 (macOS)
+    "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,0-23-65281-10-11-13-16-5,23-24,0",
+    # Edge 120 (Windows)
+    "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,0-23-65281-10-11-13-16-5,23-24,0",
+    # Opera 106 (Windows)
+    "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,0-23-65281-10-11-13-16-5,23-24,0",
+]
+
+COMMON_USER_AGENTS.extend([
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.112 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.112 Safari/537.36 Edg/125.0.2535.67",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.112 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.112 Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.112 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+])
+
+COMMON_REFERERS.extend([
+    "https://www.facebook.com/",
+    "https://www.instagram.com/",
+    "https://www.reddit.com/",
+    "https://news.google.com/",
+    "https://www.youtube.com/",
+    "https://www.linkedin.com/",
+    "https://t.co/",
+    "https://l.facebook.com/",
+])
+
+COMMON_LANGUAGES.extend([
+    "en-CA,en;q=0.9",
+    "en-AU,en;q=0.9",
+    "fr-FR,fr;q=0.9,en;q=0.8",
+    "de-DE,de;q=0.9,en;q=0.8",
+    "pl-PL,pl;q=0.9,en;q=0.8",
+    "es-ES,es;q=0.9,en;q=0.8",
+    "it-IT,it;q=0.9,en;q=0.8",
+    "ru-RU,ru;q=0.9,en-US;q=0.8",
+])
+
+
+def get_random_ja3() -> str:
+    return random.choice(JA3_FINGERPRINTS)
+
+
+def get_random_user_agent() -> str:
+    return random.choice(COMMON_USER_AGENTS)
+
+
+def get_random_referer() -> str:
+    return random.choice(COMMON_REFERERS)
+
+
+def get_random_language() -> str:
+    return random.choice(COMMON_LANGUAGES)
+
+
+def log_error(msg: str) -> None:
+    try:
+        logger.error(msg)
+        if CRAWLER_ERROR_LOG:
+            os.makedirs(os.path.dirname(str(CRAWLER_ERROR_LOG)) or "logs", exist_ok=True)
+            with open(CRAWLER_ERROR_LOG, "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.now(timezone.utc).isoformat()}] {msg}\n")
+    except Exception:
+        logger.exception("Failed to write to CRAWLER_ERROR_LOG")
+
+
+_last_request: float = 0.0
+_rate_lock = threading.Lock()
+
+
+def rate_limit() -> None:
+    global _last_request
+    with _rate_lock:
+        try:
+            r = float(RATE_LIMIT) if RATE_LIMIT else 1.0
+        except Exception:
+            r = 1.0
+        min_interval = 1.0 / max(r, 0.0001)
+        now = time.time()
+        delta = max(0.0, now - _last_request)
+        if delta < min_interval:
+            time.sleep(min_interval - delta)
+        _last_request = time.time()
+
+
+DEFAULT_HEADERS: dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+if AGGRESSIVE_HEADERS:
+    DEFAULT_HEADERS.update(
+        {
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-User": "?1",
+            "Sec-Fetch-Dest": "document",
+        }
+    )
+
+ANTI_WAF_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) "
+    "Gecko/20100101 Firefox/124.0",
+]
+
+ANTI_WAF_ACCEPT_LANG = [
+    "en-US,en;q=0.9",
+    "ru-RU,ru;q=0.9,en-US;q=0.8",
+    "uk-UA,uk;q=0.9,en-US;q=0.8",
+]
+
+ANTI_WAF_REFERERS = [
+    "https://www.google.com/",
+    "https://www.bing.com/",
+    "https://duckduckgo.com/",
+]
+
+TLS_SPOOF_CIPHERS = [
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-CHACHA20-POLY1305",
+    "ECDHE-RSA-CHACHA20-POLY1305",
+    "DHE-RSA-AES128-GCM-SHA256",
+    "DHE-RSA-AES256-GCM-SHA384",
+]
+
+try:
+    import geoip2.database  # type: ignore
+
+    GEOIP_READER = geoip2.database.Reader("GeoLite2-Country.mmdb")
+except Exception:
+    GEOIP_READER = None
+    logger.debug("GeoIP database not available — email audit continues without GeoIP")
+
+
+def build_browser_headers() -> dict[str, str]:
+    """Rotate UA / Referer / Accept-Language for each audit request."""
+    headers = dict(DEFAULT_HEADERS)
+    headers["User-Agent"] = get_random_user_agent()
+    headers["Referer"] = get_random_referer()
+    headers["Accept-Language"] = get_random_language()
+    if random.random() < 0.5:
+        headers["User-Agent"] = random.choice(ANTI_WAF_USER_AGENTS)
+        headers["Accept-Language"] = random.choice(ANTI_WAF_ACCEPT_LANG)
+        headers["Referer"] = random.choice(ANTI_WAF_REFERERS)
+    return headers
+
+_EMAIL_RE = re.compile(
+    r"(?<![\w.+-])[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9-]+"
+    r"(?:\.[A-Z0-9-]+)+(?![\w.-])",
+    re.IGNORECASE,
+)
+_MAX_RESPONSE_BYTES = 1_000_000
+_DEFAULT_MAX_PAGES = 100
+_DEFAULT_MAX_REQUESTS = 200
+_DEFAULT_TIMEOUT = 5
+ALLOWED_CONTROL_CHARS = {"\n", "\r", "\t"}
+
+def _validated_form_values(
+    values: Optional[dict[str, str]]
+) -> dict[str, str]:
+    if values is None:
+        return {}
+
+    if not isinstance(values, dict):
+        raise TypeError(
+            "form_values must be a mapping of field names to plain-text values"
+        )
+
+    validated: dict[str, str] = {}
+
+    for name, value in values.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(
+                "Form field names must be non-empty strings"
+            )
+
+        if not isinstance(value, str) or len(value) > 256:
+            raise ValueError(
+                "Form test values must be strings of at most 256 characters"
+            )
+
+        if any(
+            char not in ALLOWED_CONTROL_CHARS and ord(char) < 32
+            for char in value
+        ):
+            raise ValueError(
+                "Form test values must not contain control characters"
+            )
+
+        lowered = value.lower()
+
+        if any(
+            marker in lowered
+            for marker in ("<", ">", "onerror=", "onload=")
+        ):
+            raise ValueError(
+                "Only plain-text, non-executable form test values are accepted"
+            )
+
+        validated[name] = value
+
+    return validated
+
+
+def _form_fields(form: Any, values: dict[str, str]) -> tuple[dict[str, str], bool]:
+    fields: dict[str, str] = {}
+    matched_test_value = False
+    for control in form.find_all(["input", "textarea", "select"]):
+        name = control.get("name")
+        if not name:
+            continue
+        name = str(name)
+        control_type = str(control.get("type", "text")).lower()
+        if control.name == "input" and control_type in {
+            "checkbox", "radio",
+        }:
+            continue
+        if control_type == "hidden":
+            fields[name] = str(control.get("value", ""))
+        elif name in values:
+            if control.name == "select":
+                options = {
+                    str(option.get("value", option.get_text(strip=True)))
+                    for option in control.find_all("option")
+                }
+                if values[name] not in options:
+                    continue
+            fields[name] = values[name]
+            matched_test_value = True
+    return fields, matched_test_value
+
+
+def _response_text(response: requests.Response) -> str:
+    chunks: list[bytes] = []
+    size = 0
+    for chunk in response.iter_content(chunk_size=16_384):
+        if not chunk:
+            continue
+        remaining = _MAX_RESPONSE_BYTES - size
+        chunks.append(chunk[:remaining])
+        size += min(len(chunk), remaining)
+        if size >= _MAX_RESPONSE_BYTES:
+            break
+    encoding = response.encoding or "utf-8"
+    return b"".join(chunks).decode(encoding, errors="replace")
+
+
+def run_email_leak_audit(
+    target_url: str,
+    *,
+    active_testing: bool = True,
+    max_pages: int = _DEFAULT_MAX_PAGES,
+    max_requests: int = _DEFAULT_MAX_REQUESTS,
+    timeout: int = _DEFAULT_TIMEOUT,
+    form_values: Optional[dict[str, str]] = None,
+    callback: Optional[Callable[[dict[str, Any]], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> dict[str, Any]:
+    """Crawl an allowlisted origin and report masked email exposure.
+
+    Form submissions are disabled by default. Active mode submits explicitly
+    supplied, plain-text values only to matching same-origin fields.
+    """
+    target = normalize_http_url(target_url)
+    if not is_target_authorized(target):
+        return {
+            "status": "blocked",
+            "error": "Target is outside ALLOW_REAL_RUN/ALLOWED_TARGETS",
+            "target": target,
+            "active_testing": True,
+            "pages": [],
+            "forms": [],
+            "emails": [],
+            "requests": 0,
+        }
+    if not isinstance(active_testing, bool):
+        raise TypeError("active_testing must be a boolean")
+    test_values = _validated_form_values(form_values)
+
+    max_pages = min(max(int(max_pages), 1), 500)
+    timeout = min(max(int(timeout), 1), 5)
+    budget = RequestBudget(min(max(int(max_requests), 1), _DEFAULT_MAX_REQUESTS))
+    session = requests.Session()
+    session.headers.update(build_browser_headers())
+
+    pages: list[str] = []
+    forms_found: list[dict[str, Any]] = []
+    form_submissions: list[dict[str, Any]] = []
+    emails: dict[str, set[str]] = {}
+    visited: set[str] = set()
+    pending = deque([target])
+    queued_urls: set[str] = {target}
+
+    def report(event: dict[str, Any]) -> None:
+        if callback:
+            callback(event)
+
+    try:
+        while (
+                pending
+                and len(pages) < max_pages
+                and budget.used < budget.limit
+                and not (cancel_event and cancel_event.is_set())
+        ):
+
+            page_url = normalize_http_url(
+                pending.popleft()
+            )
+
+            queued_urls.discard(page_url)
+
+            if page_url in visited:
+                continue
+
+            if not same_origin(page_url, target):
+                report({
+                    "stage": "scope_skip",
+                    "url": page_url,
+                })
+                continue
+
+            visited.add(page_url)
+
+            if not budget.try_consume():
+                report({
+                    "stage": "budget_exhausted",
+                    "requests": budget.used,
+                    "limit": budget.limit,
+                })
+                break
+
+            rate_limit()
+            session.headers.update(build_browser_headers())
+
+            report({
+                "stage": "crawl_start",
+                "url": page_url,
+                "visited": len(visited),
+                "queued": len(pending),
+                "requests": budget.used,
+            })
+
+            try:
+                response = scoped_request(
+                    session,
+                    "GET",  # <- тільки GET
+                    page_url,
+                    root_url=target,
+                    timeout=timeout,
+                    stream=True,
+                    request_budget=budget,
+                    initial_budget_consumed=True,
+                )
+
+                if response.status_code >= 400:
+                    report({
+                        "stage": "http_error",
+                        "url": page_url,
+                        "status": response.status_code,
+                    })
+                    continue
+
+            except requests.exceptions.RequestException as exc:
+                report({
+                    "stage": "crawl_error",
+                    "url": page_url,
+                    "error": str(exc),
+                })
+                continue
+
+            try:
+                if response.is_redirect:
+                    report({
+                        "stage": "redirect_blocked",
+                        "url": page_url,
+                        "location": response.headers.get("Location", ""),
+                    })
+                    continue
+
+                if not same_origin(response.url, target):
+                    report({
+                        "stage": "cross_origin_blocked",
+                        "url": response.url,
+                    })
+                    continue
+
+                content_type = (
+                    response.headers.get("Content-Type", "")
+                    .split(";")[0]
+                    .strip()
+                    .lower()
+                )
+
+                allowed_types = {
+                    "text/html",
+                    "text/plain",
+                    "application/xhtml+xml",
+                }
+
+                if content_type and content_type not in allowed_types:
+                    report({
+                        "stage": "content_type_skipped",
+                        "url": page_url,
+                        "content_type": content_type,
+                    })
+                    continue
+
+                html = _response_text(response)
+
+                page_url = normalize_http_url(response.url)
+
+                pages.append(page_url)
+
+                report({
+                    "stage": "page_processed",
+                    "url": page_url,
+                    "pages": len(pages),
+                    "requests": budget.used,
+                })
+
+            finally:
+                response.close()
+
+            soup = BeautifulSoup(html, "html.parser")
+            text = soup.get_text(" ", strip=True) + " " + html
+            for address in _EMAIL_RE.findall(text):
+                emails.setdefault(address.lower(), set()).add(page_url)
+
+            for anchor in soup.find_all("a", href=True):
+                candidate = normalize_http_url(
+                    urljoin(page_url, str(anchor["href"]))
+                )
+
+                if (
+                        same_origin(candidate, target)
+                        and candidate not in visited
+                        and candidate not in queued_urls
+                ):
+                    if urlparse(candidate).path.lower().endswith(
+                            (
+                                    ".pdf",
+                                    ".zip",
+                                    ".png",
+                                    ".jpg",
+                                    ".jpeg",
+                                    ".gif",
+                                    ".svg",
+                                    ".css",
+                                    ".js",
+                            )
+                    ):
+                        continue
+
+                    pending.append(candidate)
+                    queued_urls.add(candidate)
+
+            for form in soup.find_all("form"):
+                action = urljoin(page_url, str(form.get("action", "")))
+                method = str(form.get("method", "GET")).upper()
+                if method not in {"GET", "POST"} or not same_origin(action, target):
+                    continue
+                descriptor = {
+                    "url": action,
+                    "method": method,
+                    "input_count": len(
+                        form.find_all(
+                            ["input", "textarea", "select"]
+                        )
+                    ),
+                    "contains_password": bool(
+                        form.find(
+                            "input",
+                            {"type": "password"}
+                        )
+                    ),
+                    "contains_email": bool(
+                        form.find(
+                            "input",
+                            {"type": "email"}
+                        )
+                    ),
+                }
+                forms_found.append(descriptor)
+                if not active_testing or not test_values:
+                    continue
+                fields, matched_test_value = _form_fields(form, test_values)
+                if not fields or not matched_test_value:
+                    continue
+                if cancel_event and cancel_event.is_set():
+                    break
+                if not budget.try_consume():
+                    break
+                rate_limit()
+                session.headers.update(build_browser_headers())
+                try:
+                    form_response = scoped_request(
+                        session,
+                        method,
+                        action,
+                        root_url=target,
+                        timeout=timeout,
+                        stream=True,
+                        request_budget=budget,
+                        initial_budget_consumed=True,
+                        **({"params": fields} if method == "GET" else {"data": fields}),
+                    )
+                except requests.exceptions.RequestException as exc:
+                    report({"stage": "form_error", "url": action, "error": str(exc)})
+                    continue
+                try:
+                    submission = {
+                        "url": action,
+                        "method": method,
+                        "status": form_response.status_code,
+                        "redirect_blocked": form_response.is_redirect,
+                    }
+
+                    if not form_response.is_redirect and same_origin(
+                            form_response.url,
+                            target
+                    ):
+                        submitted_text = _response_text(form_response)
+
+                        submission["response_bytes"] = len(
+                            submitted_text.encode("utf-8")
+                        )
+
+                    form_submissions.append(submission)
+
+                finally:
+                    form_response.close()
+
+        report({
+            "stage": "progress",
+            "pages": len(pages),
+            "visited": len(visited),
+            "queued": len(pending),
+            "emails": len(emails),
+            "forms": len(forms_found),
+            "active_findings": len(form_submissions),
+            "requests": budget.used,
+            "budget": budget.limit,
+        })
+
+        masked_emails = sorted(emails.keys())
+        result = {
+            "status": "cancelled" if cancel_event and cancel_event.is_set() else "completed",
+            "target": target,
+            "active_testing": active_testing,
+            "active_form_submissions": bool(form_submissions),
+            "pages": pages,
+            "page_count": len(pages),
+            "forms": forms_found,
+            "form_count": len(forms_found),
+            "emails": masked_emails,
+            "email_sources": {
+                address: sorted(sources)
+                for address, sources in emails.items()
+            },
+            "form_submissions": form_submissions,
+            "active_findings": form_submissions,
+            "requests": budget.used,
+            "request_budget": budget.limit,
+        }
+        artifact = build_email_leak_artifact(
+            {"emails": masked_emails},
+            target_url=target,
+            source="email_leak_worker",
+            module="EmailLeakWorker",
+        )
+        if artifact:
+            result["artifact"] = artifact
+            THREAT_CONNECTOR.add_artifact("EmailLeakWorker", target, [artifact])
+        return result
+    finally:
+        session.close()
+
 
 class EmailLeakWorker:
-    """
-    EmailLeakWorker 13.0 ULTRA‑MODE (GOD‑ENGINE)
-    Enterprise‑grade worker для Email Leak Integration.
-    """
+    """Background runner compatible with the main window's legacy worker API."""
 
     def __init__(
         self,
-        threat_tab,
-        ui_bridge,
-        poll_interval: float = 0.15,
-        retries: int = 1,
-        on_start: Optional[Callable] = None,
-        on_finish: Optional[
-            Callable[[bool, int, Dict[str, Any], Dict[str, List[Dict[str, Any]]]], None]
-        ] = None,
-        on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
-        debug_telemetry: bool = False,
-        connector: Optional[ThreatConnector] = None,
-    ):
-        # GUI + threading
+        threat_tab=None,
+        ui_bridge=None,
+        target_provider: Optional[Callable[[], str]] = None,
+        on_complete: Optional[Callable[[dict[str, Any]], None]] = None,
+    ) -> None:
         self.threat_tab = threat_tab
-        self.ui = ui_bridge
-        self.poll_interval = poll_interval
-        self.retries = retries
-
-        # Callbacks
-        self.on_start = on_start
-        self.on_finish = on_finish
-        self.on_event = on_event
-        self.debug_telemetry = debug_telemetry
-
-        # ThreatConnector (SQLite backend)
-        self.connector: ThreatConnector = connector or THREAT_CONNECTOR
-
-        # ------------------------------------------------------------
-        # ULTRA‑MODE state machine
-        # ------------------------------------------------------------
+        self.ui_bridge = ui_bridge
+        self.target_provider = target_provider
+        self.on_complete = on_complete
+        self._thread: Optional[threading.Thread] = None
+        self._cancel = threading.Event()
         self._lock = threading.Lock()
-        self._running = False
-        self._finished = False
-        self._shutdown = False
-        self._error: Optional[Exception] = None
+        self.last_result: Optional[dict[str, Any]] = None
 
-        # Threads
-        self._worker_thread_obj: Optional[threading.Thread] = None
-        self._progress_thread_obj: Optional[threading.Thread] = None
-        self._watchdog_thread_obj: Optional[threading.Thread] = None
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
 
-        # Health / watchdog
-        self._health_ok = True
-        self._last_heartbeat = time.time()
-        self._watchdog_enabled = True
-        self._heartbeat_interval = 1.0
-        self._max_silence = 10.0  # seconds
+    def start(
+        self,
+        target_url: Optional[str] = None,
+        *,
+        active_testing: bool = False,
+        max_pages: int = _DEFAULT_MAX_PAGES,
+        max_requests: int = _DEFAULT_MAX_REQUESTS,
+        form_values: Optional[dict[str, str]] = None,
+    ) -> bool:
+        if self.is_running():
+            return False
+        if target_url is None and self.target_provider is not None:
+            target_url = self.target_provider()
+        if not target_url:
+            raise ValueError("An audit target URL is required")
+        if not isinstance(active_testing, bool):
+            raise TypeError("active_testing must be a boolean")
+        self._cancel.clear()
 
-        # ------------------------------------------------------------
-        # Statistics
-        # ------------------------------------------------------------
-        self.total = 0
-        self.loaded = 0
-        self.summary: Dict[str, Any] = {}
-
-        # ------------------------------------------------------------
-        # Leak categories
-        # ------------------------------------------------------------
-        self.leaks_grouped: Dict[str, List[Dict[str, Any]]] = {
-            "email_leak": [],
-            "account_state_leak": [],
-            "password_leak": [],
-            "token_leak": [],
-            "secret_leak": [],
-            "pii_leak": [],
-        }
-
-        # ------------------------------------------------------------
-        # Counters
-        # ------------------------------------------------------------
-        self.counters = {
-            "email": 0,
-            "password": 0,
-            "token": 0,
-            "secret": 0,
-            "pii": 0,
-            "total": 0,
-        }
-
-        # ------------------------------------------------------------
-        # ML / entropy / heatmap
-        # ------------------------------------------------------------
-        self.ml_enabled = True
-        self.ml_last_prediction = None
-
-        self.entropy_enabled = True
-
-        self.heatmap_enabled = True
-        self.heatmap_data: Dict[str, Any] = {}
-
-        # ------------------------------------------------------------
-        # Adaptive throttling 2.0
-        # ------------------------------------------------------------
-        self.adaptive_enabled = True
-        self.adaptive_factor = 1.0
-
-
-    # ------------------------------------------------------------
-    #  GOD‑MODE CONTROL ENGINE
-    # ------------------------------------------------------------
-
-    def start(self) -> None:
-        """Запускає інтеграцію, якщо вона ще не запущена."""
-        with self._lock:
-            if self._shutdown:
-                self._log_debug("EmailLeakWorker: start() після shutdown — ігнорую")
-                return
-
-            if self._running:
-                self._set_status("📡 Email Leak Integration вже виконується…")
-                return
-
-            # Atomic reset
-            self._running = True
-            self._finished = False
-            self._error = None
-            self.total = 0
-            self.loaded = 0
-            self.summary = {}
-            self._health_ok = True
-            self._last_heartbeat = time.time()
-
-            for k in self.leaks_grouped:
-                self.leaks_grouped[k].clear()
-
-        logger.info("[EmailLeakWorker] Запуск інтеграції (13.0 ULTRA‑MODE GOD‑ENGINE)")
-        self._set_status("📦 Email Leak Integration: запуск…")
-
-        if self.on_start:
+        def worker() -> None:
             try:
-                self.on_start()
-            except Exception:
-                logger.exception("[EmailLeakWorker] on_start callback error")
+                result = run_email_leak_audit(
+                    target_url,
+                    active_testing=active_testing,
+                    max_pages=max_pages,
+                    max_requests=max_requests,
+                    form_values=form_values,
+                    callback=lambda event: logger.info("Email audit: %s", event),
+                    cancel_event=self._cancel,
+                )
+                self.last_result = result
+                artifact = result.get("artifact")
+                if artifact and self.threat_tab is not None:
+                    self._post_ui(self.threat_tab.add_threat, artifact)
+                self._post_ui(self._publish_status, result)
+                if self.on_complete:
+                    self._post_ui(self.on_complete, result)
+            except Exception as exc:
+                logger.exception("Email leak audit failed")
+                self._post_ui(self._publish_error, exc)
+                if self.on_complete:
+                    self._post_ui(self.on_complete, {"status": "failed", "error": str(exc)})
 
-        # Worker thread
-        self._worker_thread_obj = threading.Thread(
-            target=self._worker_thread,
-            daemon=True,
-            name="EmailLeakWorkerThread",
-        )
-        self._worker_thread_obj.start()
-
-        # Progress thread
-        self._progress_thread_obj = threading.Thread(
-            target=self._progress_thread,
-            daemon=True,
-            name="EmailLeakProgressThread",
-        )
-        self._progress_thread_obj.start()
-
-        # Watchdog thread
-        if self._watchdog_enabled:
-            self._watchdog_thread_obj = threading.Thread(
-                target=self._watchdog_thread,
+        with self._lock:
+            if self.is_running():
+                return False
+            self._thread = threading.Thread(
+                target=worker,
+                name="EmailLeakAuditWorker",
                 daemon=True,
-                name="EmailLeakWatchdogThread",
             )
-            self._watchdog_thread_obj.start()
-
-    def _watchdog_thread(self) -> None:
-        """Контролює зависання worker‑потоку."""
-        while not self._shutdown:
-            time.sleep(self._heartbeat_interval)
-            now = time.time()
-
-            with self._lock:
-                running = self._running
-                last = self._last_heartbeat
-
-            if not running:
-                break
-
-            if now - last > self._max_silence:
-                logger.warning("[EmailLeakWorker] Watchdog: worker silent too long")
-                self._health_ok = False
-                self._set_status("⚠️ Email Leak Integration: watchdog detected stall")
+            self._thread.start()
+        return True
 
     def stop(self) -> None:
-        """
-        ULTRA‑MODE stop():
-        - м’яка зупинка worker + progress threads
-        - atomic state transition
-        - GUI‑safe
-        - restart‑safe
-        """
-        with self._lock:
-            self._shutdown = True
-            self._running = False
+        self._cancel.set()
 
-        self._set_status("⏹ Email Leak Integration: зупинено")
-        logger.info("[EmailLeakWorker] Stop requested — worker shutting down safely")
-
-    def shutdown(self) -> None:
-        """
-        ULTRA‑MODE shutdown():
-        - повний shutdown
-        - блокує майбутні start()
-        - завершує lifecycle
-        """
-        with self._lock:
-            self._shutdown = True
-            self._running = False
-            self._finished = True
-
-        self._set_status("⏹ Email Leak Integration: повний shutdown")
-        logger.info("[EmailLeakWorker] Full shutdown completed")
-
-    # ------------------------------------------------------------
-    #  Основний робочий потік (7.0: SQLite + ThreatConnector)
-    # ------------------------------------------------------------
-
-    def _worker_thread(self) -> None:
-        attempts = 0
-
-        while attempts <= self.retries and not self._shutdown:
-            attempts += 1
-            self._heartbeat()
-
-            try:
-                self._log_debug(f"[EmailLeakWorker] Спроба #{attempts}")
-
-                # 1) Bulk‑ingest артефактів у GUI через ThreatConnector (SQLite)
-                self._load_artifacts_to_gui_bulk()
-
-                # 2) FULL INTEL (summary + grouping + risk + entropy + ML)
-                self._collect_full_intel_async()
-
-                self._error = None
-                break
-
-            except Exception as e:
-                logger.exception(f"[EmailLeakWorker] Помилка на спробі #{attempts}: {e}")
-                self._error = e
-                time.sleep(0.5)
-                self._heartbeat()
-
-        with self._lock:
-            self._running = False
-            self._finished = True
-
-        if self._error:
-            self._set_status(f"❌ Email Leak Integration: помилка: {self._error}")
+    def _post_ui(self, callback: Callable[..., Any], *args: Any) -> None:
+        if self.ui_bridge is not None and callable(getattr(self.ui_bridge, "post_ui", None)):
+            self.ui_bridge.post_ui(callback, *args)
         else:
-            leaks_total = sum(len(v) for v in self.leaks_grouped.values())
-            risk_level = self._get_top_risk()
-            self._set_status(
-                f"✅ Email Leak Integration завершено (витоків: {leaks_total}, ризик: {risk_level})"
+            callback(*args)
+
+    def _publish_status(self, result: dict[str, Any]) -> None:
+        status_var = getattr(self.threat_tab, "status_var", None)
+        if status_var is not None:
+            status_var.set(
+                f"Email audit {result.get('status')}: "
+                f"{result.get('page_count', 0)} pages, "
+                f"{len(result.get('emails', []))} masked emails"
             )
 
-        if self.on_finish:
-            try:
-                self.on_finish(
-                    self._error is None,
-                    sum(len(v) for v in self.leaks_grouped.values()),
-                    self.summary,
-                    self.leaks_grouped,
-                )
-            except Exception:
-                logger.exception("[EmailLeakWorker] on_finish callback error")
-
-
-    # ------------------------------------------------------------
-    #  ULTRA‑MODE BULK ARTIFACT LOADING
-    # ------------------------------------------------------------
-
-    def _load_artifacts_to_gui_bulk(self) -> int:
-        """
-        ULTRA‑MODE bulk‑завантаження артефактів з ThreatConnector у GUI:
-        - сортування по ризику
-        - GUI‑safe постинг через UIQueueBridge / after()
-        - adaptive throttling 2.0
-        """
-        from xss_security_gui.threat_data_loader import ThreatDataLoader
-
-        artifacts = self.connector.load_all()
-        self.total = len(artifacts)
-
-        artifacts_sorted = sorted(
-            artifacts,
-            key=lambda a: ThreatRisk.ORDER.get(
-                ThreatRisk.normalize((a.get("result") or {}).get("risk")),
-                -1,
-            ),
-            reverse=True,
-        )
-
-        loader = ThreatDataLoader()
-        count = 0
-
-        bridge = getattr(self.threat_tab, "_bridge", None) or self.ui
-
-        for artifact in artifacts_sorted:
-            self._heartbeat()
-
-            gui_artifact = loader.convert_artifact_for_gui(artifact)
-            if not gui_artifact:
-                continue
-
-            try:
-                if bridge is not None and hasattr(bridge, "post_ui"):
-                    bridge.post_ui(self.threat_tab.add_threat, gui_artifact)
-                else:
-                    self.threat_tab.after(0, self.threat_tab.add_threat, gui_artifact)
-                count += 1
-            except Exception:
-                logger.exception("[EmailLeakWorker] Не вдалося додати артефакт у GUI")
-
-            if self.adaptive_enabled:
-                time.sleep(self.poll_interval * self.adaptive_factor)
-
-        self.loaded = count
-        self._log_debug(
-            f"[EmailLeakWorker] Bulk loaded {count}/{len(artifacts)} artifacts to GUI via ThreatConnector"
-        )
-        return count
-
-    # ------------------------------------------------------------
-    #  WATCHDOG + HEARTBEAT
-    # ------------------------------------------------------------
-
-    def _heartbeat(self) -> None:
-        """Оновлює heartbeat для watchdog."""
-        with self._lock:
-            self._last_heartbeat = time.time()
-
-    # ------------------------------------------------------------
-    #  ULTRA‑MODE FULL INTEL (summary + grouping + risk + entropy + ML)
-    #  через ThreatConnector
-    # ------------------------------------------------------------
-
-    def _collect_full_intel_async(self) -> None:
-        """
-        EmailLeakWorker 13.0 ULTRA‑MODE (GOD‑ENGINE):
-        - summary + report
-        - grouping leaks
-        - risk scoring
-        - entropy
-        - ML prediction
-        - heatmap aggregation
-        - live‑stream у ThreatAnalysisTab
-        """
-
-        def bg():
-            try:
-                self._heartbeat()
-
-                # ----------------------------------------
-                # 1) Базовий summary + report
-                # ----------------------------------------
-                summary = self.connector.summary()
-                report = self.connector.generate_report()
-
-                summary["by_risk"] = report.get("by_severity", {})
-                summary["by_category"] = report.get("by_category", {})
-                summary["by_source"] = report.get("by_source", {})
-
-                # ----------------------------------------
-                # 2) ULTRA‑MODE grouping
-                # ----------------------------------------
-                grouped = {
-                    "email_leak": [],
-                    "account_state_leak": [],
-                    "password_leak": [],
-                    "token_leak": [],
-                    "secret_leak": [],
-                    "pii_leak": [],
-                }
-
-                artifacts = self.connector.load_all()
-
-                for a in artifacts:
-                    self._heartbeat()
-                    result = a.get("result", {}) or {}
-                    category = result.get("category", "unknown").lower()
-                    text_repr = str(result).lower()
-
-                    if category == "email_leak":
-                        grouped["email_leak"].append(result)
-                    elif category == "account_state_leak":
-                        grouped["account_state_leak"].append(result)
-                    elif "password" in text_repr:
-                        grouped["password_leak"].append(result)
-                    elif any(k in text_repr for k in ("token", "jwt", "oauth", "api_key", "bearer")):
-                        grouped["token_leak"].append(result)
-                    elif any(k in text_repr for k in ("secret", "private_key", "ssh", "pem", "ghp_", "sk_live")):
-                        grouped["secret_leak"].append(result)
-                    elif any(k in text_repr for k in ("email", "phone", "iban", "ipv4", "ipv6", "credit_card")):
-                        grouped["pii_leak"].append(result)
-
-                # ----------------------------------------
-                # 3) ULTRA‑MODE risk scoring
-                # ----------------------------------------
-                risk_score = {
-                    "email_leak": len(grouped["email_leak"]) * 3,
-                    "account_state_leak": len(grouped["account_state_leak"]) * 4,
-                    "password_leak": len(grouped["password_leak"]) * 6,
-                    "token_leak": len(grouped["token_leak"]) * 7,
-                    "secret_leak": len(grouped["secret_leak"]) * 8,
-                    "pii_leak": len(grouped["pii_leak"]) * 5,
-                }
-                risk_score["total"] = sum(risk_score.values())
-                summary["risk_score"] = risk_score
-
-                # ----------------------------------------
-                # 4) Entropy analysis (ULTRA‑MODE)
-                # ----------------------------------------
-                if self.entropy_enabled:
-                    def entropy(s: str) -> float:
-                        if not s:
-                            return 0.0
-                        import math
-                        freq = {}
-                        for c in s:
-                            freq[c] = freq.get(c, 0) + 1
-                        total = len(s)
-                        return round(-sum((f / total) * math.log2(f / total) for f in freq.values()), 3)
-
-                    summary["entropy"] = {
-                        "email_leak": entropy(str(grouped["email_leak"])),
-                        "password_leak": entropy(str(grouped["password_leak"])),
-                        "token_leak": entropy(str(grouped["token_leak"])),
-                        "secret_leak": entropy(str(grouped["secret_leak"])),
-                        "pii_leak": entropy(str(grouped["pii_leak"])),
-                    }
-
-                # ----------------------------------------
-                # 5) ML‑based classification (ULTRA‑MODE)
-                # ----------------------------------------
-                if self.ml_enabled:
-                    try:
-                        from xss_security_gui.ai_core.nn_model import nn_model_predict
-                        summary["ml_prediction"] = nn_model_predict(summary)
-                        self.ml_last_prediction = summary["ml_prediction"]
-                    except Exception:
-                        summary["ml_prediction"] = "unavailable"
-                        self.ml_last_prediction = None
-                else:
-                    summary["ml_prediction"] = "disabled"
-
-                # ----------------------------------------
-                # 6) Heatmap aggregation
-                # ----------------------------------------
-                if self.heatmap_enabled:
-                    self.heatmap_data = {
-                        "email": len(grouped["email_leak"]),
-                        "password": len(grouped["password_leak"]),
-                        "token": len(grouped["token_leak"]),
-                        "secret": len(grouped["secret_leak"]),
-                        "pii": len(grouped["pii_leak"]),
-                    }
-
-                return summary, grouped
-
-            except Exception as e:
-                logger.exception("[EmailLeakWorker] ULTRA‑MODE collect_full_intel error: %s", e)
-                return e
-
-        def done(result):
-            if isinstance(result, Exception):
-                logger.warning("[EmailLeakWorker] ULTRA‑MODE intel collection failed: %s", result)
-                return
-
-            summary, grouped = result
-            self.summary = summary
-            self.leaks_grouped = grouped
-
-            self._log_debug(
-                f"[EmailLeakWorker] ULTRA‑MODE intel: total={summary.get('total')}, "
-                f"risk_score={summary['risk_score']['total']}, "
-                f"email={len(grouped['email_leak'])}, "
-                f"password={len(grouped['password_leak'])}, "
-                f"token={len(grouped['token_leak'])}, "
-                f"secret={len(grouped['secret_leak'])}, "
-                f"pii={len(grouped['pii_leak'])}"
-            )
-
-            cb = self.on_event
-            if callable(cb):
-                try:
-                    cb("email_leak_summary_ultra", summary)
-                    cb("email_leak_grouped_ultra", grouped)
-                except Exception:
-                    logger.exception("[EmailLeakWorker] on_event callback error")
-
-        if hasattr(self.ui, "post_bg"):
-            try:
-                self.ui.post_bg(bg, done)
-                return
-            except Exception:
-                logger.exception("[EmailLeakWorker] post_bg failed, fallback to Thread")
-
-        threading.Thread(
-            target=lambda: done(bg()),
-            daemon=True,
-            name="EmailLeakFullIntelULTRAThread",
-        ).start()
-
-    # ------------------------------------------------------------
-    #  ULTRA‑MODE Risk scoring + filtering API (через ThreatConnector)
-    # ------------------------------------------------------------
-
-    def _get_top_risk(self) -> str:
-        """
-        Повертає найвищий рівень ризику з summary.by_risk.
-        ULTRA‑MODE:
-        - захист від некоректних структур
-        - нормалізація ризиків
-        - fallback на 'unknown'
-        """
-        by_risk = self.summary.get("by_risk") or {}
-        if not isinstance(by_risk, dict) or not by_risk:
-            return "unknown"
-
-        # Нормалізуємо ключі ризиків
-        normalized_items = []
-        for risk_name, count in by_risk.items():
-            norm = ThreatRisk.normalize(risk_name)
-            order = ThreatRisk.ORDER.get(norm, -1)
-            normalized_items.append((norm, order, count))
-
-        if not normalized_items:
-            return "unknown"
-
-        # Сортуємо за ORDER (critical > high > medium > low > info)
-        normalized_items.sort(key=lambda x: x[1], reverse=True)
-
-        top_risk = normalized_items[0][0]
-        return top_risk if top_risk else "unknown"
-
-    def filter_leaks(
-            self,
-            category: Optional[str] = None,
-            min_risk: Optional[str] = None,
-            module: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        ULTRA‑MODE фільтрація витоків:
-        - category: email_leak / account_state_leak / password_leak / token_leak / secret_leak / pii_leak
-        - min_risk: critical / high / medium / low / info
-        - module: фільтр по модулю (EndpointScanner, RealTimeWatcher, ...)
-        """
-
-        leaks: List[Dict[str, Any]] = []
-
-        # Вибір категорій
-        categories = [category] if category else list(self.leaks_grouped.keys())
-
-        # Нормалізація мінімального ризику
-        min_risk_norm = None
-        if min_risk:
-            min_risk_norm = ThreatRisk.normalize(min_risk)
-            min_risk_order = ThreatRisk.ORDER.get(min_risk_norm, -1)
-        else:
-            min_risk_order = -1
-
-        for cat in categories:
-            group = self.leaks_grouped.get(cat, [])
-            if not isinstance(group, list):
-                continue
-
-            for leak in group:
-                # -----------------------------
-                # 1) Risk filter (ULTRA‑MODE)
-                # -----------------------------
-                risk_raw = leak.get("risk") or leak.get("severity") or "unknown"
-                risk_norm = ThreatRisk.normalize(risk_raw)
-                risk_order = ThreatRisk.ORDER.get(risk_norm, -1)
-
-                if risk_order < min_risk_order:
-                    continue
-
-                # -----------------------------
-                # 2) Module filter (ULTRA‑MODE)
-                # -----------------------------
-                if module:
-                    src_module = (
-                            leak.get("source_module")
-                            or leak.get("module")
-                            or ""
-                    )
-                    if src_module and module.lower() not in str(src_module).lower():
-                        continue
-
-                # -----------------------------
-                # 3) Append leak
-                # -----------------------------
-                leaks.append(leak)
-
-        return leaks
-
-    # ------------------------------------------------------------
-    #  ULTRA‑MODE: filter_by_module
-    # ------------------------------------------------------------
-    def filter_by_module(self, module: str) -> List[Dict[str, Any]]:
-        """
-        ULTRA‑MODE:
-        - безпечна делегація до ThreatConnector
-        - захист від некоректних відповідей
-        - fallback на пустий список
-        """
-        try:
-            result = self.connector.filter_by_module(module)
-            return result if isinstance(result, list) else []
-        except Exception:
-            logger.exception("[EmailLeakWorker] filter_by_module error")
-            return []
-
-
-    # ------------------------------------------------------------
-    #  ULTRA‑MODE: filter_by_severity
-    # ------------------------------------------------------------
-    def filter_by_severity(self, severity: str) -> List[Dict[str, Any]]:
-        """
-        ULTRA‑MODE:
-        - нормалізація severity
-        - безпечна делегація до ThreatConnector
-        - fallback на пустий список
-        """
-        try:
-            severity_norm = ThreatRisk.normalize(severity)
-            result = self.connector.filter_by_severity(severity_norm)
-            return result if isinstance(result, list) else []
-        except Exception:
-            logger.exception("[EmailLeakWorker] filter_by_severity error")
-            return []
-
-
-    # ------------------------------------------------------------
-    #  ULTRA‑MODE: generate_report
-    # ------------------------------------------------------------
-    def generate_report(self) -> Dict[str, Any]:
-        """
-        ULTRA‑MODE:
-        - повний звіт через ThreatConnector
-        - захист від некоректних структур
-        - гарантія повернення dict
-        """
-        try:
-            report = self.connector.generate_report()
-            return report if isinstance(report, dict) else {}
-        except Exception:
-            logger.exception("[EmailLeakWorker] generate_report error")
-            return {}
-
-    # ------------------------------------------------------------
-    #  Потік прогресу
-    # ------------------------------------------------------------
-
-    def _progress_thread(self) -> None:
-        """
-        ULTRA‑MODE:
-        - GUI‑safe статус‑бар
-        - heartbeat для watchdog
-        - захист від падіння threat_tab
-        - adaptive throttling
-        """
-        while True:
-            with self._lock:
-                running = self._running
-                shutdown = self._shutdown
-
-            if not running or shutdown:
-                break
-
-            try:
-                # Якщо вкладка GUI зникла — завершуємо прогрес
-                if not self.threat_tab.winfo_exists():
-                    logger.warning("[EmailLeakWorker] ThreatTab зник — зупиняю прогрес")
-                    break
-
-                # Heartbeat для watchdog
-                self._heartbeat()
-
-                # ULTRA‑MODE статус
-                msg = (
-                    "📡 Email Leak Integration… "
-                    "інтел, grouping, risk scoring, entropy, ML…"
-                )
-                self._set_status(msg)
-
-            except Exception:
-                logger.exception("[EmailLeakWorker] Проблема оновлення прогресу")
-
-            # Adaptive throttling 2.0
-            delay = self.poll_interval * self.adaptive_factor
-            time.sleep(delay)
-
-
-    # ------------------------------------------------------------
-    #  ULTRA‑MODE UI helper + debug
-    # ------------------------------------------------------------
-    def _set_status(self, text: str) -> None:
-        """
-        ULTRA‑MODE:
-        - потокобезпечне оновлення статусу
-        - GUI‑safe через UIQueueBridge
-        - fallback на .after()
-        """
-        try:
-            bridge = getattr(self.threat_tab, "_bridge", None) or self.ui
-
-            if bridge is not None and hasattr(bridge, "post_ui"):
-                bridge.post_ui(self.threat_tab.status_var.set, text)
-            else:
-                # Fallback для Tkinter без UIQueueBridge
-                self.threat_tab.after(0, self.threat_tab.status_var.set, text)
-
-        except Exception:
-            logger.error("[EmailLeakWorker] Не вдалося оновити статус")
-
-
-    def _log_debug(self, msg: str) -> None:
-        """ULTRA‑MODE debug telemetry."""
-        if self.debug_telemetry:
-            logger.info(msg)
-    # ------------------------------------------------------------
-    #  Viewer для витоків email/password/account
-    # ------------------------------------------------------------
-    def open_leak_details(self, leak: Dict[str, Any]) -> None:
-        """ULTRA‑MODE: відкриває деталі витоку у окремому вікні (GUI‑safe)."""
-        try:
-            bridge = getattr(self.threat_tab, "_bridge", None) or self.ui
-            if bridge is not None and hasattr(bridge, "post_ui"):
-                bridge.post_ui(self._show_leak_window, leak)
-            else:
-                # Fallback для Tkinter без UIQueueBridge
-                self.threat_tab.after(0, self._show_leak_window, leak)
-        except Exception:
-            logger.exception("[EmailLeakWorker] Не вдалося відкрити вікно витоку")
-
-    def _show_leak_window(self, leak: Dict[str, Any]) -> None:
-        """ULTRA‑MODE viewer для витоків."""
-        try:
-            import tkinter as tk
-            from tkinter import ttk, filedialog
-            import json
-            import webbrowser
-
-            if not self.threat_tab or not self.threat_tab.winfo_exists():
-                return
-
-            root = self.threat_tab.winfo_toplevel()
-
-            win = tk.Toplevel(root)
-            win.title("Leak Details — ULTRA‑MODE")
-            win.geometry("780x620")
-            win.configure(bg="#111")
-
-            frame = ttk.Frame(win, padding=10)
-            frame.pack(fill="both", expand=True)
-
-            # ----------------------------
-            # Normalize fields
-            # ----------------------------
-            def normalize_list(value):
-                if value is None:
-                    return []
-                if isinstance(value, str):
-                    return [value]
-                if isinstance(value, list):
-                    return value
-                return [str(value)]
-
-            emails = normalize_list(leak.get("emails") or leak.get("email"))
-            passwords = normalize_list(leak.get("passwords") or leak.get("password"))
-            tokens = normalize_list(leak.get("tokens") or leak.get("token"))
-            secrets = normalize_list(leak.get("secrets") or leak.get("secret"))
-            pii = normalize_list(leak.get("pii"))
-
-            source = leak.get("source") or leak.get("url") or leak.get("breach") or "unknown"
-            risk = leak.get("risk") or leak.get("severity") or "unknown"
-            entropy = leak.get("entropy") or "n/a"
-            ml_pred = leak.get("ml_prediction") or "n/a"
-            category = leak.get("category", "unknown")
-
-            # ----------------------------
-            # Header section
-            # ----------------------------
-            ttk.Label(frame, text="Leak Category:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
-            ttk.Label(frame, text=category).grid(row=0, column=1, sticky="w")
-
-            ttk.Label(frame, text="Risk:", font=("Segoe UI", 10, "bold")).grid(row=1, column=0, sticky="w")
-            ttk.Label(frame, text=risk).grid(row=1, column=1, sticky="w")
-
-            ttk.Label(frame, text="Source:", font=("Segoe UI", 10, "bold")).grid(row=2, column=0, sticky="w")
-            ttk.Label(frame, text=source).grid(row=2, column=1, sticky="w")
-
-            ttk.Label(frame, text="Entropy:", font=("Segoe UI", 10, "bold")).grid(row=3, column=0, sticky="w")
-            ttk.Label(frame, text=str(entropy)).grid(row=3, column=1, sticky="w")
-
-            ttk.Label(frame, text="ML Prediction:", font=("Segoe UI", 10, "bold")).grid(row=4, column=0, sticky="w")
-            ttk.Label(frame, text=str(ml_pred)).grid(row=4, column=1, sticky="w")
-
-            ttk.Separator(frame).grid(row=5, column=0, columnspan=2, pady=10, sticky="ew")
-
-            # ----------------------------
-            # Leak content sections
-            # ----------------------------
-            row = 6
-
-            def add_section(title, items, mask=False):
-                nonlocal row
-                if not items:
-                    return
-                ttk.Label(frame, text=title, font=("Segoe UI", 10, "bold")).grid(row=row, column=0, sticky="nw")
-                if mask:
-                    masked = ["*" * len(p) for p in items]
-                    ttk.Label(frame, text=", ".join(masked)).grid(row=row, column=1, sticky="w")
-                else:
-                    ttk.Label(frame, text=", ".join(items)).grid(row=row, column=1, sticky="w")
-                row += 1
-
-            add_section("Emails:", emails)
-            add_section("Passwords:", passwords, mask=True)
-            add_section("Tokens:", tokens)
-            add_section("Secrets:", secrets)
-            add_section("PII:", pii)
-
-            ttk.Separator(frame).grid(row=row, column=0, columnspan=2, pady=10, sticky="ew")
-            row += 1
-
-            # ----------------------------
-            # Raw JSON viewer
-            # ----------------------------
-            text = tk.Text(frame, wrap="word", height=15, bg="#111", fg="cyan", insertbackground="white")
-            text.grid(row=row, column=0, columnspan=2, sticky="nsew")
-            frame.rowconfigure(row, weight=1)
-            frame.columnconfigure(1, weight=1)
-
-            text.insert("1.0", json.dumps(leak, indent=2, ensure_ascii=False))
-            text.config(state="disabled")
-            row += 1
-
-            # ----------------------------
-            # Buttons
-            # ----------------------------
-            btn_frame = ttk.Frame(frame)
-            btn_frame.grid(row=row, column=0, columnspan=2, pady=10, sticky="ew")
-
-            def copy_to_clipboard(values):
-                if values:
-                    win.clipboard_clear()
-                    win.clipboard_append("\n".join(values))
-
-            ttk.Button(btn_frame, text="Copy Emails", command=lambda: copy_to_clipboard(emails)).pack(side="left", padx=5)
-            ttk.Button(btn_frame, text="Copy Passwords", command=lambda: copy_to_clipboard(passwords)).pack(side="left", padx=5)
-            ttk.Button(btn_frame, text="Copy Tokens", command=lambda: copy_to_clipboard(tokens)).pack(side="left", padx=5)
-            ttk.Button(btn_frame, text="Copy Secrets", command=lambda: copy_to_clipboard(secrets)).pack(side="left", padx=5)
-
-            def export_leak():
-                path = filedialog.asksaveasfilename(
-                    defaultextension=".json",
-                    filetypes=[("JSON files", "*.json"), ("Text files", "*.txt")]
-                )
-                if not path:
-                    return
-                try:
-                    with open(path, "w", encoding="utf-8") as f:
-                        json.dump(leak, f, indent=2, ensure_ascii=False)
-                except Exception as e:
-                    logger.error("Export error: %s", e)
-
-            ttk.Button(btn_frame, text="Export Leak", command=export_leak).pack(side="left", padx=5)
-
-            def open_url():
-                if isinstance(source, str) and source.startswith("http"):
-                    webbrowser.open(source)
-
-            ttk.Button(btn_frame, text="Open Source URL", command=open_url).pack(side="left", padx=5)
-
-            ttk.Button(btn_frame, text="Закрити", command=win.destroy).pack(side="right", padx=5)
-
-        except Exception:
-            logger.exception("[EmailLeakWorker] ULTRA‑MODE leak viewer error")
-
+    def _publish_error(self, error: Exception) -> None:
+        status_var = getattr(self.threat_tab, "status_var", None)
+        if status_var is not None:
+            status_var.set(f"Email audit failed: {type(error).__name__}: {error}")
+
+
+__all__ = [
+    "EmailLeakWorker",
+    "run_email_leak_audit",
+    "JA3_FINGERPRINTS",
+    "COMMON_USER_AGENTS",
+    "COMMON_REFERERS",
+    "COMMON_LANGUAGES",
+    "TLS_SPOOF_CIPHERS",
+    "get_random_ja3",
+    "get_random_user_agent",
+    "get_random_referer",
+    "get_random_language",
+    "rate_limit",
+    "build_browser_headers",
+]
 

@@ -7,7 +7,7 @@ import datetime
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Callable
 
-from xss_security_gui.auto_recon.core_logger import get_logger, LogLevel
+from xss_security_gui.auto_recon.core_logger import get_logger
 from xss_security_gui.auto_recon.user_tracker import get_user_tracker, get_user_context, build_attack_surface
 from xss_security_gui.auto_recon.metrics import get_metrics_collector
 from xss_security_gui.auto_recon.reporting import get_report_generator
@@ -16,6 +16,12 @@ from xss_security_gui.auto_recon.scanner import EndpointScanner, save_reflected_
 from xss_security_gui.auto_recon.analyzer import AutoReconAnalyzerV2
 from xss_security_gui.auto_recon.planner import AttackPlannerV2, build_attack_plan
 from xss_security_gui.auto_recon.payloads import PayloadGenerator
+from xss_security_gui.auto_recon.scope import (
+    RequestBudget,
+    is_target_authorized,
+    normalize_http_url,
+    same_origin,
+)
 
 from xss_security_gui.threat_analysis.threat_connector import THREAT_CONNECTOR
 
@@ -32,115 +38,43 @@ class AutoReconOrchestrator:
 
     def __init__(
         self,
-        target_urls: List[str],
+        target_urls: List[str] | str,
         config: Optional[Dict[str, Any]] = None,
         callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ):
-        # -----------------------------
-        # 1. Базовые параметры
-        # -----------------------------
-        self.target_urls = target_urls
-        self.config = config or self._default_config()
+        self.target_urls = [target_urls] if isinstance(target_urls, str) else list(target_urls)
+        self.config = {**self._default_config(), **(config or {})}
+        self.active_request_budget = RequestBudget(200)
         self.callback = callback
+        if self.config.get("opsec_mode"):
+            try:
+                get_user_context().opsec_mode = str(self.config.get("opsec_mode"))
+            except Exception:
+                pass
 
-        # -----------------------------
-        # 2. Компоненты
-        # -----------------------------
+        # Компоненты
         self.logger = get_logger("AutoReconOrchestrator")
         self.user_tracker = get_user_tracker()
         self.metrics_collector = get_metrics_collector()
         self.reporter = get_report_generator()
         self.ctx = get_user_context()
 
-        # -----------------------------
-        # 3. Session UUID (Red Team)
-        # -----------------------------
-        import uuid
-        self.session_uuid = str(uuid.uuid4())
-        self.ctx.user.session_id = self.session_uuid
-
-        self.logger.info(
-            f"🎯 AutoRecon Session UUID: {self.session_uuid}",
-            user_id=self.ctx.user.user_id,
-            session_id=self.session_uuid,
-        )
-
-        # -----------------------------
-        # 4. OPSEC режимы
-        # -----------------------------
-        if self.config.get("opsec_mode") == "high":
-            self.ctx.opsec_mode = "high"
-            self.logger.warning(
-                "🔐 OPSEC: High stealth mode enabled",
-                user_id=self.ctx.user.user_id,
-                session_id=self.session_uuid,
-            )
-
-        if self.config.get("aggressive"):
-            self.logger.warning(
-                "⚠️ Aggressive mode enabled — high-noise scanning",
-                user_id=self.ctx.user.user_id,
-                session_id=self.session_uuid,
-            )
-
-        # -----------------------------
-        # 5. ThreatConnector
-        # -----------------------------
-        self.threat_connector = THREAT_CONNECTOR
-        self.threat_connector.add_artifact(
-            "SESSION_START",
-            ", ".join(target_urls),
-            {
-                "session_uuid": self.session_uuid,
-                "timestamp": datetime.datetime.utcnow().isoformat(),
-                "opsec_mode": self.ctx.opsec_mode,
-            },
-        )
-
-        # -----------------------------
-        # 6. LiveAttackMonitor (GUI)
-        # -----------------------------
-        self.live_stream_enabled = True
-        self.live_stream_queue = None  # GUI подставит свою очередь
-
-        # -----------------------------
-        # 7. Результаты
-        # -----------------------------
+        # Результаты
         self.scan_results: List[Dict[str, Any]] = []
         self.analysis_results: Dict[str, Any] = {}
         self.attack_results: List[Dict[str, Any]] = []
         self.final_report: Dict[str, Any] = {}
 
-        # -----------------------------
-        # 8. Мониторинг времени
-        # -----------------------------
+        # Мониторинг
         self.start_time: Optional[float] = None
         self.end_time: Optional[float] = None
-
-        # -----------------------------
-        # 9. Attack Surface Cache
-        # -----------------------------
-        self.attack_surface_cache: Dict[str, Any] = {}
-
-        # -----------------------------
-        # 10. MITRE: Recon Initialization
-        # -----------------------------
-        self.user_tracker.track_attack_chain(
-            tactic="TA0043",
-            technique="T1595",
-            subtechnique="T1595.002",
-            target=", ".join(self.target_urls),
-            status="initialized",
-            details={"session_uuid": self.session_uuid},
-            operator_note="AutoRecon orchestrator initialized.",
-        )
 
     @staticmethod
     def _default_config() -> Dict[str, Any]:
         return {
             "aggressive": False,
-            "max_workers": 5,
-            "timeout": 10,
+            "max_workers": 10,
+            "timeout": 5,
             "save_report": True,
             "export_html": True,
             "export_json": True,
@@ -149,21 +83,48 @@ class AutoReconOrchestrator:
             "include_csrf": True,
             "include_ssrf": True,
             "include_dom_xss": True,
-            "max_payloads": 50,
+            "max_payloads": 200,
+            "active_testing": False,
         }
 
-    def _report_progress(self, stage: str, status: str, details: Optional[Dict[str, Any]] = None):
-        if self.callback:
-            try:
+    def _emit_intel(self, module: str, target: str, payload: Any) -> None:
+        """ThreatConnector.add_artifact iterates a list — never pass a raw dict."""
+        if payload is None:
+            return
+        if isinstance(payload, dict):
+            items = [payload]
+        elif isinstance(payload, list):
+            items = [x if isinstance(x, dict) else {"value": x} for x in payload]
+        else:
+            items = [{"value": payload}]
+        try:
+            THREAT_CONNECTOR.add_artifact(module, target, items)
+        except Exception as e:
+            self.logger.error(f"ThreatConnector emit failed: {e}")
+
+    def _report_progress(self, stage=None, status=None, details=None, **kwargs):
+        """Accepts orchestrator (stage, status, details) or scanner dict callbacks."""
+        if not self.callback:
+            return
+        try:
+            if isinstance(stage, dict):
+                message = dict(stage)
+                message.setdefault("timestamp", datetime.datetime.now(datetime.timezone.utc).isoformat())
+                message.setdefault("stage", message.get("stage") or "SCANNING")
+                message.setdefault("status", message.get("status") or message.get("error") or "update")
+                message.setdefault("details", {k: v for k, v in message.items() if k not in ("timestamp", "stage", "status", "details")})
+            else:
                 message = {
-                    "timestamp": datetime.datetime.utcnow().isoformat(),
-                    "stage": stage,
-                    "status": status,
+                    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "stage": stage or "UNKNOWN",
+                    "status": status or "running",
                     "details": details or {},
                 }
-                self.callback(message)
-            except Exception as e:
-                self.logger.error(f"Progress callback error: {e}")
+            if kwargs:
+                message["details"] = {**(message.get("details") or {}), **kwargs}
+            self.callback(message)
+        except Exception as e:
+            self.logger.error(f"Progress callback error: {e}")
 
     @property
     def user_context_dict(self) -> Dict[str, Any]:
@@ -184,6 +145,34 @@ class AutoReconOrchestrator:
         Recon → Analyze → Attack → Report + MITRE / Kill Chain / Metrics.
         """
         self.start_time = time.time()
+        try:
+            self.target_urls = list(dict.fromkeys(
+                normalize_http_url(target) for target in self.target_urls
+            ))
+        except (TypeError, ValueError) as exc:
+            return self._blocked_report(f"Invalid target scope: {exc}")
+
+        unauthorized = [
+            target for target in self.target_urls if not is_target_authorized(target)
+        ]
+        if not self.target_urls or unauthorized:
+            reason = (
+                "No targets were provided."
+                if not self.target_urls
+                else "Targets are not enabled by ALLOW_REAL_RUN/ALLOWED_TARGETS: "
+                + ", ".join(unauthorized)
+            )
+            return self._blocked_report(reason)
+
+        self.config["active_testing"] = self.config.get("active_testing") is True
+        self.config["aggressive"] = bool(self.config.get("aggressive"))
+        if not self.config["active_testing"]:
+            self.config["aggressive"] = False
+        self.config["max_workers"] = min(max(1, int(self.config.get("max_workers", 1))), 10)
+        self.config["max_payloads"] = min(max(0, int(self.config.get("max_payloads", 0))), 200)
+        self.config["timeout"] = min(max(int(self.config.get("timeout", 5)), 1), 5)
+        self.active_request_budget = RequestBudget(self.config["max_payloads"])
+
         user_ctx = self.user_context_dict
 
         self.logger.info(
@@ -230,7 +219,7 @@ class AutoReconOrchestrator:
 
             # Attack Surface + Risk
             surface = build_attack_surface()
-            THREAT_CONNECTOR.add_artifact("ATTACK_SURFACE", ", ".join(self.target_urls), surface)
+            self._emit_intel("ATTACK_SURFACE", ", ".join(self.target_urls), surface)
 
             self.end_time = time.time()
             duration = self.end_time - self.start_time
@@ -281,6 +270,30 @@ class AutoReconOrchestrator:
                 "duration_seconds": duration,
             }
 
+    def _blocked_report(self, reason: str) -> Dict[str, Any]:
+        report = {
+            "status": "blocked",
+            "error": reason,
+            "metadata": {
+                "report_type": "full_autorecon_report",
+                "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "targets": list(self.target_urls),
+                "active_testing": True,
+                "scope_enforced": True,
+                "risk_level": "unknown",
+                "risk_score": 0,
+            },
+            "scan_report": {},
+            "vulnerability_report": {},
+            "detailed_analysis": {},
+            "attack_results": [],
+            "threat_summary": {},
+        }
+        self._report_progress(
+            "SCOPE", "blocked", {"reason": reason, "targets": self.target_urls}
+        )
+        return report
+
     def _run_scan_stage(self) -> List[Dict[str, Any]]:
         """
         Этап 1: Сканирование эндпоинтов.
@@ -328,11 +341,19 @@ class AutoReconOrchestrator:
                 scanner = EndpointScanner(
                     target_url,
                     gui_callback=self._report_progress,
-                    opsec_mode=self.ctx.opsec_mode,
+                    opsec_mode=getattr(self.ctx, "opsec_mode", "standard"),
+                    timeout=self.config["timeout"],
+                    active_request_budget=self.active_request_budget,
+                    active_testing=self.config["active_testing"],
                 )
 
                 # === 1. Endpoint Discovery ===
                 endpoints = scanner.scan()
+                endpoints = [
+                    endpoint for endpoint in endpoints
+                    if isinstance(endpoint, dict)
+                    and same_origin(str(endpoint.get("url") or target_url), target_url)
+                ]
                 total_endpoints += len(endpoints)
 
                 self.logger.info(
@@ -346,12 +367,15 @@ class AutoReconOrchestrator:
                 for ep in endpoints:
                     self.user_tracker.track_endpoint(target_url, ep.get("url", ep))
 
-                # === 2. XSS Detection ===
-                xss_results = scanner.scan_xss_on_endpoints()
+                # Active probes run only after an explicit operator opt-in.
+                if self.config["active_testing"]:
+                    xss_results = scanner.scan_xss_on_endpoints()
+                else:
+                    xss_results = []
                 total_xss += len(xss_results)
 
                 for entry in xss_results:
-                    if entry.get("context") and entry.get("context") != "❌ Not reflected":
+                    if entry.get("vulnerable") is True:
                         save_reflected_response(entry)
 
                         self.user_tracker.track_vulnerability_found(
@@ -366,7 +390,11 @@ class AutoReconOrchestrator:
                         )
 
                 # === 3. Fuzzing ===
-                fuzz_results = scanner.fuzz_xss_parameters({"q": "test"}, method="GET")
+                fuzz_results = (
+                    scanner.fuzz_xss_parameters({"q": "test"}, method="GET")
+                    if self.config["active_testing"]
+                    else []
+                )
                 total_fuzz += len(fuzz_results)
 
                 # Track parameters
@@ -386,7 +414,7 @@ class AutoReconOrchestrator:
                 # === Attack Surface per target ===
                 surface = build_attack_surface(target_url)
                 self.user_tracker.track_attack_surface(target_url, surface)
-                THREAT_CONNECTOR.add_artifact("ATTACK_SURFACE", target_url, surface)
+                self._emit_intel("ATTACK_SURFACE", target_url, surface)
 
                 # === OPSEC-aware logging ===
                 if self.ctx.opsec_mode == "high" and len(endpoints) > 50:
@@ -491,13 +519,18 @@ class AutoReconOrchestrator:
             # === Анализ ===
             results = analyzer.analyze(responses)
 
-            xss_count = len(results.get("xss", []))
-            sqli_count = len(results.get("sqli", []))
-            csrf_count = len(results.get("csrf", []))
-            ssrf_count = len(results.get("ssrf", []))
+            xss_count = len(results.get("xss") or results.get("dom_xss") or [])
+            sqli_count = len(results.get("sqli") or [])
+            csrf_count = len(results.get("csrf") or [])
+            ssrf_count = len(results.get("ssrf") or [])
 
             # ThreatConnector enrichment
-            THREAT_CONNECTOR.add_artifact("ANALYSIS", ", ".join(self.target_urls), results)
+            self._emit_intel("ANALYSIS", ", ".join(self.target_urls), {
+                "xss": xss_count,
+                "sqli": sqli_count,
+                "csrf": csrf_count,
+                "ssrf": ssrf_count,
+            })
 
             # === Risk scoring (Red Team) ===
             risk_score = (
@@ -595,6 +628,14 @@ class AutoReconOrchestrator:
         • Anomaly detection
         """
 
+        if not self.config["active_testing"]:
+            self._report_progress(
+                "ATTACKING",
+                "skipped",
+                {"reason": "active_testing_not_confirmed"},
+            )
+            return []
+
         op_id = self.metrics_collector.start_operation(
             "execute_attacks",
             {"max_workers": self.config["max_workers"], "phase": self.ctx.current_phase}
@@ -636,19 +677,48 @@ class AutoReconOrchestrator:
                     "url": r.get("url", self.target_urls[0]),
                     "method": r.get("method", "GET"),
                     "params": r.get("params", {}),
+                    "source": r.get("source", "unknown"),
                 }
-                for r in self.scan_results[:20]
+                for r in self.scan_results
+                if isinstance(r, dict)
+                and any(
+                    same_origin(
+                        str(r.get("url") or target),
+                        target,
+                    )
+                    for target in self.target_urls
+                )
             ]
 
             # === 2. Генерация payload'ов ===
-            payload_gen = PayloadGenerator(endpoints, use_mutation=True)
+            payload_gen = PayloadGenerator(
+                endpoints[: self.config["max_payloads"]],
+                use_mutation=True,
+            )
             payloads = payload_gen.generate()[:self.config["max_payloads"]]
 
-            # Threat-aware payload selection
-            if self.analysis_results.get("xss"):
-                payloads = [p for p in payloads if "xss" in p.get("type", "")]
-            if self.analysis_results.get("sqli"):
-                payloads += [p for p in payloads if "sqli" in p.get("type", "")]
+            # Threat-aware payload selection (keep mixed set if filters would empty it)
+            xss_hits = self.analysis_results.get("xss") or self.analysis_results.get("dom_xss")
+            sqli_hits = self.analysis_results.get("sqli")
+            filtered = list(payloads)
+            if xss_hits:
+                xss_only = [p for p in payloads if "xss" in str(p.get("type", "xss")).lower()]
+                if xss_only:
+                    filtered = xss_only
+            if sqli_hits:
+                sqli_only = [p for p in payloads if "sqli" in str(p.get("type", "")).lower()]
+                if sqli_only:
+                    filtered = filtered + sqli_only
+            payloads = filtered or payloads
+            payloads = [
+                payload
+                for payload in payloads
+                if isinstance(payload, dict)
+                and any(
+                    same_origin(str(payload.get("url") or ""), target)
+                    for target in self.target_urls
+                )
+            ][: self.config["max_payloads"]]
 
             self.logger.info(
                 f"🧬 Генерация payload'ов завершена: {len(payloads)}",
@@ -676,6 +746,8 @@ class AutoReconOrchestrator:
                 threat_connector=THREAT_CONNECTOR,
                 max_workers=self.config["max_workers"],
                 timeout=self.config["timeout"],
+                active_testing=True,
+                active_request_budget=self.active_request_budget,
             )
 
             attack_results = planner.execute()
@@ -736,7 +808,7 @@ class AutoReconOrchestrator:
         # === Сбор уязвимостей ===
         vulnerabilities = [
             r for r in self.scan_results
-            if r.get("vulnerable") or (r.get("context") and r.get("context") != "❌ Not reflected")
+            if r.get("vulnerable") is True
         ]
 
         # === Генерация отчётов ===
@@ -759,7 +831,7 @@ class AutoReconOrchestrator:
 
         # === Attack Surface ===
         surface = build_attack_surface()
-        THREAT_CONNECTOR.add_artifact("ATTACK_SURFACE", ", ".join(self.target_urls), surface)
+        self._emit_intel("ATTACK_SURFACE", ", ".join(self.target_urls), surface)
 
         # === Risk Assessment ===
         risk_score = (
@@ -788,10 +860,17 @@ class AutoReconOrchestrator:
                 "report_type": "full_autorecon_report",
                 "generated_at": datetime.datetime.utcnow().isoformat(),
                 "targets": self.target_urls,
-                "duration_seconds": (self.end_time - self.start_time),
+                "duration_seconds": (
+                    (self.end_time or time.time()) - (self.start_time or time.time())
+                ),
                 "user": self.user_context_dict,
                 "risk_level": risk_level,
                 "risk_score": risk_score,
+                "scope_enforced": True,
+                "active_testing": self.config["active_testing"],
+                "aggressive": self.config["aggressive"],
+                "max_workers": self.config["max_workers"],
+                "max_payloads": self.config["max_payloads"],
             },
             "scan_report": scan_report,
             "vulnerability_report": vulnerability_report,
@@ -833,7 +912,12 @@ def run_full_autorecon(
     return orchestrator.run()
 
 
-def run_aggressive_scan(targets: List[str] | str, callback: Optional[Callable] = None) -> Dict[str, Any]:
+def run_aggressive_scan(
+    targets: List[str] | str,
+    callback: Optional[Callable] = None,
+    *,
+    active_testing: bool = False,
+) -> Dict[str, Any]:
     """
     Запускает агрессивное сканирование.
     Red Team версия:
@@ -844,9 +928,10 @@ def run_aggressive_scan(targets: List[str] | str, callback: Optional[Callable] =
 
     config = AutoReconOrchestrator._default_config()
     config["aggressive"] = True
-    config["max_workers"] = 12
-    config["max_payloads"] = 150
-    config["timeout"] = 15
+    config["max_workers"] = 10
+    config["max_payloads"] = 200
+    config["timeout"] = 5
+    config["active_testing"] = active_testing
 
     return run_full_autorecon(targets, config, callback)
 
@@ -951,5 +1036,3 @@ if __name__ == "__main__":
             import traceback
             traceback.print_exc()
         sys.exit(1)
-
-

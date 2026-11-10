@@ -186,6 +186,7 @@ def fuzz_url_params(
     log_all: bool = False,
     timeout: int = 4,
     max_retries: int = 3,
+    active_request_budget: Optional[RequestBudget] = None,
 ) -> List[Tuple[str, str, str]]:
     """
     Фуззинг URL‑параметров с расширенной детекцией и интеграцией ThreatConnector.
@@ -206,8 +207,17 @@ def fuzz_url_params(
         XSSAnalyzerApp.run_fuzzing ожидает именно такой формат.
     """
 
+    from xss_security_gui.auto_recon.scope import (
+        RequestBudget,
+        is_target_authorized,
+        scoped_request,
+    )
+
     if not url or not isinstance(url, str):
         raise ValueError("Invalid URL provided")
+    if not is_target_authorized(url):
+        logger.warning("Parameter fuzzing blocked by ALLOW_REAL_RUN/ALLOWED_TARGETS: %s", url)
+        return []
 
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
@@ -222,6 +232,9 @@ def fuzz_url_params(
     logger.info(f"Parameters detected: {list(params.keys())}")
 
     session = requests.Session()
+    request_budget = active_request_budget or RequestBudget(200)
+    timeout = min(max(timeout, 1), 5)
+    max_retries = min(max(max_retries, 1), 3)
     session.headers.update(
         {
             "User-Agent": "Mozilla/5.0 (Security Scanner)",
@@ -232,6 +245,9 @@ def fuzz_url_params(
     for key in params:
         for attempt in range(max_retries):
             try:
+                if not request_budget.try_consume():
+                    logger.warning("Active request budget exhausted during parameter fuzzing")
+                    break
                 test_params = copy.deepcopy(params)
                 test_payload = str(payload or get_random_payload(category))
                 test_params[key] = [test_payload]
@@ -239,11 +255,19 @@ def fuzz_url_params(
                 new_query = urlencode(test_params, doseq=True)
                 test_url = urlunparse(parsed._replace(query=new_query))
 
-                r = session.get(
+                r = scoped_request(
+                    session,
+                    "GET",
                     test_url,
+                    root_url=url,
                     timeout=timeout,
-                    allow_redirects=False,
+                    request_budget=request_budget,
+                    initial_budget_consumed=True,
                 )
+                if r.is_redirect:
+                    r.close()
+                    logger.warning("Cross-origin redirect blocked during parameter fuzzing")
+                    break
 
                 flags = _analyze_response(r.text, test_payload)
                 risk_score = _calculate_risk_score(flags)
@@ -274,6 +298,7 @@ def fuzz_url_params(
                     severity=severity,
                 )
                 artifacts_for_threat.append(finding)
+                r.close()
 
                 if detected:
                     findings_for_gui.append((key, test_payload, test_url))

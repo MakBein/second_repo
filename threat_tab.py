@@ -6,16 +6,13 @@ import json
 import math
 import threading
 import time
-from typing import Any, Dict, List
-from datetime import datetime, UTC
+from typing import Any, Dict, List, Optional
 
 import tkinter as tk
 from tkinter import ttk, filedialog
 
-from xss_security_gui.auto_recon.user_tracker import get_user_tracker
-from xss_security_gui.auto_recon.core_logger import get_logger
 from xss_security_gui.threat_analysis.threat_connector import THREAT_CONNECTOR
-from xss_security_gui.threat_data_loader import ThreatDataLoader
+from xss_security_gui.threat_data_loader import ThreatDataLoader, ThreatRisk
 from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
 from xss_security_gui.utils.pii_aggregator import (
     PII_FIELD_LABELS,
@@ -38,24 +35,6 @@ class ThreatAnalysisTab(ttk.Frame):
 
     def __init__(self, parent: tk.Misc, result_queue=None) -> None:
         super().__init__(parent)
-
-        # === Red Team Core Components ===
-        self.user_tracker = get_user_tracker()
-        self.logger = get_logger("ThreatAnalysisTab")
-
-        # === ThreatConnector reference ===
-        self.threat_connector = THREAT_CONNECTOR
-
-        # === LiveAttackMonitor event queue ===
-        # GUI передає LIVE_MONITOR_QUEUE глобально
-        try:
-            from xss_security_gui.threat_analysis.threat_connector import LIVE_MONITOR_QUEUE
-            self._event_queue = LIVE_MONITOR_QUEUE
-        except Exception:
-            self._event_queue = None
-
-        # === Timestamp helper ===
-        self._now = lambda: datetime.now(UTC)
 
         # === Shared queue for CombatCrawler + RealTimeWatcher + GUI ===
         self.result_queue = result_queue
@@ -874,171 +853,40 @@ class ThreatAnalysisTab(ttk.Frame):
 
         render_chunk(0)
 
-    # ============================================================
-    #  AutoRecon Red Team Integration (Fix unresolved references)
-    # ============================================================
-
-    def ingest_autorecon(self, report: dict):
-        """
-        Принимает отчёт AutoRecon и добавляет его в Threat Intel.
-        Вызывается оркестратором.
-        """
-        try:
-            # ThreatConnector ingestion
-            if hasattr(self, "threat_connector"):
-                self.threat_connector.add_artifact("AUTORECON", "ThreatAnalysisTab", report)
-
-            # GUI update
-            if hasattr(self, "text"):
-                self.text.delete("1.0", "end")
-                self.text.insert("end", json.dumps(report, indent=2, ensure_ascii=False))
-
-            self.last_autorecon_report = report
-
-        except Exception as e:
-            print(f"[ThreatAnalysisTab] ingest_autorecon error: {e}")
-
-    def update_report(self, report: dict):
-        """
-        Универсальный метод обновления отчёта.
-        Используется Dashboard, History, Combat Results.
-        """
-        try:
-            self.last_autorecon_report = report
-
-            if hasattr(self, "text"):
-                self.text.delete("1.0", "end")
-                self.text.insert("end", json.dumps(report, indent=2, ensure_ascii=False))
-
-        except Exception as e:
-            print(f"[ThreatAnalysisTab] update_report error: {e}")
-
-    def refresh(self):
-        """
-        Обновляет Threat Analysis после AutoRecon.
-        Вызывается HistoryTab и оркестратором.
-        """
-        try:
-            if hasattr(self, "load_threatintel"):
-                self.load_threatintel()
-
-            elif hasattr(self, "text"):
-                self.text.insert("end", "\n[🔄] ThreatAnalysisTab refreshed\n")
-                self.text.see("end")
-
-        except Exception as e:
-            print(f"[ThreatAnalysisTab] refresh error: {e}")
-
     def get_all_threats(self) -> List[Dict[str, Any]]:
         """
         Возвращает полный список Threat Intel событий.
-        Red Team версия:
-        • Priority: ThreatDataLoader → ThreatConnector
-        • MITRE: Collection (TA0009)
-        • OPSEC-aware
-        • LiveAttackMonitor events
-        • Telemetry для Dashboard
+        Приоритет: ThreatDataLoader (analyzer1.json), fallback: THREAT_CONNECTOR.summary().
         """
-
-        events: List[Dict[str, Any]] = []
-
-        # === 1. ThreatDataLoader (primary) ===
         try:
             loader = ThreatDataLoader(json_path=None)
             if loader.load():
-                artifacts = [
-                    loader.convert_artifact_for_gui(a)
-                    for a in loader.artifacts
-                ]
-                events.extend(artifacts)
+                return [loader.convert_artifact_for_gui(a) for a in loader.artifacts]
+        except Exception:
+            pass
 
-                # MITRE: Collection
-                self.user_tracker.track_attack_chain(
-                    tactic="TA0009",
-                    technique="T1005",
-                    subtechnique=None,
-                    target="ThreatDataLoader",
-                    status="success",
-                    details={"count": len(artifacts)},
-                    operator_note="ThreatDataLoader artifacts collected."
-                )
-
-        except Exception as e:
-            self.logger.warning(f"[ThreatIntel] Loader error: {e}")
-
-        # === 2. ThreatConnector (fallback) ===
         try:
             summary = THREAT_CONNECTOR.summary()
-            entries = summary.get("entries", [])
-            if isinstance(entries, list):
-                events.extend(entries)
+        except Exception:
+            return []
 
-                # LiveAttackMonitor
-                try:
-                    self._event_queue.put({
-                        "type": "threatintel_update",
-                        "count": len(entries),
-                        "timestamp": datetime.now(UTC).isoformat()
-
-                    })
-                except Exception:
-                    pass
-
-        except Exception as e:
-            self.logger.error(f"[ThreatIntel] Summary error: {e}")
-
-        return events
+        entries = summary.get("entries", [])
+        return list(entries) if isinstance(entries, list) else []
 
     def send_to_threat_intel(self, module: str, data: Any) -> None:
         """
         Локальный предпросмотр данных от модулей (crawler, autorecon и т.д.).
-        Red Team версия:
-        • MITRE Execution (TA0002)
-        • Command and Control (TA0011)
-        • ThreatConnector enrichment
-        • LiveAttackMonitor events
-        • OPSEC-aware payload filtering
-        • GUI-safe chunked render
+        НЕ отправляет данные в ThreatConnector, только рендерит в GUI.
         """
-
         try:
-            # === Normalize payload ===
-            entries = data if isinstance(data, list) else [data]
-            payload = {"module": module, "entries": entries}
+            payload = {
+                "module": module,
+                "entries": data if isinstance(data, list) else [data],
+            }
 
-            # === OPSEC-aware filtering ===
-            if getattr(self.ctx, "opsec_mode", "") == "high":
-                entries = [e for e in entries if not getattr(e, "aggressive", False)]
-                payload["entries"] = entries
-
-            # === MITRE: Execution ===
-            self.user_tracker.track_attack_chain(
-                tactic="TA0002",
-                technique="T1059",
-                subtechnique="T1059.007",
-                target=module,
-                status="executed",
-                details={"entries": len(entries)},
-                operator_note="Local threat intel preview."
-            )
-
-            # === ThreatConnector enrichment ===
-            THREAT_CONNECTOR.add_artifact("LOCAL_PREVIEW", module, payload)
-
-            # === LiveAttackMonitor ===
-            try:
-                self._event_queue.put({
-                    "type": "local_threatintel",
-                    "module": module,
-                    "count": len(entries),
-                    "timestamp": datetime.now(UTC).isoformat()
-
-                })
-            except Exception:
-                pass
-
-            # === GUI-safe chunked render ===
+            # 🔥 ВАЖНО: chunked‑render, НЕ load_results
             self.load_results_safe(payload)
+
             self.status_var.set(f"Получены данные от модуля: {module}")
 
         except Exception as e:

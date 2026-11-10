@@ -41,13 +41,6 @@ import dns.resolver
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-try:
-    from tls_client import Session as TLSClientSession  # type: ignore
-    TLS_CLIENT_AVAILABLE = True
-except Exception:  # pragma: no cover - optional dependency
-    TLSClientSession = None  # type: ignore
-    TLS_CLIENT_AVAILABLE = False
-
 from xss_security_gui.js_inspector import extract_js_insights
 from xss_security_gui.settings import settings
 from xss_security_gui.settings import (
@@ -792,29 +785,65 @@ def _is_http_url(u: str) -> bool:
         return False
 
 
-def is_same_domain(url: str, base_netloc: str) -> bool:
-    """Check if URL belongs to same domain (with whitelist support)."""
+def is_same_domain(
+        url: str,
+        base_netloc: str
+) -> bool:
+    """
+    Check whether URL belongs to the same domain.
+    Supports subdomains and domain whitelist.
+    """
+
     try:
+
         parsed = urlparse(url)
-        netloc = parsed.netloc.lower()
+
+        netloc = (
+            parsed.netloc or ""
+        ).lower()
+
         if not netloc:
             return False
 
-        base = (base_netloc or "").lower()
+        base = (
+            base_netloc or ""
+        ).lower()
+
         if not base:
             return False
 
         if netloc.startswith("www."):
             netloc = netloc[4:]
+
         if base.startswith("www."):
             base = base[4:]
 
         if CRAWL_DOMAINS_WHITELIST:
-            wl = [d.lower() for d in CRAWL_DOMAINS_WHITELIST]
-            if netloc not in wl and not any(netloc.endswith("." + d) for d in wl):
+
+            whitelist = [
+                domain.lower()
+                for domain in
+                CRAWL_DOMAINS_WHITELIST
+            ]
+
+            if (
+                netloc not in whitelist
+                and not any(
+                    netloc.endswith(
+                        "." + domain
+                    )
+                    for domain in whitelist
+                )
+            ):
                 return False
 
-        return netloc == base or netloc.endswith("." + base)
+        return (
+                netloc == base
+                or netloc.endswith(
+                    "." + base
+                )
+        )
+
     except Exception:
         return False
 
@@ -966,6 +995,10 @@ def build_stealth_headers(base_headers: Optional[Dict] = None) -> Dict:
 
 # Enable TLS client JA3 impersonation
 USE_TLS_CLIENT = bool(settings.get("anti_detection.use_tls_client", False))
+if USE_TLS_CLIENT:
+    logger.warning(
+        "tls-client disabled for this runtime; using requests.Session instead"
+    )
 
 # -----------------------------------------------------------
 # Modern TLS / HTTP2 support (legal)
@@ -993,25 +1026,8 @@ def make_session(
     # -----------------------------------------------------------
     # Choose TLS client or requests.Session
     # -----------------------------------------------------------
-    s: Any = None
-    if USE_TLS_CLIENT and TLS_CLIENT_AVAILABLE and TLSClientSession is not None:
-        try:
-            s = TLSClientSession(
-                client_identifier=random.choice([
-                    "chrome_120",
-                    "chrome_121",
-                    "chrome_118",
-                    "firefox_120",
-                    "safari_17_0",
-                    "edge_116"
-                ]),
-                random_tls_extension_order=True
-            )
-        except Exception as e:
-            logger.error("Failed to create TLS client session: %s", e)
-            s = None
-    if s is None:
-        s = requests.Session()
+
+    s = requests.Session()
 
     # -----------------------------------------------------------
     # Configure retry strategy (only for requests.Session)
@@ -1080,14 +1096,22 @@ def make_session(
 
         s.headers.update(stealth_headers)
 
-        if delay is not None:
-            s.request = _throttled_request(s.request, delay, delay_jitter)
-
     else:
+
         s.headers.update({
-            "User-Agent": "Mozilla/5.0 (compatible; XSSSecurityCrawler/2.0; +https://localhost)",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "User-Agent":
+                "Mozilla/5.0 (compatible; XSSSecurityCrawler/2.0; +https://localhost)",
+
+            "Accept":
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         })
+
+    if delay is not None:
+        s.request = _throttled_request(
+            s.request,
+            delay,
+            delay_jitter
+        )
 
     return s
 
@@ -1617,41 +1641,75 @@ def extract_api_endpoints_from_text(text: str, base_url: str) -> List[str]:
 # ---------------------------------------------------------------------
 # ThreatIntel Reporter
 # ---------------------------------------------------------------------
-def report_threatintel(node: Dict[str, Any], gui_callback=None) -> None:
+def report_threatintel(
+        node: Dict[str, Any],
+        gui_callback=None
+) -> None:
     """
-    Safe reporting of metadata to ThreatIntel / GUI callback.
-    Builds a masked, deduplicated summary and calls gui_callback if provided.
+    Safe reporting of metadata
+    to ThreatIntel / GUI callback.
     """
+
     if not gui_callback:
         return
 
     try:
+
         url = node.get("url", "")
+
         forms = node.get("forms") or []
         scripts = node.get("scripts") or []
         headers = node.get("headers") or {}
-        api_endpoints = dedupe_preserve_order(node.get("api_endpoints") or [])[:MAX_API_ENDPOINTS]
+
+        api_endpoints = (
+            dedupe_preserve_order(
+                node.get("api_endpoints") or []
+            )[:MAX_API_ENDPOINTS]
+        )
+
         links = node.get("links") or []
         meta = node.get("meta") or []
         events = node.get("events") or []
+
         error = node.get("error")
 
-        # Extract script paths safely
         script_paths: List[str] = []
-        for s in scripts:
-            if isinstance(s, dict):
-                p = s.get("path") or s.get("src") or s.get("url") or ""
-            else:
-                p = str(s)
-            if p:
-                script_paths.append(p)
-        script_paths = dedupe_preserve_order(script_paths)[:50]
 
-        # Mask long header values
+        for s in scripts:
+
+            if isinstance(s, dict):
+
+                path = (
+                    s.get("path")
+                    or s.get("src")
+                    or s.get("url")
+                    or ""
+                )
+
+            else:
+
+                path = str(s)
+
+            if path:
+                script_paths.append(path)
+
+        script_paths = (
+            dedupe_preserve_order(
+                script_paths
+            )[:50]
+        )
+
         safe_headers: Dict[str, str] = {}
-        for k, v in headers.items():
-            vs = str(v)
-            safe_headers[str(k)] = vs if len(vs) <= 200 else vs[:100] + "…"
+
+        for key, value in headers.items():
+
+            value_str = str(value)
+
+            safe_headers[str(key)] = (
+                value_str
+                if len(value_str) <= 200
+                else value_str[:100] + "..."
+            )
 
         safe_report = {
             "module": "crawler",
@@ -1659,7 +1717,7 @@ def report_threatintel(node: Dict[str, Any], gui_callback=None) -> None:
             "forms_count": len(forms),
             "scripts": script_paths,
             "headers": safe_headers,
-            "api_endpoints": api_endpoints[:200],
+            "api_endpoints": api_endpoints,
             "links_count": len(links),
             "meta": meta,
             "events": events[:100],
@@ -1667,12 +1725,31 @@ def report_threatintel(node: Dict[str, Any], gui_callback=None) -> None:
         }
 
         try:
-            gui_callback({"crawler": safe_report})
+
+            gui_callback({
+                "crawler": safe_report
+            })
+
         except Exception:
-            logger.debug("gui_callback failed for %s", url)
+
+            logger.debug(
+                "gui_callback failed for %s",
+                url
+            )
+
     except Exception:
+
         try:
-            gui_callback({"crawler": {"module": "crawler", "error": "failed to build safe report"}})
+
+            gui_callback({
+                "crawler": {
+                    "module": "crawler",
+                    "error": (
+                        "failed to build safe report"
+                    )
+                }
+            })
+
         except Exception:
             pass
 
@@ -1847,16 +1924,37 @@ def crawl_site(
 
     # Whitelist check
     if CRAWL_DOMAINS_WHITELIST:
-        if parsed_domain not in CRAWL_DOMAINS_WHITELIST and not any(
-            parsed_domain.endswith("." + d) for d in CRAWL_DOMAINS_WHITELIST
-        ):
-            return {"url": safe_url, "error": "Domain not whitelisted"}
 
-    # Uniqueness (hash without query/fragment)
-    url_id = hash_url_no_query(safe_url)
+        if (
+                parsed_domain
+                not in CRAWL_DOMAINS_WHITELIST
+                and not any(
+            parsed_domain.endswith(
+                "." + domain
+            )
+            for domain in
+            CRAWL_DOMAINS_WHITELIST
+        )
+        ):
+            return {
+                "url": safe_url,
+                "error": "Domain not whitelisted"
+            }
+
+        # Uniqueness (hash without query/fragment)
+
+    url_id = hash_url_no_query(
+        safe_url
+    )
+
     with visited_lock:
+
         if url_id in visited:
-            return {"url": safe_url, "error": "Already visited"}
+            return {
+                "url": safe_url,
+                "error": "Already visited"
+            }
+
         visited.add(url_id)
 
     # Node skeleton
@@ -1950,22 +2048,57 @@ def crawl_site(
         # ============================================================
         # 3) JSON endpoint
         # ============================================================
-        if ("application/json" in content_type or safe_url.lower().endswith(".json")) and resp is not None:
-            try:
-                json_data = resp.json()
-                node["api_endpoints"].append(safe_url)
-                _merge_sensitive_into_node(node, extract_sensitive_data(json.dumps(json_data)))
-            except Exception as e:
-                node["error"] = f"json_parse_error: {e}"
+        if (
+                (
+                        "application/json"
+                        in content_type
+                )
+                or safe_url.lower().endswith(".json")
+        ) and resp is not None:
 
-            node["api_endpoints"] = dedupe_preserve_order(node["api_endpoints"])[:MAX_API_ENDPOINTS]
+            try:
+
+                json_data = resp.json()
+
+                node["api_endpoints"].append(
+                    safe_url
+                )
+
+                _merge_sensitive_into_node(
+                    node,
+                    extract_sensitive_data(
+                        json.dumps(json_data)
+                    )
+                )
+
+            except Exception as e:
+
+                node["error"] = (
+                    f"json_parse_error: {e}"
+                )
+
+            node["api_endpoints"] = (
+                dedupe_preserve_order(
+                    node["api_endpoints"]
+                )[:MAX_API_ENDPOINTS]
+            )
+
             _trim_node_list_fields(node)
 
             with nodes_lock:
-                nodes_json.append(node)
-                tree_log.append("  " * depth + f"📄 {safe_url}")
 
-            report_threatintel(node, gui_callback)
+                nodes_json.append(node)
+
+                tree_log.append(
+                    "  " * depth
+                    + f"📄 {safe_url}"
+                )
+
+            report_threatintel(
+                node,
+                gui_callback
+            )
+
             return node
 
         # HTML parsing
@@ -2124,28 +2257,65 @@ def crawl_site(
         # 7) Links
         # ============================================================
         try:
-            hrefs = [a.get("href") for a in soup.find_all("a") if a.get("href")]
+
+            hrefs = [
+                a.get("href")
+                for a in soup.find_all("a")
+                if a.get("href")
+            ]
+
         except Exception:
+
             hrefs = []
 
         clean_links: List[str] = []
+
         for h in hrefs:
+
             try:
+
                 if not is_real_link(h):
                     continue
-                candidate = h.split("#")[0].strip().strip("'\"")
+
+                candidate = (
+                    h.split("#")[0]
+                    .strip()
+                    .strip("'\"")
+                )
+
                 if not candidate:
                     continue
-                absolute = urljoin(safe_url, candidate)
-                parsed_cand = urlparse(absolute)
-                if parsed_cand.scheme not in ("http", "https"):
+
+                absolute = urljoin(
+                    safe_url,
+                    candidate
+                )
+
+                parsed_cand = urlparse(
+                    absolute
+                )
+
+                if parsed_cand.scheme not in (
+                        "http",
+                        "https"
+                ):
                     continue
-                clean_links.append(absolute)
+
+                clean_links.append(
+                    absolute
+                )
+
             except Exception:
                 continue
 
-        unique_links = dedupe_preserve_order(clean_links)[:max_links]
-        node["links"] = [str(x) for x in unique_links]
+        unique_links = dedupe_preserve_order(
+            clean_links
+        )[:max_links]
+
+        node["links"] = [
+            str(x)
+            for x in unique_links
+        ]
 
         # ============================================================
         # 8) META (safe)
@@ -2311,13 +2481,19 @@ def crawl_site(
         # 16) on* events
         # ============================================================
         safe_events: List[str] = []
+
         for tag in soup.find_all(True):
+
             try:
+
                 for attr in tag.attrs:
+
                     if attr.startswith("on"):
                         safe_events.append(
-                            f"{tag.name}.{attr} → {str(tag.attrs[attr])[:200]}"
+                            f"{tag.name}.{attr} → "
+                            f"{str(tag.attrs[attr])[:200]}"
                         )
+
             except Exception:
                 continue
 
@@ -2344,7 +2520,10 @@ def crawl_site(
         # ============================================================
         # 18) Dedup all list fields
         # ============================================================
-        node["api_endpoints"] = dedupe_preserve_order(node["api_endpoints"])[:MAX_API_ENDPOINTS]
+        node["api_endpoints"] = dedupe_preserve_order(
+            node["api_endpoints"]
+        )[:MAX_API_ENDPOINTS]
+
         _trim_node_list_fields(node)
 
         with nodes_lock:
@@ -2356,21 +2535,34 @@ def crawl_site(
         # 19) Recursive crawl
         # ============================================================
         if parallel and len(unique_links) > 1:
+
             to_visit: List[str] = []
 
             for link in unique_links:
-                if not is_same_domain(link, parsed_domain):
+
+                if not is_same_domain(
+                        link,
+                        parsed_domain
+                ):
                     continue
+
                 link_id = hash_url_no_query(link)
+
                 with visited_lock:
                     if link_id in visited:
                         continue
+
                 to_visit.append(link)
 
             if to_visit:
+
                 with ThreadPoolExecutor(
-                    max_workers=min(MAX_CONCURRENT_REQUESTS, len(to_visit))
+                        max_workers=min(
+                            MAX_CONCURRENT_REQUESTS,
+                            len(to_visit)
+                        )
                 ) as executor:
+
                     futures = {
                         executor.submit(
                             crawl_site,
@@ -2386,20 +2578,35 @@ def crawl_site(
                         for link in to_visit
                     }
 
-                    for fut in as_completed(futures):
+                    for future in as_completed(futures):
+
                         try:
-                            fut.result()
+
+                            future.result()
+
                         except Exception as e:
-                            node["error"] = (node.get("error") or "") + f" child_error:{futures[fut]}:{e}"
+
+                            node["error"] = (
+                                    (node.get("error") or "")
+                                    + f" child_error:{futures[future]}:{e}"
+                            )
+
         else:
-            # Sequential mode
+
             for link in unique_links:
-                if not is_same_domain(link, parsed_domain):
+
+                if not is_same_domain(
+                        link,
+                        parsed_domain
+                ):
                     continue
+
                 link_id = hash_url_no_query(link)
+
                 with visited_lock:
                     if link_id in visited:
                         continue
+
                 crawl_site(
                     link,
                     depth + 1,
@@ -2411,22 +2618,46 @@ def crawl_site(
                     parallel=parallel,
                 )
 
-        return node
+            return node
 
     except Exception as e:
+
         node["error"] = str(e)
+
         try:
-            err_path = str(CRAWLER_ERROR_LOG or "")
-            os.makedirs(os.path.dirname(err_path) or "logs", exist_ok=True)
-            with open(err_path, "a", encoding="utf-8") as errlog:
-                errlog.write(f"[{datetime.now().isoformat()}] {safe_url} ❌ {str(e)}\n")
+
+            err_path = str(
+                CRAWLER_ERROR_LOG or ""
+            )
+
+            os.makedirs(
+            os.path.dirname(err_path) or "logs",
+            exist_ok=True,
+            )
+
+            with open(
+                    err_path,
+                    "a",
+                    encoding="utf-8",
+            ) as errlog:
+
+                errlog.write(
+                    f"[{datetime.now().isoformat()}] "
+                    f"{safe_url} ❌ {e}\n"
+                )
+
         except Exception:
             pass
+
         with nodes_lock:
             nodes_json.append(node)
-        report_threatintel(node, gui_callback)
-        return node
 
+        report_threatintel(
+            node,
+            gui_callback,
+        )
+
+        return node
 
 # ---------------------------------------------------------------------
 # Final aggregation (Burp/ZAP-style summary)
@@ -3092,5 +3323,3 @@ class AntiDetectionSession:
         except Exception as e:
             logger.warning(f"Geo-IP rotation failed: {e}")
             return None
-
-

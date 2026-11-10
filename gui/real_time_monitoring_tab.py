@@ -1,408 +1,311 @@
-# xss_security_gui/gui/real_time_monitoring_tab.py
-# ============================================================
-# RealTimeMonitoringTab 8.0 — LIVE Threat Intel Dashboard
-# Stealth Mode 11.0 Stats + Пагінація + async + threat‑query API
-# Асинхронна вставка рядків у TreeView (batch insert)
-# ============================================================
+"""Read-only live view of watcher status and persisted threat events."""
 
-import os
+from __future__ import annotations
+
+import json
+import threading
 import tkinter as tk
 from tkinter import ttk
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-from xss_security_gui.threat_tab_connector import ThreatIntelConnector
+from xss_security_gui.threat_analysis.threat_connector import THREAT_CONNECTOR
 
 
 class RealTimeMonitoringTab(ttk.Frame):
-    PAGE_SIZE = 100
-    BATCH_SIZE = 50  # кількість рядків у одній порції вставки
+    """Show watcher telemetry and recent local Threat Intel records."""
 
-    def __init__(self, parent, ui_bridge, tic: ThreatIntelConnector):
-        super().__init__(parent)
+    REFRESH_MS = 5000
 
-        self.ui = ui_bridge
-        self.tic = tic
+    def __init__(self, parent, ui_bridge, watcher=None, **kwargs: Any) -> None:
+        super().__init__(parent, **kwargs)
+        self.ui_bridge = ui_bridge
+        self.watcher = watcher
+        self._refresh_lock = threading.Lock()
+        self._refresh_scheduled: str | None = None
+        self._destroyed = False
 
-        # Filters
-        self._risk_var = tk.StringVar(value="all")
-        self._module_var = tk.StringVar(value="all")
-        self._category_var = tk.StringVar(value="all")
-        self._search_var = tk.StringVar(value="")
+        header = ttk.Frame(self, padding=(12, 10, 12, 4))
+        header.pack(fill="x")
+        ttk.Label(
+            header, text="Real-Time Monitoring", font=("TkDefaultFont", 14, "bold")
+        ).pack(anchor="w")
+        ttk.Label(
+            header,
+            text="Огляд збережених подій Threat Intelligence та стану моніторингу.",
+        ).pack(anchor="w", pady=(2, 0))
 
-        # Pagination
-        self._page = 0
-        self._total_rows = 0
+        toolbar = ttk.Frame(self, padding=(12, 6))
+        toolbar.pack(fill="x")
+        self.status_var = tk.StringVar(value="Підключення до сховища подій…")
+        ttk.Label(toolbar, textvariable=self.status_var, anchor="w").pack(
+            side="left", fill="x", expand=True
+        )
+        self.refresh_button = ttk.Button(
+            toolbar, text="Оновити", command=self.refresh
+        )
+        self.refresh_button.pack(side="right")
 
-        # Status
-        self._status_var = tk.StringVar(value="Ready")
+        summary = ttk.LabelFrame(self, text="Зведення", padding=8)
+        summary.pack(fill="x", padx=12, pady=(0, 8))
+        self.summary_var = tk.StringVar(value="Подій: 0  |  Високий ризик: 0")
+        ttk.Label(summary, textvariable=self.summary_var).pack(anchor="w")
 
-        # Trees
-        self._tree: Optional[ttk.Treeview] = None
-        self._file_tree: Optional[ttk.Treeview] = None
-        self._artifact_text: Optional[tk.Text] = None
-
-        self._build_layout()
-        self._refresh_async()
-
-    # ============================================================
-    # Layout
-    # ============================================================
-    def _build_layout(self):
-        top = ttk.Frame(self)
-        top.pack(fill="x", padx=8, pady=6)
-
-        # Filters
-        ttk.Label(top, text="Risk:").pack(side="left")
-        ttk.Combobox(
-            top,
-            textvariable=self._risk_var,
-            values=["all", "critical", "high", "medium", "low", "info"],
-            width=10,
+        filters = ttk.Frame(self, padding=(12, 0, 12, 8))
+        filters.pack(fill="x")
+        ttk.Label(filters, text="Ризик").pack(side="left", padx=(0, 5))
+        self.severity_filter = ttk.Combobox(
+            filters,
+            values=("Усі", "critical", "high", "medium", "low", "info"),
             state="readonly",
-        ).pack(side="left", padx=4)
+            width=12,
+        )
+        self.severity_filter.set("Усі")
+        self.severity_filter.pack(side="left", padx=(0, 12))
+        self.severity_filter.bind("<<ComboboxSelected>>", self._apply_filters)
+        ttk.Label(filters, text="Пошук").pack(side="left", padx=(0, 5))
+        self.search_var = tk.StringVar()
+        search_entry = ttk.Entry(filters, textvariable=self.search_var)
+        search_entry.pack(side="left", fill="x", expand=True)
+        self.search_var.trace_add("write", self._apply_filters)
 
-        ttk.Label(top, text="Module:").pack(side="left")
-        self._module_cb = ttk.Combobox(top, textvariable=self._module_var, values=["all"], width=14)
-        self._module_cb.pack(side="left", padx=4)
-
-        ttk.Label(top, text="Category:").pack(side="left")
-        self._category_cb = ttk.Combobox(top, textvariable=self._category_var, values=["all"], width=16)
-        self._category_cb.pack(side="left", padx=4)
-
-        ttk.Label(top, text="Search:").pack(side="left")
-        search_entry = ttk.Entry(top, textvariable=self._search_var, width=24)
-        search_entry.pack(side="left", padx=4)
-        search_entry.bind("<Return>", lambda e: self._refresh_async())
-
-        ttk.Button(top, text="🔄 Refresh", command=self._refresh_async).pack(side="left", padx=4)
-
-        ttk.Label(top, textvariable=self._status_var).pack(side="right")
-
-        # Pagination buttons
-        pag = ttk.Frame(self)
-        pag.pack(fill="x", padx=8, pady=4)
-
-        ttk.Button(pag, text="⬅ Prev", command=self._prev_page).pack(side="left")
-        ttk.Button(pag, text="Next ➡", command=self._next_page).pack(side="left")
-
-        # Main split
-        main = ttk.PanedWindow(self, orient="horizontal")
-        main.pack(fill="both", expand=True)
-
-        # Left: Tree
-        left = ttk.Frame(main)
-        main.add(left, weight=3)
-
-        self._tree = ttk.Treeview(
-            left,
-            columns=("risk", "category", "module", "url", "extra"),
+        table_frame = ttk.Frame(self, padding=(12, 0, 12, 8))
+        table_frame.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(
+            table_frame,
+            columns=("timestamp", "module", "severity", "target", "category"),
             show="headings",
-            height=20,
+            height=14,
         )
-        self._tree.pack(fill="both", expand=True)
-
-        for col, w in [
-            ("risk", 80),
-            ("category", 140),
-            ("module", 120),
-            ("url", 260),
-            ("extra", 260),
-        ]:
-            self._tree.heading(col, text=col.capitalize())
-            self._tree.column(col, width=w, anchor="w")
-
-        self._tree.bind("<Double-1>", self._on_artifact_click)
-
-        # Right: Inspector + Files
-        right = ttk.Frame(main)
-        main.add(right, weight=2)
-
-        # Artifact Inspector
-        insp = ttk.LabelFrame(right, text="Artifact Inspector")
-        insp.pack(fill="both", expand=True, padx=4, pady=4)
-
-        self._artifact_text = tk.Text(insp, wrap="word", height=12)
-        self._artifact_text.pack(fill="both", expand=True)
-        self._artifact_text.config(state="disabled")
-
-        # Stealth Mode 11.0 Stats Panel
-        stealth_frame = ttk.LabelFrame(right, text="🛡️ Stealth Mode 11.0 — Red Team Edition")
-        stealth_frame.pack(fill="x", padx=4, pady=4)
-
-        self._stealth_text = tk.Text(stealth_frame, wrap="word", height=6, state="disabled")
-        self._stealth_text.pack(fill="both", expand=True)
-
-        # File Explorer
-        files = ttk.LabelFrame(right, text="File Explorer")
-        files.pack(fill="both", expand=True, padx=4, pady=4)
-
-        self._file_tree = ttk.Treeview(files, columns=("type", "path"), show="headings", height=8)
-        self._file_tree.pack(side="left", fill="both", expand=True)
-
-        self._file_tree.heading("type", text="Type")
-        self._file_tree.heading("path", text="Path")
-        self._file_tree.column("type", width=120)
-        self._file_tree.column("path", width=320)
-
-        self._file_tree.bind("<Double-1>", self._on_file_click)
-
-        scroll = ttk.Scrollbar(files, orient="vertical", command=self._file_tree.yview)
-        self._file_tree.configure(yscrollcommand=scroll.set)
-        scroll.pack(side="right", fill="y")
-
-    # ============================================================
-    # Pagination
-    # ============================================================
-    def _next_page(self):
-        self._page += 1
-        self._refresh_async()
-
-    def _prev_page(self):
-        if self._page > 0:
-            self._page -= 1
-        self._refresh_async()
-
-    # ============================================================
-    # Async refresh
-    # ============================================================
-    def _refresh_async(self):
-        self._status_var.set("Loading…")
-
-        if hasattr(self.ui, "post_bg"):
-            self.ui.post_bg(self._refresh_bg, self._refresh_done)
-        else:
-            self._refresh_done(self._refresh_bg())
-
-    def _refresh_bg(self) -> Dict[str, Any]:
-        risk = self._risk_var.get()
-        module = self._module_var.get()
-        category = self._category_var.get()
-        search = self._search_var.get().strip()
-
-        risk = None if risk == "all" else risk
-        module = None if module == "all" else module
-        category = None if category == "all" else category
-        search = None if not search else search
-
-        total_count = self.tic.count(
-            category=category,
-            risk=risk,
-            module=module,
-            search=search,
+        for column, title, width in (
+            ("timestamp", "Время", 170),
+            ("module", "Модуль", 170),
+            ("severity", "Риск", 90),
+            ("target", "Цель", 300),
+            ("category", "Категория", 180),
+        ):
+            self.tree.heading(column, text=title)
+            self.tree.column(column, width=width, minwidth=70, anchor="w")
+        y_scroll = ttk.Scrollbar(
+            table_frame, orient="vertical", command=self.tree.yview
         )
-
-        rows = self.tic.query(
-            category=category,
-            risk=risk,
-            module=module,
-            search=search,
-            limit=self.PAGE_SIZE,
-            offset=self._page * self.PAGE_SIZE,
-            order_by="timestamp",
-            order_desc=True,
+        x_scroll = ttk.Scrollbar(
+            table_frame, orient="horizontal", command=self.tree.xview
         )
+        self.tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+        self.tree.tag_configure("critical", foreground="#b00020")
+        self.tree.tag_configure("high", foreground="#c65911")
+        self.tree.tag_configure("medium", foreground="#9c6500")
+        self.tree.tag_configure("low", foreground="#356b3b")
+        self.tree.bind("<<TreeviewSelect>>", self._show_event_details)
 
-        all_mods = set()
-        all_cats = set()
-        files = []
+        self.empty_state = ttk.Label(
+            table_frame,
+            text="Подій ще немає. Натисніть «Оновити», щоб перевірити сховище.",
+            anchor="center",
+        )
+        self.empty_state.place(relx=0.5, rely=0.5, anchor="center")
 
-        for a in rows:
-            res = a.get("result") or {}
-            all_mods.add(a.get("module", "unknown"))
-            all_cats.add(res.get("category", "unknown"))
+        details_frame = ttk.LabelFrame(
+            self, text="Деталі вибраної події", padding=8
+        )
+        details_frame.pack(fill="x", padx=12, pady=(0, 12))
+        self.details_box = tk.Text(details_frame, height=5, wrap="word", state="disabled")
+        self.details_box.pack(fill="both", expand=True)
+        self._artifacts: list[dict[str, Any]] = []
+        self._visible_artifacts: list[dict[str, Any]] = []
+        self.bind("<Destroy>", self._on_destroy, add=True)
+        self.refresh()
 
-            lp = res.get("local_path")
-            if lp:
-                files.append(("config", lp))
-            screenshot = res.get("screenshot") or res.get("screenshot_path")
-            if screenshot:
-                files.append(("screenshot", screenshot))
-            js_files = res.get("js_files") or []
-            for j in js_files:
-                files.append(("js", j))
+    def refresh(self) -> None:
+        if self._destroyed or not self._refresh_lock.acquire(blocking=False):
+            return
+        self.status_var.set("Обновление событий…")
+        self.refresh_button.configure(state="disabled")
 
-        return {
-            "rows": rows,
-            "total_count": total_count,
-            "modules": sorted(all_mods),
-            "categories": sorted(all_cats),
-            "files": files,
-        }
+        def worker() -> None:
+            try:
+                artifacts = THREAT_CONNECTOR.load_all()
+                if not isinstance(artifacts, list):
+                    raise TypeError("ThreatConnector.load_all() must return a list")
+                artifacts = sorted(
+                    (item for item in artifacts if isinstance(item, dict)),
+                    key=lambda item: str(item.get("timestamp", "")),
+                    reverse=True,
+                )[:100]
+                watcher_status = (
+                    self.watcher.get_status() if self.watcher is not None else "недоступен"
+                )
+                watcher_url = getattr(self.watcher, "url", "—")
+                watcher_interval = getattr(self.watcher, "interval", "—")
+                retry_stats = (
+                    self.watcher.get_retry_stats()
+                    if self.watcher is not None
+                    and callable(getattr(self.watcher, "get_retry_stats", None))
+                    else {}
+                )
+                self.ui_bridge.post_ui(
+                    self._render,
+                    artifacts,
+                    watcher_status,
+                    watcher_url,
+                    watcher_interval,
+                    retry_stats,
+                )
+            except Exception as exc:
+                self.ui_bridge.post_ui(self._show_error, exc)
+            finally:
+                self._refresh_lock.release()
 
-    # ============================================================
-    # Async UI update (batch insert)
-    # ============================================================
-    def async_fill_treeview(self, tree: ttk.Treeview, rows: List[tuple], batch_size: int = 50):
-        tree.delete(*tree.get_children())
+        threading.Thread(
+            target=worker, name="RealtimeMonitoringRefresh", daemon=True
+        ).start()
 
-        total = len(rows)
-        index = 0
-
-        def insert_batch():
-            nonlocal index
-
-            end = min(index + batch_size, total)
-            batch = rows[index:end]
-
-            for row in batch:
-                risk = row[0]
-                tag = f"risk_{risk}"
-                if not tree.tag_has(tag):
-                    color = {
-                        "critical": "#ff4d4f",
-                        "high": "#ff7a45",
-                        "medium": "#faad14",
-                        "low": "#52c41a",
-                        "info": "#1890ff",
-                    }.get(risk, "#d9d9d9")
-                    tree.tag_configure(tag, background=color)
-
-                tree.insert("", "end", values=row, tags=(tag,))
-
-            index = end
-
-            if index < total:
-                tree.after(1, insert_batch)
-            else:
-                self._status_var.set(f"Page {self._page + 1} — {total} rows (async)")
-
-        insert_batch()
-
-    def async_fill_file_tree(self, files: List[tuple], batch_size: int = 50):
-        self._file_tree.delete(*self._file_tree.get_children())
-
-        total = len(files)
-        index = 0
-
-        def insert_batch():
-            nonlocal index
-
-            end = min(index + batch_size, total)
-            batch = files[index:end]
-
-            for ftype, path in batch:
-                self._file_tree.insert("", "end", values=(ftype, path))
-
-            index = end
-
-            if index < total:
-                self._file_tree.after(1, insert_batch)
-
-        insert_batch()
-
-    # ============================================================
-    # Refresh done
-    # ============================================================
-    def _refresh_done(self, data: Dict[str, Any]):
-        try:
-            rows = data.get("rows", [])
-            total_count = data.get("total_count", len(rows))
-            modules = data.get("modules", [])
-            categories = data.get("categories", [])
-            files = data.get("files", [])
-
-            self._total_rows = total_count
-            total_pages = max(1, (total_count + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
-
-            # Prepare rows for async insert
-            prepared_rows = []
-            for a in rows:
-                res = a.get("result") or {}
-                prepared_rows.append((
-                    res.get("risk", "info"),
-                    res.get("category", ""),
-                    a.get("module", ""),
-                    res.get("url", a.get("target", "")),
-                    str(res),
-                ))
-
-            # Async insert
-            self.async_fill_treeview(self._tree, prepared_rows, batch_size=self.BATCH_SIZE)
-            self.async_fill_file_tree(files, batch_size=self.BATCH_SIZE)
-
-            # Update filters
-            self._module_cb["values"] = ["all"] + modules
-            self._category_cb["values"] = ["all"] + categories
-
-            self._status_var.set(
-                f"Page {self._page + 1}/{total_pages} — {total_count} total artifacts"
+    def _render(
+        self,
+        artifacts: list[dict[str, Any]],
+        watcher_status: str,
+        watcher_url: str,
+        watcher_interval: Any,
+        retry_stats: dict[str, Any],
+    ) -> None:
+        if self._destroyed:
+            return
+        retry_summary = ", ".join(
+            f"{key}={value}" for key, value in sorted(retry_stats.items())
+        ) or "нет данных"
+        self.status_var.set(
+            f"Монітор: {watcher_status} | Ціль: {watcher_url} | "
+            f"Інтервал: {watcher_interval} с | Повтори: {retry_summary}"
+        )
+        self._artifacts = artifacts
+        self._apply_filters()
+        self.refresh_button.configure(state="normal")
+        if self._refresh_scheduled is None:
+            self._refresh_scheduled = self.after(
+                self.REFRESH_MS, self._scheduled_refresh
             )
 
-        except Exception as e:
-            self._status_var.set(f"Error: {e}")
-
-    # ============================================================
-    # Artifact Inspector
-    # ============================================================
-    def _on_artifact_click(self, event):
-        item = self._tree.selection()
-        if not item:
+    def _apply_filters(self, *_args: Any) -> None:
+        if self._destroyed:
             return
+        selected_severity = self.severity_filter.get().lower()
+        search = self.search_var.get().strip().casefold()
+        filtered: list[dict[str, Any]] = []
+        for artifact in self._artifacts:
+            result = artifact.get("result")
+            result = result if isinstance(result, dict) else {}
+            severity = str(
+                result.get("severity")
+                or artifact.get("severity")
+                or "info"
+            ).lower()
+            searchable = " ".join(
+                str(value)
+                for value in (
+                    artifact.get("timestamp", ""),
+                    artifact.get("module", ""),
+                    artifact.get("target", ""),
+                    result.get("category", artifact.get("category", "")),
+                )
+            ).casefold()
+            if selected_severity not in {"", "усі"} and severity != selected_severity:
+                continue
+            if search and search not in searchable:
+                continue
+            filtered.append(artifact)
 
-        values = self._tree.item(item[0], "values")
-        if len(values) < 5:
+        self._visible_artifacts = filtered
+        self.tree.delete(*self.tree.get_children())
+        for artifact in filtered:
+            result = artifact.get("result")
+            result = result if isinstance(result, dict) else {}
+            severity = str(
+                result.get("severity") or artifact.get("severity") or "info"
+            ).lower()
+            self.tree.insert(
+                "",
+                "end",
+                values=(
+                    artifact.get("timestamp", result.get("timestamp", "—")),
+                    artifact.get("module", "—"),
+                    severity.upper(),
+                    artifact.get("target", "—"),
+                    result.get("category", artifact.get("category", "—")),
+                ),
+                tags=(severity,)
+                if severity in {"critical", "high", "medium", "low"}
+                else (),
+            )
+        if filtered:
+            self.empty_state.place_forget()
+        else:
+            self.empty_state.place(relx=0.5, rely=0.5, anchor="center")
+        high_risk = sum(
+            1
+            for artifact in self._artifacts
+            if str(
+                (artifact.get("result") or {}).get("severity")
+                if isinstance(artifact.get("result"), dict)
+                else artifact.get("severity", "info")
+            ).lower()
+            in {"critical", "high"}
+        )
+        self.summary_var.set(
+            f"Подій: {len(self._artifacts)}  |  Високий ризик: {high_risk}  "
+            f"|  Показано: {len(filtered)}"
+        )
+
+    def _show_event_details(self, _event: tk.Event | None = None) -> None:
+        selection = self.tree.selection()
+        if not selection:
             return
-
-        extra = values[4]
-
-        self._artifact_text.config(state="normal")
-        self._artifact_text.delete("1.0", "end")
-        self._artifact_text.insert("1.0", extra)
-        self._artifact_text.config(state="disabled")
-
-        self._status_var.set("Artifact opened")
-
-    # ============================================================
-    # File Explorer
-    # ============================================================
-    def update_stealth_stats(self, stats: dict):
-        """Update Stealth Mode 11.0 stats panel."""
-        try:
-            self._stealth_text.config(state="normal")
-            self._stealth_text.delete("1.0", "end")
-
-            lines = []
-            lines.append(f"Active: {'✅ YES' if stats.get('stealth_active') else '❌ NO'}")
-            lines.append(f"Detected WAF: {stats.get('detected_waf', 'None')}")
-            lines.append(f"Browser Profiles: {stats.get('browser_profiles_count', 0)}")
-
-            tls = stats.get("tls", {})
-            lines.append(f"TLS Profiles: {tls.get('total_profiles', 0)} | Blocked: {len(tls.get('blocked_profiles', []))}")
-
-            delay = stats.get("delay", {})
-            lines.append(f"Avg Delay: {delay.get('avg_delay', 0)}s | Blocks: {delay.get('consecutive_blocks', 0)}")
-
-            evasion = stats.get("evasion", {})
-            lines.append(f"Requests: {evasion.get('requests_sent', 0)} | Evaded: {evasion.get('blocks_evaded', 0)} | WAF Hits: {evasion.get('waf_detections', 0)}")
-
-            self._stealth_text.insert("1.0", "\n".join(lines))
-            self._stealth_text.config(state="disabled")
-        except Exception:
-            pass
-
-    def _on_file_click(self, event):
-        item = self._file_tree.selection()
-        if not item:
+        index = self.tree.index(selection[0])
+        if index >= len(self._visible_artifacts):
             return
+        artifact = self._visible_artifacts[index]
+        result = artifact.get("result")
+        result = result if isinstance(result, dict) else {}
+        safe_details = {
+            "Время": artifact.get("timestamp", "—"),
+            "Модуль": artifact.get("module", "—"),
+            "Риск": result.get("severity", artifact.get("severity", "info")),
+            "Цель": artifact.get("target", "—"),
+            "Категория": result.get("category", artifact.get("category", "—")),
+            "Источник": result.get("source", artifact.get("source", "—")),
+            "Теги": result.get("tags", artifact.get("tags", [])),
+        }
+        self.details_box.configure(state="normal")
+        self.details_box.delete("1.0", "end")
+        self.details_box.insert(
+            "1.0", json.dumps(safe_details, ensure_ascii=False, indent=2, default=str)
+        )
+        self.details_box.configure(state="disabled")
 
-        values = self._file_tree.item(item[0], "values")
-        if len(values) < 2:
-            return
+    def _show_error(self, error: Exception) -> None:
+        if not self._destroyed:
+            self.status_var.set(
+                f"Не вдалося завантажити події: {type(error).__name__}: {error}"
+            )
+            self.refresh_button.configure(state="normal")
+            self._artifacts = []
+            self._apply_filters()
+            if self._refresh_scheduled is None:
+                self._refresh_scheduled = self.after(
+                    self.REFRESH_MS, self._scheduled_refresh
+                )
 
-        path = values[1]
-        if not os.path.exists(path):
-            self._status_var.set(f"File not found: {path}")
-            return
+    def _scheduled_refresh(self) -> None:
+        self._refresh_scheduled = None
+        self.refresh()
 
-        os.startfile(path)
-        self._status_var.set(f"Opened: {path}")
-
-
-
-
-
-
-
-
-
-
+    def _on_destroy(self, event: tk.Event) -> None:
+        if event.widget is self:
+            self._destroyed = True
+            if self._refresh_scheduled is not None:
+                self.after_cancel(self._refresh_scheduled)
+                self._refresh_scheduled = None

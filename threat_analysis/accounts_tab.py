@@ -1,228 +1,171 @@
-# xss_security_gui/threat_analysis/accounts_tab.py
-from tkinter import ttk
-import tkinter as tk
-from typing import List, Dict, Any
+"""Read-only account-related Threat Intel records with sensitive fields masked."""
 
-from xss_security_gui.threat_analysis.account_intel import AccountIntelPipeline
+from __future__ import annotations
+
+import json
+import threading
+import tkinter as tk
+from tkinter import ttk
+from typing import Any
+
+from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
+
+
+_ACCOUNT_TERMS = (
+    "account",
+    "identity",
+    "email",
+    "credential",
+    "user",
+    "login",
+    "pii",
+)
+_SENSITIVE_TERMS = (
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "cookie",
+    "authorization",
+    "api_key",
+    "apikey",
+    "access_key",
+)
+
+
+def _mask_email(value: str) -> str:
+    local, separator, domain = value.partition("@")
+    if not separator:
+        return value[:2] + ("…" if len(value) > 2 else "")
+    return f"{local[:1]}…@{domain}"
+
+
+def _safe_summary(value: Any, key: str = "") -> str:
+    normalized_key = key.lower().replace("-", "_")
+    if any(marker in normalized_key for marker in _SENSITIVE_TERMS):
+        return "[скрыто]"
+    if isinstance(value, dict):
+        parts = []
+        for child_key, child_value in list(value.items())[:12]:
+            parts.append(f"{child_key}: {_safe_summary(child_value, str(child_key))}")
+        return "; ".join(parts)
+    if isinstance(value, list):
+        return ", ".join(_safe_summary(item, key) for item in value[:8])
+    if isinstance(value, str):
+        if "@" in value and len(value) < 255:
+            return _mask_email(value)
+        return value[:240]
+    if value is None or isinstance(value, (bool, int, float)):
+        return str(value)
+    return type(value).__name__
 
 
 class AccountsTab(ttk.Frame):
-    """
-    Threat Intel Accounts Tab 11.0
-    - працює на Account Intelligence Pipeline 11.0
-    - показує всі акаунти, витягнуті AccountExtractor 11.0 + AccountAggregator 10.0
-    - підтримує сортування по колонкам
-    - підсвічує ризик (low/medium/high)
-    - фільтрація по email/username/URL
-    - без падінь, навіть якщо ThreatConnector тимчасово порожній/кривий
-    """
+    """Browse account/identity artifacts already stored in Threat Intel."""
 
-    def __init__(self, master, threat_intel_connector, **kwargs):
-        super().__init__(master, **kwargs)
-        self.threat_intel_connector = threat_intel_connector
-        self._accounts: List[Dict[str, Any]] = []
-        self._build_ui()
+    def __init__(self, parent, threat_connector, **kwargs: Any) -> None:
+        super().__init__(parent, **kwargs)
+        self.threat_connector = threat_connector
+        self._refresh_lock = threading.Lock()
+        self._bridge = UIQueueBridge(self, poll_ms=50)
+        self._destroyed = False
+
+        header = ttk.Frame(self)
+        header.pack(fill="x", padx=8, pady=8)
+        ttk.Label(
+            header,
+            text="Локальные account / identity артефакты Threat Intel",
+        ).pack(side="left", fill="x", expand=True)
+        ttk.Button(header, text="Обновить", command=self.refresh).pack(side="right")
+
+        self.status_var = tk.StringVar(value="Готово")
+        ttk.Label(self, textvariable=self.status_var, anchor="w").pack(
+            fill="x", padx=8, pady=(0, 5)
+        )
+        self.tree = ttk.Treeview(
+            self,
+            columns=("timestamp", "module", "target", "category", "summary"),
+            show="headings",
+        )
+        for column, title, width in (
+            ("timestamp", "Время", 165),
+            ("module", "Модуль", 150),
+            ("target", "Источник / цель", 250),
+            ("category", "Категория", 150),
+            ("summary", "Сводка (секреты скрыты)", 500),
+        ):
+            self.tree.heading(column, text=title)
+            self.tree.column(column, width=width, anchor="w")
+        self.tree.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.bind("<Destroy>", self._on_destroy, add=True)
         self.refresh()
 
-    # ------------------------------------------------------------
-    # UI
-    # ------------------------------------------------------------
-    def _build_ui(self) -> None:
-        toolbar = ttk.Frame(self)
-        toolbar.pack(side=tk.TOP, fill=tk.X)
-
-        self.refresh_btn = ttk.Button(toolbar, text="🔄 Refresh Accounts", command=self.refresh)
-        self.refresh_btn.pack(side=tk.LEFT, padx=5, pady=5)
-
-        ttk.Label(toolbar, text="Filter:").pack(side=tk.LEFT, padx=(10, 2))
-        self.filter_var = tk.StringVar()
-        self.filter_entry = ttk.Entry(toolbar, textvariable=self.filter_var, width=30)
-        self.filter_entry.pack(side=tk.LEFT, padx=2)
-        self.filter_entry.bind("<Return>", lambda e: self._apply_filter())
-
-        self.info_label = ttk.Label(toolbar, text="Accounts: 0")
-        self.info_label.pack(side=tk.LEFT, padx=10)
-
-        columns = (
-            "risk",
-            "username",
-            "email",
-            "password",
-            "phone",
-            "credit_card",
-            "source",
-            "url",
-        )
-
-        self.tree = ttk.Treeview(self, columns=columns, show="headings", height=20)
-        self.tree.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-
-        headers = {
-            "risk": "Risk",
-            "username": "Username",
-            "email": "Email",
-            "password": "Password",
-            "phone": "Phone",
-            "credit_card": "Card",
-            "source": "Source",
-            "url": "URL",
-        }
-
-        widths = {
-            "risk": 60,
-            "username": 140,
-            "email": 180,
-            "password": 160,
-            "phone": 120,
-            "credit_card": 150,
-            "source": 120,
-            "url": 260,
-        }
-
-        for col, text in headers.items():
-            self.tree.heading(col, text=text, command=lambda c=col: self._sort_by(c, False))
-            self.tree.column(col, width=widths.get(col, 120), anchor=tk.W, stretch=True)
-
-        self.tree.tag_configure("low", foreground="#2e7d32")
-        self.tree.tag_configure("medium", foreground="#f9a825")
-        self.tree.tag_configure("high", foreground="#c62828")
-
-        self._menu = tk.Menu(self, tearoff=0)
-        self._menu.add_command(label="Copy username", command=lambda: self._copy_field("username"))
-        self._menu.add_command(label="Copy email", command=lambda: self._copy_field("email"))
-        self._menu.add_command(label="Copy password", command=lambda: self._copy_field("password"))
-        self._menu.add_command(label="Copy URL", command=lambda: self._copy_field("url"))
-
-        self.tree.bind("<Button-3>", self._on_right_click)
-
-    # ------------------------------------------------------------
-    # Data loading (Account Intelligence 11.0)
-    # ------------------------------------------------------------
     def refresh(self) -> None:
-        artifacts: List[Dict[str, Any]] = []
+        if self._destroyed or not self._refresh_lock.acquire(blocking=False):
+            return
+        self.status_var.set("Загрузка account-артефактов…")
 
-        try:
-            if self.threat_intel_connector is not None:
-                if hasattr(self.threat_intel_connector, "get_artifacts"):
-                    artifacts = self.threat_intel_connector.get_artifacts()
-                else:
-                    artifacts = self.threat_intel_connector.load_artifacts()
-        except Exception:
-            artifacts = []
+        def worker() -> None:
+            try:
+                artifacts = self.threat_connector.query(
+                    limit=1000,
+                    offset=0,
+                    order_by="timestamp",
+                    order_desc=True,
+                )
+                accounts = [
+                    artifact
+                    for artifact in artifacts
+                    if self._is_account_artifact(artifact)
+                ]
+                self._bridge.post_ui(self._render, accounts)
+            except Exception as exc:
+                self._bridge.post_ui(self._show_error, exc)
+            finally:
+                self._refresh_lock.release()
 
-        try:
-            pipeline = AccountIntelPipeline(artifacts)
-            account_artifact = pipeline.build_threat_artifact()
-            self._accounts = account_artifact.get("accounts", []) or []
-        except Exception:
-            self._accounts = []
+        threading.Thread(target=worker, name="AccountsTabRefresh", daemon=True).start()
 
-        self._render(self._accounts)
+    @staticmethod
+    def _is_account_artifact(artifact: Any) -> bool:
+        if not isinstance(artifact, dict):
+            return False
+        module = str(artifact.get("module", "")).lower()
+        result = artifact.get("result")
+        if not isinstance(result, dict):
+            result = {}
+        category = str(result.get("category") or artifact.get("category") or "").lower()
+        content = f"{module} {category} {json.dumps(result, ensure_ascii=False, default=str)}".lower()
+        return any(term in content for term in _ACCOUNT_TERMS)
 
-    # ------------------------------------------------------------
-    # Rendering
-    # ------------------------------------------------------------
-    def _render(self, accounts: List[Dict[str, Any]]) -> None:
-        for row in self.tree.get_children():
-            self.tree.delete(row)
-
-        for acc in accounts:
-            risk = acc.get("risk", 0)
-            tag = self._risk_tag(risk)
-
+    def _render(self, artifacts: list[dict[str, Any]]) -> None:
+        if self._destroyed:
+            return
+        self.tree.delete(*self.tree.get_children())
+        for artifact in artifacts:
+            result = artifact.get("result")
+            result = result if isinstance(result, dict) else {}
+            category = result.get("category", artifact.get("category", "—"))
             self.tree.insert(
                 "",
-                tk.END,
+                "end",
                 values=(
-                    risk,
-                    acc.get("username") or "",
-                    acc.get("email") or "",
-                    acc.get("password") or "",
-                    acc.get("phone") or "",
-                    acc.get("credit_card") or "",
-                    acc.get("source") or "",
-                    acc.get("url") or "",
+                    artifact.get("timestamp", result.get("timestamp", "—")),
+                    artifact.get("module", "—"),
+                    artifact.get("target", "—"),
+                    category,
+                    _safe_summary(result),
                 ),
-                tags=(tag,),
+            )
+        self.status_var.set(f"Загружено account-артефактов: {len(artifacts)}")
+
+    def _show_error(self, error: Exception) -> None:
+        if not self._destroyed:
+            self.status_var.set(
+                f"Ошибка загрузки: {type(error).__name__}: {error}"
             )
 
-        self.info_label.config(text=f"Accounts: {len(accounts)}")
-
-    # ------------------------------------------------------------
-    # Filtering
-    # ------------------------------------------------------------
-    def _apply_filter(self) -> None:
-        q = (self.filter_var.get() or "").strip().lower()
-        if not q:
-            self._render(self._accounts)
-            return
-
-        filtered = []
-        for acc in self._accounts:
-            haystack = " ".join(
-                str(acc.get(k) or "").lower()
-                for k in ("username", "email", "url", "source")
-            )
-            if q in haystack:
-                filtered.append(acc)
-
-        self._render(filtered)
-
-    # ------------------------------------------------------------
-    # Risk helpers
-    # ------------------------------------------------------------
-    def _risk_tag(self, risk: int) -> str:
-        if risk >= 100:
-            return "high"
-        if risk >= 50:
-            return "medium"
-        return "low"
-
-    # ------------------------------------------------------------
-    # Sorting
-    # ------------------------------------------------------------
-    def _sort_by(self, col: str, descending: bool) -> None:
-        data = [(self.tree.set(child, col), child) for child in self.tree.get_children("")]
-
-        try:
-            data.sort(key=lambda t: int(t[0]), reverse=descending)
-        except ValueError:
-            data.sort(key=lambda t: t[0], reverse=descending)
-
-        for index, (_, child) in enumerate(data):
-            self.tree.move(child, "", index)
-
-        self.tree.heading(col, command=lambda: self._sort_by(col, not descending))
-
-    # ------------------------------------------------------------
-    # Context menu handlers
-    # ------------------------------------------------------------
-    def _on_right_click(self, event) -> None:
-        row_id = self.tree.identify_row(event.y)
-        if not row_id:
-            return
-        self.tree.selection_set(row_id)
-        self._menu.tk_popup(event.x_root, event.y_root)
-
-    def _copy_field(self, field: str) -> None:
-        sel = self.tree.selection()
-        if not sel:
-            return
-        item_id = sel[0]
-        values = self.tree.item(item_id, "values")
-        columns = ["risk", "username", "email", "password", "phone", "credit_card", "source", "url"]
-        if field not in columns:
-            return
-        idx = columns.index(field)
-        val = values[idx]
-        if not val:
-            return
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(val)
-        except Exception:
-            pass
-
-
-
-
+    def _on_destroy(self, event: tk.Event) -> None:
+        if event.widget is self:
+            self._destroyed = True
+            self._bridge.stop()

@@ -25,10 +25,11 @@ from xss_security_gui.utils.threat_sender import ThreatSenderMixin
 from xss_security_gui.file_loader import save_json
 
 try:
-    from xss_security_gui.dom_parser import DOMParser, DOMParserAsync
-except ImportError:
+    from xss_security_gui.dom_parser import DOMParser
+    _DOM_PARSER_IMPORT_ERROR: Optional[ImportError] = None
+except ImportError as exc:
     DOMParser = None
-    DOMParserAsync = None
+    _DOM_PARSER_IMPORT_ERROR = exc
 
 
 class DOMParserTab(ttk.Frame, ThreatSenderMixin):
@@ -77,14 +78,18 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
         warning_text = (
             "Модуль DOMParser не загружен.\n\n"
             "Возможные причины:\n"
-            " • Файл dom_parser.py отсутствует или повреждён\n"
-            " • Ошибка импорта в xss_security_gui/dom_parser/__init__.py\n"
-            " • Нарушена структура пакета\n\n"
+            " • Ошибка импорта пакета xss_security_gui.dom_parser\n"
+            " • Отсутствует зависимость beautifulsoup4\n\n"
             "Рекомендации:\n"
-            " • Проверьте, что каталог xss_security_gui/dom_parser существует\n"
-            " • Убедитесь, что в нём есть parser.py и __init__.py\n"
-            " • Перезапустите приложение после исправления\n"
+            " • Проверьте установку beautifulsoup4\n"
+            " • Проверьте журнал приложения для подробностей\n"
+            " • Перезапустите приложение после исправления"
         )
+        if _DOM_PARSER_IMPORT_ERROR is not None:
+            warning_text += (
+                f"\n\nОшибка импорта: {type(_DOM_PARSER_IMPORT_ERROR).__name__}: "
+                f"{_DOM_PARSER_IMPORT_ERROR}"
+            )
 
         try:
             messagebox.showwarning("⚠️ DOMParser недоступен", warning_text)
@@ -806,6 +811,4 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
         except Exception:
             pass
         super().destroy()
-
-
 

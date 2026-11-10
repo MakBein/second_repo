@@ -17,6 +17,7 @@ import subprocess
 import json
 import tkinter as tk
 from tkinter import ttk, messagebox
+from tkinter.scrolledtext import ScrolledText
 from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
 
 # Универсальные импорты
@@ -35,6 +36,7 @@ class AutoAnalyzerTab(ttk.Frame, ThreatSenderMixin):
     def __init__(self, parent, threat_tab=None):
         super().__init__(parent)
         self.links = []
+        self.deep_analysis_results = []
         self.threat_tab = threat_tab
         self.result_box = tk.Text(
             self,
@@ -69,6 +71,7 @@ class AutoAnalyzerTab(ttk.Frame, ThreatSenderMixin):
         ttk.Button(control, text="📕 Лог ошибок", command=self.show_error_log).grid(row=1, column=3, pady=4)
         ttk.Button(control, text="🧬 Глубокий анализ", command=self.run_deep_analysis).grid(row=1, column=4, pady=4)
         ttk.Button(control, text="🎯 Фуззить формы", command=self.fuzz_forms).grid(row=1, column=5, pady=4)
+        ttk.Button(control, text="📄 View Analysis JSON", command=self.show_analysis_json).grid(row=1, column=6, pady=4)
 
         self.result_box.pack(padx=10, pady=5, fill="both", expand=True)
 
@@ -146,12 +149,70 @@ class AutoAnalyzerTab(ttk.Frame, ThreatSenderMixin):
     def _deep_analysis_worker(self):
         try:
             self._ui_log("🧬 Запуск глубокого анализа...")
-            analyze_list(self.links)
-            self._ui_log("✅ deep_crawl.json создан. Можно открыть вкладку Глубокий анализ.")
+            results = analyze_list(self.links)
+            self._bridge.post_ui(self._set_deep_analysis_results, results)
+            self._ui_log("✅ JSON-отчёты сохранены в cache/site_analysis.")
             THREAT_CONNECTOR.emit(module="AutoAnalyzer", target="deep_analysis",
                                   result={"check": "deep_analysis", "links": self.links})
         except Exception as e:
             self._ui_log(f"❌ Ошибка при анализе: {e}")
+
+    def _set_deep_analysis_results(self, results):
+        self.deep_analysis_results = results
+
+    def show_analysis_json(self):
+        if not self.deep_analysis_results:
+            messagebox.showinfo("Нет результатов", "Сначала запустите глубокий анализ.")
+            return
+
+        window = tk.Toplevel(self)
+        window.title("Глубокий анализ сайта")
+        window.geometry("900x700")
+
+        ttk.Label(window, text="Сайт:").pack(anchor="w", padx=8, pady=(8, 2))
+        site_var = tk.StringVar()
+        site_box = ttk.Combobox(
+            window,
+            textvariable=site_var,
+            values=[result.get("url", "—") for result in self.deep_analysis_results],
+            state="readonly",
+        )
+        site_box.pack(fill="x", padx=8)
+
+        robots_frame = ttk.LabelFrame(window, text="robots.txt")
+        robots_frame.pack(fill="both", expand=False, padx=8, pady=6)
+        robots_text = ScrolledText(robots_frame, height=8, wrap="none")
+        robots_text.pack(fill="both", expand=True)
+        robots_text.configure(state="disabled")
+
+        json_frame = ttk.LabelFrame(window, text="Analysis JSON")
+        json_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        json_text = ScrolledText(json_frame, wrap="none")
+        json_text.pack(fill="both", expand=True)
+        json_text.configure(state="disabled")
+
+        def display_selected_site(_event=None):
+            selected_url = site_var.get()
+            result = next(
+                (item for item in self.deep_analysis_results if item.get("url", "—") == selected_url),
+                None,
+            )
+            if result is None:
+                return
+
+            for widget, content in (
+                (robots_text, result.get("robots_raw", "")),
+                (json_text, json.dumps(result, indent=2, ensure_ascii=False)),
+            ):
+                widget.configure(state="normal")
+                widget.delete("1.0", "end")
+                widget.insert("1.0", content)
+                widget.configure(state="disabled")
+
+        site_box.bind("<<ComboboxSelected>>", display_selected_site)
+        if self.deep_analysis_results:
+            site_box.current(0)
+            display_selected_site()
 
     def fuzz_forms(self):
         self._bridge.post_bg(self._fuzz_forms_worker)
