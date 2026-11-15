@@ -5,6 +5,8 @@ __pycache__/
 *.pyo
 *.pyd
 exports/*.json
+exports/*.html
+exports/reports/
 
 # === Виртуальное окружение ===
 .venv/
@@ -23,6 +25,10 @@ build/
 *.swp
 *.swo
 
+# === Runtime databases ===
+payloads/payload_db.db
+
+
 # === Логи проекта ===
 logs/
 *.log
@@ -32,3 +38,7 @@ logs/
 
 # === Сгенерированные отчёты ===
 *.md~
+
+# === Scan artifacts ===
+attack_results*.json
+autorecon_report*.html
