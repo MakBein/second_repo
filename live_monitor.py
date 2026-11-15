@@ -8,6 +8,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from collections import Counter, deque
 from typing import Dict, Any, List
+from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
+from xss_security_gui.utils.ai_bridge import analyze_async
 
 EventDict = Dict[str, Any]
 
@@ -50,6 +52,9 @@ class LiveAttackMonitor(ttk.Frame):
         self._severity_stats = Counter()
         self._module_stats = Counter()
         self._summary_mode = tk.BooleanVar(value=False)
+
+        # UI bridge for safe post_ui
+        self._bridge = UIQueueBridge(self, poll_ms=100)
 
         # Для "AI‑аналитики"
         self._recent_events = deque(maxlen=500)
@@ -438,7 +443,44 @@ class LiveAttackMonitor(ttk.Frame):
         # 4) Специфические паттерны по полям
         self._ai_check_token_pattern(event)
         self._ai_check_xss_pattern(event)
+        # 5) Optionally call AI Core async for heavier analysis (do not block GUI)
+        try:
+            # Only run AI analysis for high severity events to avoid overload
+            if severity == "high":
+                analyze_async(event, callback=self._on_ai_result, name="LiveMonitorAI")
+        except Exception:
+            pass
 
+    def _on_ai_result(self, result: Dict[str, Any]):
+        """Callback called from AI worker thread (safe_invoke will schedule to mainloop).
+
+        We use UIQueueBridge to post UI updates.
+        """
+        try:
+            # If result contains error, log to ai_text
+            if not isinstance(result, dict):
+                return
+
+            if result.get("error"):
+                text = f"[AI] Error: {result.get('error')}\n"
+            else:
+                summary = result.get("summary", "no-summary")
+                conf = result.get("confidence") or result.get("confidence", result.get("confidence", "?"))
+                tags = ",".join(result.get("tags", [])) if isinstance(result.get("tags"), list) else str(result.get("tags"))
+                text = f"[AI] {summary} (conf={conf}) tags={tags}\n"
+
+            # Post to ai_text via bridge to ensure mainloop execution
+            try:
+                self._bridge.post_ui(self.ai_text.insert, "end", text)
+                self._bridge.post_ui(self.ai_text.see, "end")
+            except Exception:
+                # Fallback: schedule with after
+                try:
+                    self.after(0, lambda t=text: (self.ai_text.insert("end", t), self.ai_text.see("end")))
+                except Exception:
+                    pass
+        except Exception:
+            pass
     def _ai_check_high_burst(self, now: float):
         # если за последние 30 секунд > N HIGH‑событий — сигнал
         window = 30.0

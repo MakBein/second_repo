@@ -471,7 +471,7 @@ All inherit from ThreatSenderMixin
   "headers": {
     "user-agent": "...",
     "referer": "...",
-    ...
+    "cookie": "..."
   },
   "raw": "GET /api/users HTTP/1.1\r\n..."
 }

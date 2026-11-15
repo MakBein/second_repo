@@ -3,13 +3,13 @@
 Threat Sources Tab - shows threats loaded from multiple sources (analyzer, real breaches, history)
 Provides Load All / Analyze / Export actions and a tree viewer.
 """
-import threading
 import json
 import tkinter as tk
 from tkinter import ttk, filedialog
 from typing import Optional
 
 from xss_security_gui.unified_threat_loader import UnifiedThreatLoader
+from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
 
 
 class ThreatSourcesTab(ttk.Frame):
@@ -17,6 +17,7 @@ class ThreatSourcesTab(ttk.Frame):
         super().__init__(parent)
         self.threat_tab = threat_tab
         self.loader = UnifiedThreatLoader()
+        self._bridge = UIQueueBridge(self, poll_ms=100)
 
         top = ttk.Frame(self)
         top.pack(fill="x", pady=3)
@@ -72,7 +73,7 @@ class ThreatSourcesTab(ttk.Frame):
             except Exception:
                 pass
 
-        threading.Thread(target=_worker, daemon=True).start()
+        self._bridge.post_bg(_worker)
 
     def analyze(self):
         def _worker():
@@ -91,7 +92,7 @@ class ThreatSourcesTab(ttk.Frame):
                 except Exception:
                     pass
 
-        threading.Thread(target=_worker, daemon=True).start()
+        self._bridge.post_bg(_worker)
 
     def export_combined(self):
         try:

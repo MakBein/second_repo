@@ -18,6 +18,7 @@ from xss_security_gui.net_utils import session_request_safe
 from xss_security_gui.auto_modules.module_families import MODULE_FAMILIES
 from xss_security_gui.threat_analysis.threat_connector import THREAT_CONNECTOR, ThreatConnector
 from xss_security_gui.threat_data_loader import ThreatRisk
+from xss_security_gui.auto_modules.dom_and_endpoints import attack_xss_targets
 
 import logging
 logger = logging.getLogger(__name__)
@@ -232,7 +233,7 @@ def _request_get(
 
 
 # ============================================================
-#  API Endpoints (Ultra)
+#  API Endpoints (Ultra‑Mode, AGGRESSIVE MODULES 4.0)
 # ============================================================
 def attack_api_endpoints(
     session: requests.Session,
@@ -241,9 +242,21 @@ def attack_api_endpoints(
     headers_list: List[Dict[str, str]],
     log: Optional[LogFunc] = None,
 ) -> Dict[str, Any]:
+    """
+    Ultra‑Mode API Endpoint Scanner:
+    • стабільні запити
+    • WAF‑aware
+    • GraphQL‑aware
+    • JSON‑aware
+    • повна аналітика (entropy, pattern, risk, fingerprint)
+    • heatmap‑готова структура
+    • ThreatEngine‑готовий формат
+    """
+
     cfg = _load_ultra_config()
     cap = int(cfg["max_endpoints_per_run"])
     endpoints = list(endpoints)[:cap]
+
     if not headers_list:
         headers_list = [{}]
 
@@ -253,45 +266,97 @@ def attack_api_endpoints(
     results: List[Dict[str, Any]] = []
 
     try:
-        for ep in endpoints:
+    for ep in endpoints:
             url = _normalize_url(base_url, str(ep))
-            for hdr in headers_list:
+
+        for hdr in headers_list:
                 _safe_log(log, f"[API] GET {url}", "debug")
+
                 r, err = _request_get(session, url, hdr, cfg, log)
                 _pace(cfg)
 
-                if r is None:
-                    results.append(
-                        {
-                            "endpoint": url,
-                            "headers_used": hdr,
-                            "error": err or "request_failed",
-                            "severity": "error",
-                        }
-                    )
-                    continue
+                # ------------------------------
+                # Ошибка запроса
+                # ------------------------------
+            if r is None:
+                results.append({
+                    "endpoint": url,
+                    "headers_used": hdr,
+                        "error": err or "request_failed",
+                    "severity": "error",
+                        "entropy_score": len(set(str(err))),
+                        "pattern_score": 1,
+                        "risk_score": 3,
+                        "context_score": 0,
+                        "total_score": len(set(str(err))) + 4,
+                        "fingerprint": hash(str(err)[:200]),
+                })
+                continue
 
+                # ------------------------------
+                # Анализ ответа
+                # ------------------------------
                 body = _sample_body(r.text or "", cfg["max_body_sample"])
-                json_body = _extract_json(body)
+            json_body = _extract_json(body)
                 rh = dict(r.headers)
+
                 is_graphql = _looks_like_graphql(url, body, rh)
                 waf = _waf_like(body)
+                redirected = len(r.history) > 0
 
-                results.append(
-                    {
-                        "endpoint": url,
-                        "status": r.status_code,
-                        "headers_used": hdr,
-                        "content_type": r.headers.get("Content-Type", ""),
-                        "length": len(r.text or ""),
-                        "is_graphql": is_graphql,
-                        "json_detected": json_body is not None,
-                        "waf_or_block_page": waf,
-                        "redirected": len(r.history) > 0,
-                        "final_url": r.url,
-                        "severity": _classify_severity(r.status_code, waf_like=waf),
-                    }
+                # ------------------------------
+                # AGGRESSIVE ANALYTICS 4.0
+                # ------------------------------
+                entropy_score = len(set(body[:500]))
+                pattern_score = (
+                    (3 if "<script" in body.lower() else 0) +
+                    (2 if "alert(" in body.lower() else 0) +
+                    (2 if "graphql" in body.lower() else 0)
                 )
+                risk_score = (
+                    (3 if r.status_code >= 500 else 0) +
+                    (2 if waf else 0) +
+                    (2 if json_body is not None else 0)
+                )
+                context_score = (
+                    (2 if url.startswith("https://") else 0) +
+                    (1 if "api" in url.lower() else 0)
+                )
+
+                total_score = entropy_score + pattern_score + risk_score + context_score
+                fingerprint = hash((url + body[:300])[:300])
+
+                severity = (
+                    "critical" if risk_score >= 3 else
+                    "high" if risk_score >= 2 else
+                    "medium" if json_body else
+                    "low"
+                )
+
+                # ------------------------------
+                # Результат
+                # ------------------------------
+                results.append({
+                "endpoint": url,
+                "status": r.status_code,
+                "headers_used": hdr,
+                "content_type": r.headers.get("Content-Type", ""),
+                    "length": len(r.text or ""),
+                "is_graphql": is_graphql,
+                "json_detected": json_body is not None,
+                    "waf_or_block_page": waf,
+                    "redirected": redirected,
+                    "final_url": r.url,
+                    "severity": severity,
+
+                    # AGGRESSIVE ANALYTICS 4.0
+                    "entropy_score": entropy_score,
+                    "pattern_score": pattern_score,
+                    "risk_score": risk_score,
+                    "context_score": context_score,
+                    "total_score": total_score,
+                    "fingerprint": fingerprint,
+                })
 
         return {
             "status": "ok",
@@ -312,7 +377,6 @@ def attack_api_endpoints(
             "risk": meta.get("risk", "-"),
             "tags": meta.get("tags", []),
         }
-
 
 def _auth_header_variants(token: str, max_variants: int) -> List[Dict[str, str]]:
     t = token.strip()
@@ -338,7 +402,7 @@ def _auth_header_variants(token: str, max_variants: int) -> List[Dict[str, str]]
 
 
 # ============================================================
-#  Token probing (Ultra) — используется AttackEngine
+#  Token probing (Ultra) — AGGRESSIVE MODULES 4.0
 # ============================================================
 def brute_force_tokens(
     session: requests.Session,
@@ -346,6 +410,15 @@ def brute_force_tokens(
     tokens: List[str],
     log: Optional[LogFunc] = None,
 ) -> Dict[str, Any]:
+    """
+    AGGRESSIVE MODULES 4.0 — Token Brute Force (Ultra‑Mode)
+
+    • стабільний перебір токенів
+    • WAF‑aware / sensitive‑body‑aware
+    • статус‑зсув (401/403 → інші коди)
+    • повна аналітика (entropy, pattern, risk, context, total_score, fingerprint)
+    • heatmap‑готова структура для ThreatEngine
+    """
 
     module_name = "Token Brute Force"
     meta = MODULE_FAMILIES.get(module_name, {})
@@ -358,50 +431,115 @@ def brute_force_tokens(
     attempt_no = 0
 
     try:
-        for token in tokens:
+    for token in tokens:
             if attempt_no >= max_attempts:
                 _safe_log(log, f"[TOKENS] лимит попыток {max_attempts}", "warn")
                 break
+
+            masked = _mask_secret(str(token))
+            token_entropy = len(set(token))
+            token_length = len(token)
 
             for hdr in _auth_header_variants(str(token), max_hdr):
                 if attempt_no >= max_attempts:
                     break
 
-                masked = _mask_secret(str(token))
-                _safe_log(log, f"[TOKENS] GET {base_url} auth={hdr.keys()} token={masked}", "debug")
+                _safe_log(
+                    log,
+                    f"[TOKENS] GET {base_url} auth={list(hdr.keys())} token={masked}",
+                    "debug",
+                )
 
                 r, err = _request_get(session, base_url, hdr, cfg, log)
                 _pace(cfg)
                 attempt_no += 1
 
-                if r is None:
-                    results.append({
+                # ------------------------------
+                # Ошибка запроса
+                # ------------------------------
+        if r is None:
+                    entropy_score = len(set(str(err)))
+                    pattern_score = 1
+                    risk_score = 3
+                    context_score = 0
+                    total_score = entropy_score + pattern_score + risk_score + context_score
+                    fingerprint = hash(str(err)[:200])
+
+            results.append({
                         "token_preview": masked,
                         "auth_headers": list(hdr.keys()),
                         "error": err or "request_failed",
-                        "severity": "error",
-                    })
-                    continue
+                "severity": "error",
 
+                        # AGGRESSIVE ANALYTICS 4.0
+                        "entropy_score": entropy_score,
+                        "pattern_score": pattern_score,
+                        "risk_score": risk_score,
+                        "context_score": context_score,
+                        "total_score": total_score,
+                        "fingerprint": fingerprint,
+                        "token_entropy": token_entropy,
+                        "token_length": token_length,
+            })
+            continue
+
+                # ------------------------------
+                # Анализ ответа
+                # ------------------------------
                 body = _sample_body(r.text or "", cfg["max_body_sample"])
                 suspicious = _sensitive_body(body)
                 waf = _waf_like(body)
                 status_shift = r.status_code not in (401, 403)
 
+                # ------------------------------
+                # AGGRESSIVE ANALYTICS 4.0
+                # ------------------------------
+                body_lower = body.lower()
+                entropy_score = len(set(body[:500]))
+                pattern_score = (
+                    (3 if "error" in body_lower else 0) +
+                    (2 if "denied" in body_lower else 0) +
+                    (2 if "token" in body_lower else 0)
+                )
+                risk_score = (
+                    (3 if status_shift else 0) +
+                    (2 if suspicious else 0) +
+                    (2 if waf else 0)
+                )
+                context_score = (
+                    (2 if "api" in base_url.lower() else 0) +
+                    (1 if "auth" in base_url.lower() else 0)
+                )
+
+                total_score = entropy_score + pattern_score + risk_score + context_score
+                fingerprint = hash((masked + body[:300])[:300])
+
+                severity = (
+                    "critical" if risk_score >= 3 else
+                    "high" if risk_score >= 2 else
+                    "medium" if status_shift else
+                    "low"
+                )
+
                 results.append({
                     "token_preview": masked,
                     "auth_headers": list(hdr.keys()),
-                    "status": r.status_code,
+            "status": r.status_code,
                     "length": len(r.text or ""),
-                    "suspicious": suspicious,
+            "suspicious": suspicious,
                     "waf_or_block_page": waf,
                     "not_unauthorized": status_shift,
-                    "severity": _classify_severity(
-                        r.status_code,
-                        reflected=False,
-                        error=False,
-                        waf_like=waf,
-                    ),
+                    "severity": severity,
+
+                    # AGGRESSIVE ANALYTICS 4.0
+                    "entropy_score": entropy_score,
+                    "pattern_score": pattern_score,
+                    "risk_score": risk_score,
+                    "context_score": context_score,
+                    "total_score": total_score,
+                    "fingerprint": fingerprint,
+                    "token_entropy": token_entropy,
+                    "token_length": token_length,
                 })
 
         return {
@@ -426,7 +564,7 @@ def brute_force_tokens(
 
 
 # ============================================================
-#  Parameters (Ultra)
+#  Parameters (Ultra) — AGGRESSIVE MODULES 4.0
 # ============================================================
 def attack_parameters(
     session: requests.Session,
@@ -443,27 +581,49 @@ def attack_parameters(
     results: List[Dict[str, Any]] = []
 
     try:
-        for param in parameters:
+    for param in parameters:
             pname = str(param).strip()
             if not pname:
                 continue
 
+            # Формируем URL с параметром
             url = _merge_query_params(base_url, {pname: probe})
             _safe_log(log, f"[PARAM] GET {url[:200]}", "debug")
 
             r, err = _request_get(session, url, None, cfg, log)
             _pace(cfg)
 
-            if r is None:
-                results.append({
-                    "parameter": pname,
-                    "url": url,
-                    "error": err or "request_failed",
-                    "severity": "error",
-                })
-                continue
+            # ------------------------------
+            # Ошибка запроса
+            # ------------------------------
+        if r is None:
+                entropy_score = len(set(str(err)))
+                pattern_score = 1
+                risk_score = 3
+                context_score = 0
+                total_score = entropy_score + pattern_score + risk_score + context_score
+                fingerprint = hash(str(err)[:200])
 
-            body = r.text or ""
+            results.append({
+                    "parameter": pname,
+                "url": url,
+                    "error": err or "request_failed",
+                "severity": "error",
+
+                    # AGGRESSIVE ANALYTICS 4.0
+                    "entropy_score": entropy_score,
+                    "pattern_score": pattern_score,
+                    "risk_score": risk_score,
+                    "context_score": context_score,
+                    "total_score": total_score,
+                    "fingerprint": fingerprint,
+            })
+            continue
+
+            # ------------------------------
+            # Анализ ответа
+            # ------------------------------
+        body = r.text or ""
             reflected = probe in body
 
             enc = quote(probe, safe="")
@@ -471,18 +631,53 @@ def attack_parameters(
 
             waf = _waf_like(body)
 
+            # ------------------------------
+            # AGGRESSIVE ANALYTICS 4.0
+            # ------------------------------
+            body_lower = body.lower()
+
+            entropy_score = len(set(body[:500]))
+            pattern_score = (
+                (3 if probe in body else 0) +
+                (2 if enc in body else 0) +
+                (2 if "alert(" in body_lower else 0)
+            )
+            risk_score = (
+                (3 if reflected or encoded_hit else 0) +
+                (2 if waf else 0) +
+                (2 if r.status_code >= 400 else 0)
+            )
+            context_score = (
+                (2 if "api" in base_url.lower() else 0) +
+                (1 if "?" in url else 0)
+            )
+
+            total_score = entropy_score + pattern_score + risk_score + context_score
+            fingerprint = hash((pname + body[:300])[:300])
+
+            severity = (
+                "critical" if risk_score >= 3 else
+                "high" if risk_score >= 2 else
+                "medium" if reflected or encoded_hit else
+                "low"
+            )
+
             results.append({
                 "parameter": pname,
-                "url": url,
-                "status": r.status_code,
+            "url": url,
+            "status": r.status_code,
                 "reflected": reflected or encoded_hit,
-                "length": len(body),
+            "length": len(body),
                 "waf_or_block_page": waf,
-                "severity": _classify_severity(
-                    r.status_code,
-                    reflected=reflected,
-                    waf_like=waf
-                ),
+                "severity": severity,
+
+                # AGGRESSIVE ANALYTICS 4.0
+                "entropy_score": entropy_score,
+                "pattern_score": pattern_score,
+                "risk_score": risk_score,
+                "context_score": context_score,
+                "total_score": total_score,
+                "fingerprint": fingerprint,
             })
 
         return {
@@ -505,9 +700,8 @@ def attack_parameters(
             "tags": meta.get("tags", []),
         }
 
-
 # ============================================================
-#  User IDs (Ultra)
+#  User IDs (Ultra) AGGRESSIVE MODULES 4.0
 # ============================================================
 def attack_user_ids(
     session: requests.Session,
@@ -521,6 +715,9 @@ def attack_user_ids(
 
     cfg = _load_ultra_config()
 
+    # ---------------------------------------------------------
+    #  Завантаження додаткових параметрів user_id
+    # ---------------------------------------------------------
     try:
         from xss_security_gui import settings as app_settings
         extra = app_settings.settings.get("attack.user_id_param_names")
@@ -534,41 +731,103 @@ def attack_user_ids(
     results: List[Dict[str, Any]] = []
 
     try:
-        for uid in user_ids:
+    for uid in user_ids:
             for pname in id_param_names:
+
                 url = _merge_query_params(base_url, {pname: str(uid)})
                 _safe_log(log, f"[USER] GET {url[:200]}", "debug")
 
                 r, err = _request_get(session, url, None, cfg, log)
                 _pace(cfg)
 
-                if r is None:
-                    results.append({
-                        "user_id": uid,
-                        "param": pname,
-                        "url": url,
-                        "error": err or "request_failed",
-                        "severity": "error",
-                    })
-                    continue
+                # ---------------------------------------------------------
+                #  Ошибка запроса
+                # ---------------------------------------------------------
+        if r is None:
+                    entropy_score = len(set(str(err)))
+                    pattern_score = 1
+                    risk_score = 3
+                    context_score = 0
+                    total_score = entropy_score + pattern_score + risk_score + context_score
+                    fingerprint = hash(str(err)[:200])
 
-                body = r.text or ""
+            results.append({
+                "user_id": uid,
+                        "param": pname,
+                "url": url,
+                        "error": err or "request_failed",
+                "severity": "error",
+
+                        # AGGRESSIVE ANALYTICS 4.0
+                        "entropy_score": entropy_score,
+                        "pattern_score": pattern_score,
+                        "risk_score": risk_score,
+                        "context_score": context_score,
+                        "total_score": total_score,
+                        "fingerprint": fingerprint,
+            })
+            continue
+
+                # ---------------------------------------------------------
+                #  Анализ ответа
+                # ---------------------------------------------------------
+        body = r.text or ""
+                body_lower = body.lower()
+
                 leaked_email = bool(
                     re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", body)
                 )
-                diff_status = r.status_code == 200 and len(body) > 200
+
+                substantial_body = r.status_code == 200 and len(body) > 200
                 waf = _waf_like(body)
 
+                # ---------------------------------------------------------
+                #  AGGRESSIVE ANALYTICS 4.0
+                # ---------------------------------------------------------
+                entropy_score = len(set(body[:500]))
+                pattern_score = (
+                    (3 if leaked_email else 0) +
+                    (2 if "profile" in body_lower else 0) +
+                    (2 if "user" in body_lower else 0)
+                )
+                risk_score = (
+                    (3 if leaked_email else 0) +
+                    (2 if substantial_body else 0) +
+                    (2 if waf else 0)
+                )
+                context_score = (
+                    (2 if "api" in base_url.lower() else 0) +
+                    (1 if pname in ("id", "user_id") else 0)
+                )
+
+                total_score = entropy_score + pattern_score + risk_score + context_score
+                fingerprint = hash((str(uid) + body[:300])[:300])
+
+                severity = (
+                    "critical" if risk_score >= 3 else
+                    "high" if risk_score >= 2 else
+                    "medium" if leaked_email or substantial_body else
+                    "low"
+                )
+
                 results.append({
-                    "user_id": uid,
+            "user_id": uid,
                     "param": pname,
-                    "url": url,
-                    "status": r.status_code,
-                    "length": len(body),
-                    "leaked_email": leaked_email,
-                    "substantial_body": diff_status,
+            "url": url,
+            "status": r.status_code,
+            "length": len(body),
+            "leaked_email": leaked_email,
+                    "substantial_body": substantial_body,
                     "waf_or_block_page": waf,
-                    "severity": _classify_severity(r.status_code, waf_like=waf),
+                    "severity": severity,
+
+                    # AGGRESSIVE ANALYTICS 4.0
+                    "entropy_score": entropy_score,
+                    "pattern_score": pattern_score,
+                    "risk_score": risk_score,
+                    "context_score": context_score,
+                    "total_score": total_score,
+                    "fingerprint": fingerprint,
                 })
 
         return {
@@ -591,100 +850,8 @@ def attack_user_ids(
             "tags": meta.get("tags", []),
         }
 
-
 # ============================================================
-#  XSS Targets (Ultra)
-# ============================================================
-def attack_xss_targets(
-    session: requests.Session,
-    base_url: str,
-    targets: List[Any],
-    log: Optional[LogFunc] = None,
-) -> Dict[str, Any]:
-
-    module_name = "XSS Targets"
-    meta = MODULE_FAMILIES.get(module_name, {})
-
-    cfg = _load_ultra_config()
-    results: List[Dict[str, Any]] = []
-
-    try:
-        for t in targets:
-            if isinstance(t, dict):
-                url = t.get("url") or base_url
-                payload = t.get("payload") or t.get("raw_payload") or "xss_test_ultra"
-                context = t.get("context") or "generic"
-                param_name = t.get("param") or t.get("parameter") or "x"
-            else:
-                url = base_url
-                payload = str(t)
-                context = "generic"
-                param_name = "x"
-
-            full_url = _merge_query_params(str(url), {str(param_name): str(payload)})
-            _safe_log(log, f"[XSS] GET ctx={context} url={full_url[:180]}…", "debug")
-
-            r, err = _request_get(session, full_url, None, cfg, log)
-            _pace(cfg)
-
-            if r is None:
-                results.append({
-                    "url": full_url,
-                    "base_url": url,
-                    "payload": payload,
-                    "param": param_name,
-                    "context": context,
-                    "error": err or "request_failed",
-                    "severity": "error",
-                })
-                continue
-
-            body = r.text or ""
-            reflected = str(payload) in body
-            dom_suspicious = any(k in body.lower() for k in _DOM_RISK)
-            waf = _waf_like(body)
-
-            results.append({
-                "url": full_url,
-                "base_url": url,
-                "payload": payload,
-                "param": param_name,
-                "context": context,
-                "status": r.status_code,
-                "reflected": reflected,
-                "length": len(body),
-                "dom_suspicious": dom_suspicious,
-                "waf_or_block_page": waf,
-                "severity": _classify_severity(
-                    r.status_code,
-                    reflected=reflected,
-                    waf_like=waf
-                ),
-            })
-
-        return {
-            "status": "ok",
-            "count": len(results),
-            "items": results,
-            "family": meta.get("family", "-"),
-            "risk": meta.get("risk", "-"),
-            "tags": meta.get("tags", []),
-        }
-
-    except Exception as e:
-        return {
-            "status": "error",
-            "count": 0,
-            "items": [],
-            "error": str(e),
-            "family": meta.get("family", "-"),
-            "risk": meta.get("risk", "-"),
-            "tags": meta.get("tags", []),
-        }
-
-
-# ============================================================
-#  Forms & Inputs (Ultra) — генерация тестовых данных для форм
+#  XSS Targets (Ultra) AGGRESSIVE MODULES 4.0
 # ============================================================
 def attack_forms_inputs(
     session: requests.Session,
@@ -692,77 +859,144 @@ def attack_forms_inputs(
     forms_data: List[Dict[str, Any]],
     log: Optional[LogFunc] = None,
 ) -> Dict[str, Any]:
+    """
+    AGGRESSIVE MODULES 4.0 — Forms & Inputs Scanner (Ultra‑Mode)
+
+    • реальний Red Team підхід до форм
+    • аналіз відображення полів (reflected / stored‑like)
+    • WAF‑aware / DOM‑aware / CSP‑aware (через контекст)
+    • entropy / pattern / risk / context / total_score / fingerprint
+    • heatmap‑готова структура для ThreatEngine / AttackEngine
+    """
 
     module_name = "Forms & Inputs"
     meta = MODULE_FAMILIES.get(module_name, {})
 
     cfg = _load_ultra_config()
+    results: List[Dict[str, Any]] = []
 
     try:
         from xss_security_gui.data_generator import generate_form_data
-
-        results: List[Dict[str, Any]] = []
 
         for form_info in forms_data:
             if isinstance(form_info, dict):
                 form_url = form_info.get("url", base_url)
                 fields = form_info.get("fields", [])
                 method = form_info.get("method", "POST").upper()
-            else:
+                context = form_info.get("context", "generic")
+        else:
                 form_url = base_url
                 fields = []
                 method = "POST"
+            context = "generic"
 
             if not fields:
-                # Если поля не указаны, генерируем стандартный набор
                 fields = ["name", "email", "password", "phone", "address", "credit_card"]
 
-            # Генерируем тестовые данные для формы
             test_data_list = generate_form_data(fields, count=5)
 
             for test_data in test_data_list:
-                # Отправляем тестовые данные на форму
                 try:
                     if method == "POST":
-                        response = session.post(form_url, data=test_data, timeout=cfg["timeout"])
+                        response = session.post(
+                            form_url,
+                            data=test_data,
+                            timeout=cfg["timeout"],
+                        )
                     else:
-                        # Для GET добавляем параметры в URL
                         params_url = _merge_query_params(form_url, test_data)
-                        response = session.get(params_url, timeout=cfg["timeout"])
+                        response = session.get(
+                            params_url,
+                            timeout=cfg["timeout"],
+                        )
 
                     _pace(cfg)
 
-                    body = _sample_body(response.text or "", cfg["max_body_sample"])
+                    body_full = response.text or ""
+                    body = _sample_body(body_full, cfg["max_body_sample"])
                     waf = _waf_like(body)
+                    body_lower = body.lower()
 
-                    # Проверяем, отражаются ли данные в ответе (потенциальная XSS)
-                    reflected_fields = []
+                    reflected_fields: List[str] = []
                     for field, value in test_data.items():
                         if str(value) in body:
                             reflected_fields.append(field)
 
-                    results.append({
+                    # ------------------------------
+                    # AGGRESSIVE ANALYTICS 4.0
+                    # ------------------------------
+                    entropy_score = len(set(body[:500]))
+                    pattern_score = (
+                        (3 if reflected_fields else 0) +
+                        (2 if "<script" in body_lower else 0) +
+                        (2 if "onerror" in body_lower or "onload" in body_lower else 0)
+                    )
+                    risk_score = (
+                        (3 if reflected_fields else 0) +
+                        (2 if waf else 0) +
+                        (2 if response.status_code >= 400 else 0)
+                    )
+                    context_score = (
+                        (2 if "login" in form_url.lower() or "auth" in form_url.lower() else 0) +
+                        (2 if "admin" in form_url.lower() else 0) +
+                        (1 if "api" in form_url.lower() else 0)
+                    )
+
+                    total_score = entropy_score + pattern_score + risk_score + context_score
+                    fingerprint = hash(
+                        (form_url + method + str(test_data) + body[:300])[:300]
+                    )
+
+                    severity = (
+                        "critical" if risk_score >= 3 else
+                        "high" if risk_score >= 2 else
+                        "medium" if reflected_fields else
+                        "low"
+                    )
+
+            results.append({
                         "form_url": form_url,
                         "method": method,
+                "context": context,
                         "test_data": test_data,
                         "status": response.status_code,
-                        "length": len(response.text or ""),
+                        "length": len(body_full),
                         "reflected_fields": reflected_fields,
                         "waf_or_block_page": waf,
-                        "severity": _classify_severity(
-                            response.status_code,
-                            reflected=bool(reflected_fields),
-                            waf_like=waf
-                        ),
+                        "severity": severity,
+
+                        # AGGRESSIVE ANALYTICS 4.0
+                        "entropy_score": entropy_score,
+                        "pattern_score": pattern_score,
+                        "risk_score": risk_score,
+                        "context_score": context_score,
+                        "total_score": total_score,
+                        "fingerprint": fingerprint,
                     })
 
                 except Exception as e:
+                    entropy_score = len(set(str(e)))
+                    pattern_score = 1
+                    risk_score = 3
+                    context_score = 0
+                    total_score = entropy_score + pattern_score + risk_score + context_score
+                    fingerprint = hash(str(e)[:200])
+
                     results.append({
                         "form_url": form_url,
                         "method": method,
+                        "context": context,
                         "test_data": test_data,
                         "error": str(e),
-                        "severity": "error",
+                "severity": "error",
+
+                        # AGGRESSIVE ANALYTICS 4.0
+                        "entropy_score": entropy_score,
+                        "pattern_score": pattern_score,
+                        "risk_score": risk_score,
+                        "context_score": context_score,
+                        "total_score": total_score,
+                        "fingerprint": fingerprint,
                     })
 
         return {
@@ -786,7 +1020,7 @@ def attack_forms_inputs(
         }
 
 # ============================================================
-#  CORS Misconfiguration Check (Ultra)
+#  CORS Misconfiguration Check (Ultra) AGGRESSIVE MODULES 4.0
 # ============================================================
 def attack_cors(
     session: requests.Session,
@@ -794,73 +1028,219 @@ def attack_cors(
     endpoints: List[str],
     log: Optional[LogFunc] = None,
 ) -> Dict[str, Any]:
+
     module_name = "CORS Misconfiguration"
     meta = MODULE_FAMILIES.get(module_name, {})
+
     cfg = _load_ultra_config()
     results: List[Dict[str, Any]] = []
 
+    # ---------------------------------------------------------
+    #  Red‑Team evil origins
+    # ---------------------------------------------------------
     evil_origins = [
         "https://evil.com",
-        "https://attacker.example.com",
+        "https://gazprombank.ru",
         "null",
         base_url.rstrip("/") + ".evil.com",
+        "https://sub." + base_url.replace("https://", "").replace("http://", ""),
+        "https://attacker." + base_url.replace("https://", "").replace("http://", ""),
     ]
 
     try:
-        test_urls = [base_url] + [_normalize_url(base_url, ep) for ep in (endpoints or [])[:20]]
+        # ---------------------------------------------------------
+        #  Тестуємо базовий URL + ендпоінти
+        # ---------------------------------------------------------
+        test_urls = [base_url] + [
+            _normalize_url(base_url, ep) for ep in (endpoints or [])[:20]
+        ]
+
         for url in test_urls:
             for origin in evil_origins:
+
                 hdr = _default_headers(cfg)
                 hdr["Origin"] = origin
+
                 r, err = _request_get(session, url, hdr, cfg, log)
                 _pace(cfg)
 
+                # ---------------------------------------------------------
+                #  Ошибка запроса
+                # ---------------------------------------------------------
                 if r is None:
-                    results.append({
-                        "url": url, "origin": origin,
-                        "error": err or "request_failed", "severity": "error",
-                    })
-                    continue
+                    entropy_score = len(set(str(err)))
+                    pattern_score = 1
+                    risk_score = 3
+                    context_score = 0
+                    total_score = entropy_score + pattern_score + risk_score + context_score
+                    fingerprint = hash(str(err)[:200])
 
+                    results.append({
+                        "url": url,
+                        "origin": origin,
+                        "error": err or "request_failed",
+                        "severity": "error",
+
+                        # AGGRESSIVE ANALYTICS 4.0
+                        "entropy_score": entropy_score,
+                        "pattern_score": pattern_score,
+                        "risk_score": risk_score,
+                        "context_score": context_score,
+                        "total_score": total_score,
+                        "fingerprint": fingerprint,
+            })
+            continue
+
+                # ---------------------------------------------------------
+                #  Анализ CORS‑заголовков
+                # ---------------------------------------------------------
                 acao = r.headers.get("Access-Control-Allow-Origin", "")
                 acac = r.headers.get("Access-Control-Allow-Credentials", "").lower()
+                acma = r.headers.get("Access-Control-Max-Age", "")
+                acex = r.headers.get("Access-Control-Expose-Headers", "")
+                acam = r.headers.get("Access-Control-Allow-Methods", "")
+                acah = r.headers.get("Access-Control-Allow-Headers", "")
+
                 misconfigured = False
                 details = []
 
+                # ---------------------------------------------------------
+                #  Wildcard origin
+                # ---------------------------------------------------------
                 if acao == "*":
                     misconfigured = True
                     details.append("wildcard_acao")
+
+                # ---------------------------------------------------------
+                #  Origin reflection
+                # ---------------------------------------------------------
                 if acao == origin and origin != base_url:
                     misconfigured = True
                     details.append("origin_reflected")
+
+                # ---------------------------------------------------------
+                #  Credentials + wildcard
+                # ---------------------------------------------------------
+                if acac == "true" and acao == "*":
+                    misconfigured = True
+                    details.append("credentials_with_wildcard")
+
+                # ---------------------------------------------------------
+                #  Credentials + any AC‑AO
+                # ---------------------------------------------------------
                 if acac == "true" and acao != "":
                     misconfigured = True
                     details.append("credentials_with_acao")
+
+                # ---------------------------------------------------------
+                #  Null origin allowed
+                # ---------------------------------------------------------
                 if acao == "null":
                     misconfigured = True
                     details.append("null_origin_allowed")
 
+                # ---------------------------------------------------------
+                #  Regex‑like origin matching (dangerous)
+                # ---------------------------------------------------------
+                if origin in acao and "*" in acao:
+                    misconfigured = True
+                    details.append("regex_like_origin_match")
+
+                # ---------------------------------------------------------
+                #  Substring origin matching (very dangerous)
+                # ---------------------------------------------------------
+                if origin.split(".")[0] in acao and acao != origin:
+                    misconfigured = True
+                    details.append("substring_origin_match")
+
+                # ---------------------------------------------------------
+                #  Overly permissive AC‑Methods
+                # ---------------------------------------------------------
+                if "GET" in acam and "POST" in acam and "PUT" in acam and "DELETE" in acam:
+                    misconfigured = True
+                    details.append("overly_permissive_methods")
+
+                # ---------------------------------------------------------
+                #  Overly permissive AC‑Headers
+                # ---------------------------------------------------------
+                if "*" in acah or "authorization" in acah.lower():
+                    misconfigured = True
+                    details.append("overly_permissive_headers")
+
+                # ---------------------------------------------------------
+                #  AGGRESSIVE ANALYTICS 4.0
+                # ---------------------------------------------------------
+        body = r.text or ""
+                entropy_score = len(set(body[:500]))
+
+                pattern_score = (
+                    (3 if misconfigured else 0) +
+                    (2 if "access-control" in body.lower() else 0)
+                )
+
+                risk_score = (
+                    (3 if misconfigured else 0) +
+                    (2 if acac == "true" else 0)
+                )
+
+                context_score = (
+                    (2 if "api" in url.lower() else 0) +
+                    (1 if origin != base_url else 0)
+                )
+
+                total_score = entropy_score + pattern_score + risk_score + context_score
+                fingerprint = hash((origin + url + acao)[:300])
+
+                severity = (
+                    "critical" if misconfigured and acac == "true" else
+                    "high" if misconfigured else
+                    "medium" if acao else
+                    "info"
+                )
+
                 results.append({
-                    "url": url, "origin": origin,
-                    "acao": acao, "acac": acac,
+                    "url": url,
+                    "origin": origin,
+                    "acao": acao,
+                    "acac": acac,
+                    "acma": acma,
+                    "acex": acex,
+                    "acam": acam,
+                    "acah": acah,
                     "misconfigured": misconfigured,
                     "details": details,
-                    "status": r.status_code,
-                    "severity": "critical" if misconfigured and acac == "true" else
-                                "high" if misconfigured else "info",
+            "status": r.status_code,
+                    "severity": severity,
+
+                    # AGGRESSIVE ANALYTICS 4.0
+                    "entropy_score": entropy_score,
+                    "pattern_score": pattern_score,
+                    "risk_score": risk_score,
+                    "context_score": context_score,
+                    "total_score": total_score,
+                    "fingerprint": fingerprint,
                 })
 
         return {
-            "status": "ok", "count": len(results), "items": results,
-            "family": meta.get("family", "-"), "risk": meta.get("risk", "-"),
+            "status": "ok",
+            "count": len(results),
+            "items": results,
+            "family": meta.get("family", "-"),
+            "risk": meta.get("risk", "-"),
             "tags": meta.get("tags", []),
         }
+
     except Exception as e:
         return {
-            "status": "error", "count": 0, "items": [], "error": str(e),
-            "family": meta.get("family", "-"), "risk": meta.get("risk", "-"),
+            "status": "error",
+            "count": 0,
+            "items": [],
+            "error": str(e),
+            "family": meta.get("family", "-"),
+            "risk": meta.get("risk", "-"),
             "tags": meta.get("tags", []),
         }
+
 
 
 # ============================================================
@@ -1285,7 +1665,7 @@ def attack_path_traversal(
                     "param": param, "payload": payload, "url": url,
                     "status": r.status_code,
                     "traversal_found": traversal_found,
-                    "length": len(body),
+            "length": len(body),
                     "severity": "critical" if traversal_found else "info",
                 })
 
@@ -1570,33 +1950,36 @@ class AutoModulesEngine:
     #  Run ALL modules (full scan)
     # -----------------------------
     def run_full_scan(
-        self,
-        session: requests.Session,
-        base_url: str,
-        endpoints: List[str] | None = None,
-        parameters: List[str] | None = None,
-        tokens: List[str] | None = None,
-        user_ids: List[Any] | None = None,
-        xss_targets: List[Any] | None = None,
-        forms_data: List[Dict[str, Any]] | None = None,
-        headers_list: List[Dict[str, str]] | None = None,
-        log: Optional[LogFunc] = None,
-        selected_modules: List[str] | None = None,
-        cancel_flag: Optional[Callable[[], bool]] = None,
+            self,
+            session: requests.Session,
+            base_url: str,
+            endpoints: Optional[List[str]] = None,
+            parameters: Optional[List[str]] = None,
+            tokens: Optional[List[str]] = None,
+            user_ids: Optional[List[Any]] = None,
+            xss_targets: Optional[List[Any]] = None,
+            forms_data: Optional[List[Dict[str, Any]]] = None,
+            headers_list: Optional[List[Dict[str, str]]] = None,
+            log: Optional[LogFunc] = None,
+            selected_modules: Optional[List[str]] = None,
+            cancel_flag: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         """
         Запускает все (или выбранные) модули последовательно.
         cancel_flag — callable, возвращающий True если нужно прервать.
         """
-        endpoints = endpoints or []
-        parameters = parameters or []
-        tokens = tokens or []
-        user_ids = user_ids or []
-        xss_targets = xss_targets or []
-        forms_data = forms_data or []
-        headers_list = headers_list or [{}]
 
-        all_modules = {
+        # --- Normalize inputs (Red Team safe) ---
+        endpoints = list(endpoints or [])
+        parameters = list(parameters or [])
+        tokens = list(tokens or [])
+        user_ids = list(user_ids or [])
+        xss_targets = list(xss_targets or [])
+        forms_data = list(forms_data or [])
+        headers_list = list(headers_list or [{}])
+
+        # --- Module registry (ULTRA‑MODE orchestration) ---
+        all_modules: Dict[str, Callable[[], Dict[str, Any]]] = {
             "Technology Fingerprint": lambda: self.run_fingerprint(session, base_url, log),
             "Security Headers Audit": lambda: self.run_security_headers(session, base_url, endpoints, log),
             "CORS Misconfiguration": lambda: self.run_cors(session, base_url, endpoints, log),
@@ -1612,25 +1995,30 @@ class AutoModulesEngine:
             "Forms & Inputs": lambda: self.run_forms_inputs(session, base_url, forms_data, log),
         }
 
-        if selected_modules:
-            modules_to_run = {k: v for k, v in all_modules.items() if k in selected_modules}
-        else:
-            modules_to_run = all_modules
+        # --- Filter selected modules ---
+        modules_to_run = (
+            {k: v for k, v in all_modules.items() if k in selected_modules}
+            if selected_modules else
+            all_modules
+        )
 
         scan_results: Dict[str, Any] = {}
         total = len(modules_to_run)
         done = 0
 
+        # --- Sequential execution ---
         for name, runner in modules_to_run.items():
             if cancel_flag and cancel_flag():
                 _safe_log(log, f"[SCAN] Отменено на модуле {name}", "warn")
                 break
+
             try:
-                _safe_log(log, f"[SCAN] ▶ {name} ({done+1}/{total})", "info")
+                _safe_log(log, f"[SCAN] ▶ {name} ({done + 1}/{total})", "info")
                 scan_results[name] = runner()
             except Exception as e:
                 scan_results[name] = {"status": "error", "error": str(e), "items": []}
                 _safe_log(log, f"[SCAN] ❌ {name}: {e}", "error")
+
             done += 1
 
         return {
@@ -1646,17 +2034,94 @@ class AutoModulesEngine:
     # -----------------------------
     def build_summary(self) -> Dict[str, Any]:
         """
-        Повертає ULTRA‑MODE summary по всіх запусках AutoModulesEngine.
+        ULTRA‑MODE Red Team Summary:
+        - severity distribution
+        - top‑risk modules
+        - entropy analysis
+        - ML‑prediction
+        - normalized heatmap
+        - threat score
+        - execution fingerprint
         """
-        summary = {
+
+        # -----------------------------
+        # Base summary
+        # -----------------------------
+        summary: Dict[str, Any] = {
             "heatmap": dict(self.heatmap),
             "ml_prediction": self.last_ml_prediction or "unavailable",
         }
 
+        # -----------------------------
+        # Severity distribution
+        # -----------------------------
+        severity_dist = {
+            "critical": 0,
+            "high": 0,
+            "medium": 0,
+            "low": 0,
+            "info": 0,
+            "error": 0,
+        }
+
+        for module_name, count in self.heatmap.items():
+            # We do not have per-item severity here,
+            # but we can approximate based on module risk.
+            module_risk = MODULE_FAMILIES.get(module_name, {}).get("risk", "info")
+            sev_norm = ThreatRisk.normalize(module_risk)
+            severity_dist[sev_norm] = severity_dist.get(sev_norm, 0) + count
+
+        summary["severity_distribution"] = severity_dist
+
+        # -----------------------------
+        # Top‑risk modules
+        # -----------------------------
+        top_risk = sorted(
+            self.heatmap.items(),
+            key=lambda kv: kv[1],
+            reverse=True
+        )[:5]
+
+        summary["top_risk_modules"] = [
+            {"module": name, "count": count}
+            for name, count in top_risk
+        ]
+
+        # -----------------------------
+        # Normalized heatmap
+        # -----------------------------
+        total_items = sum(self.heatmap.values()) or 1
+        summary["heatmap_normalized"] = {
+            k: round(v / total_items, 3)
+            for k, v in self.heatmap.items()
+        }
+
+        # -----------------------------
+        # Threat score (Red Team metric)
+        # -----------------------------
+        threat_score = (
+                severity_dist["critical"] * 5 +
+                severity_dist["high"] * 3 +
+                severity_dist["medium"] * 2 +
+                severity_dist["low"] * 1
+        )
+
+        summary["threat_score"] = threat_score
+
+        # -----------------------------
+        # Execution fingerprint
+        # -----------------------------
+        fingerprint_blob = json.dumps(summary, ensure_ascii=False)
+        summary["fingerprint"] = hash(fingerprint_blob[:500])
+
+        # -----------------------------
         # ML‑hook
+        # -----------------------------
         self._ml_classify(summary)
 
+        # -----------------------------
         # Event‑stream
+        # -----------------------------
         cb = self.on_event
         if callable(cb):
             try:
@@ -1665,3 +2130,4 @@ class AutoModulesEngine:
                 logger.exception("[AutoModulesEngine] on_event summary callback error")
 
         return summary
+

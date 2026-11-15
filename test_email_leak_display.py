@@ -29,9 +29,7 @@ def test_data_loader():
     
     loader = ThreatDataLoader()
     
-    if not loader.load():
-        print("[❌] Не удалось загрузить analyzer1.json")
-        return False
+    assert loader.load(), "Не удалось загрузить analyzer1.json"
     
     print(f"[✅] Загружено {len(loader.artifacts)} артефактов")
     
@@ -83,8 +81,6 @@ def test_data_loader():
     print(f"  Total events: {summary['total']}")
     print(f"  By severity: {summary['by_severity']}")
     print(f"  By category: {summary['by_category']}")
-    
-    return True
 
 
 def test_artifact_conversion():
@@ -95,15 +91,11 @@ def test_artifact_conversion():
     
     loader = ThreatDataLoader()
     
-    if not loader.load():
-        print("[❌] Не удалось загрузить analyzer1.json")
-        return False
+    assert loader.load(), "Не удалось загрузить analyzer1.json"
     
     email_leaks = loader.get_email_leaks()
     
-    if not email_leaks:
-        print("[❌] Email leaks не найдены")
-        return False
+    assert email_leaks, "Email leaks не найдены"
     
     artifact = email_leaks[0]
     gui_artifact = loader.convert_artifact_for_gui(artifact)
@@ -114,26 +106,22 @@ def test_artifact_conversion():
     print(f"  Risk: {gui_artifact.get('risk')}")
     print(f"  Module: {gui_artifact.get('module')}")
     
-    if "email_leak" in gui_artifact:
-        email_leak = gui_artifact["email_leak"]
-        print(f"\n  📧 Email Leak Data:")
-        print(f"     Emails: {len(email_leak.get('emails', []))}")
-        print(f"     SMTP Users: {len(email_leak.get('smtp_users', []))}")
-        print(f"     SMTP Passwords: {len(email_leak.get('smtp_passwords', []))}")
-        
-        # Проверяем структуру data
-        emails = email_leak.get('emails', [])
-        users = email_leak.get('smtp_users', [])
-        passwords = email_leak.get('smtp_passwords', [])
-        
-        if emails and users and passwords:
-            print(f"\n  ✅ Структура корректна для отображения в Threat Tab")
-            return True
-        else:
-            print(f"\n  ❌ Структура неполная")
-            return False
+    assert "email_leak" in gui_artifact, "email_leak not in artifact"
     
-    return False
+    email_leak = gui_artifact["email_leak"]
+    print(f"\n  📧 Email Leak Data:")
+    print(f"     Emails: {len(email_leak.get('emails', []))}")
+    print(f"     SMTP Users: {len(email_leak.get('smtp_users', []))}")
+    print(f"     SMTP Passwords: {len(email_leak.get('smtp_passwords', []))}")
+    
+    # Проверяем структуру data
+    emails = email_leak.get('emails', [])
+    users = email_leak.get('smtp_users', [])
+    passwords = email_leak.get('smtp_passwords', [])
+    
+    assert emails and users and passwords, "Структура неполная"
+    
+    print(f"\n  ✅ Структура корректна для отображения в Threat Tab")
 
 
 def test_json_structure():
@@ -144,9 +132,7 @@ def test_json_structure():
     
     loader = ThreatDataLoader()
     
-    if not loader.load():
-        print("[❌] Не удалось загрузить analyzer1.json")
-        return False
+    assert loader.load(), "Не удалось загрузить analyzer1.json"
     
     print(f"\n[✅] JSON Структура:")
     print(f"  Root keys: {list(loader.data.keys())}")
@@ -168,14 +154,9 @@ def test_json_structure():
         if not isinstance(result, dict):
             errors.append(f"Artifact #{i}: result is not dict")
     
-    if errors:
-        print(f"\n[❌] Ошибки в структуре:")
-        for err in errors:
-            print(f"  - {err}")
-        return False
+    assert not errors, f"Ошибки в структуре: {errors}"
     
     print(f"\n[✅] Все {len(loader.artifacts)} артефактов имеют правильную структуру")
-    return True
 
 
 def test_email_leak_rendering():
@@ -186,15 +167,11 @@ def test_email_leak_rendering():
     
     loader = ThreatDataLoader()
     
-    if not loader.load():
-        print("[❌] Не удалось загрузить analyzer1.json")
-        return False
+    assert loader.load(), "Не удалось загрузить analyzer1.json"
     
     email_leaks = loader.get_email_leaks()
     
-    if not email_leaks:
-        print("[❌] Email leaks не найдены")
-        return False
+    assert email_leaks, "Email leaks не найдены"
     
     artifact = email_leaks[0]
     gui_artifact = loader.convert_artifact_for_gui(artifact)
@@ -245,7 +222,6 @@ def test_email_leak_rendering():
     print(f"        └── Length")
     
     print(f"\n[✅] Симуляция успешна")
-    return True
 
 
 def main():
@@ -265,8 +241,12 @@ def main():
     
     for name, test_func in tests:
         try:
-            result = test_func()
-            results[name] = "✅ PASS" if result else "❌ FAIL"
+            test_func()
+            results[name] = "✅ PASS"
+        except AssertionError as e:
+            results[name] = f"❌ FAIL: {e}"
+            import traceback
+            traceback.print_exc()
         except Exception as e:
             results[name] = f"❌ ERROR: {e}"
             import traceback
@@ -285,15 +265,18 @@ def main():
     
     print(f"\n  Total: {passed}/{total} passed")
     
-    if passed == total:
-        print("\n[🎉] Все тесты пройдены! GUI готов к отображению email leak.")
-        return True
-    else:
-        print("\n[❌] Некоторые тесты не пройдены.")
-        return False
+    assert passed == total, f"Некоторые тесты не пройдены: {passed}/{total}"
+    
+    print("\n[🎉] Все тесты пройдены! GUI готов к отображению email leak.")
 
 
 if __name__ == "__main__":
-    success = main()
-    sys.exit(0 if success else 1)
+    try:
+        main()
+        sys.exit(0)
+    except AssertionError:
+        sys.exit(1)
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        sys.exit(1)
 

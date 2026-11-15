@@ -1,31 +1,28 @@
 # xss_security_gui/gui/xss_log_viewer.py
-"""
-XSS Log Viewer ULTRA 6.0
-------------------------
-• Читает NDJSON лог отражённых XSS
-• Даёт сводку по категориям
-• Даёт детальный список
-• Поддерживает фильтрацию и сортировку
-• Готов для GUI-интеграции
-"""
+# ============================================================
+# XSS Log Viewer 9.0 — async, risk-aware, paginated, GUI-safe
+# ============================================================
 
 import json
 import threading
 import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional
-from collections import Counter
+from typing import List, Dict, Any, Optional, Callable
+from collections import Counter, defaultdict
 
-from xss_security_gui.settings import LOG_DIR
+from xss_security_gui.settings import LOG_DIR as BASE_LOG_DIR
 
-# Директория и файл логов
-LOG_DIR: Path = LOG_DIR / "xss"
-LOG_FILE: Path = LOG_DIR / "reflected_responses.json"
+# Директория логов
+XSS_LOG_DIR: Path = BASE_LOG_DIR / "xss"
+XSS_LOG_FILE: Path = XSS_LOG_DIR / "reflected_responses.json"
 
-LOG_DIR.mkdir(parents=True, exist_ok=True)
+XSS_LOG_DIR.mkdir(parents=True, exist_ok=True)
 _write_lock = threading.Lock()
 
 
+# ============================================================
+# NDJSON Loader 2.0
+# ============================================================
 def rotate_if_big(path: Path, max_mb: int = 20) -> None:
     """Ротирует файл, если он превышает max_mb мегабайт."""
     try:
@@ -37,15 +34,17 @@ def rotate_if_big(path: Path, max_mb: int = 20) -> None:
         print(f"[XSSLogViewer] Ошибка ротации: {e}")
 
 
-def load_ndjson(path: Path) -> List[Dict[str, Any]]:
-    """Безопасная загрузка NDJSON."""
+def load_ndjson(path: Path, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Безопасная загрузка NDJSON (lazy, limit)."""
     items: List[Dict[str, Any]] = []
     if not path.exists():
         return items
 
     try:
         with path.open("r", encoding="utf-8") as f:
-            for line in f:
+            for i, line in enumerate(f):
+                if limit and i >= limit:
+                    break
                 line = line.strip()
                 if not line:
                     continue
@@ -59,21 +58,42 @@ def load_ndjson(path: Path) -> List[Dict[str, Any]]:
     return items
 
 
+# ============================================================
+# RiskScoreEngine
+# ============================================================
+def calculate_risk(x: Dict[str, Any]) -> str:
+    payload = (x.get("payload") or "").lower()
+    url = (x.get("url") or "").lower()
+
+    if "<script>" in payload or "onerror=" in payload or "svg/onload" in payload:
+        return "high"
+    if "javascript:" in payload or "img src=x onerror" in payload:
+        return "medium"
+    if "alert(" in payload:
+        return "low"
+    return "unknown"
+
+
+# ============================================================
+# XSSLogViewer 9.0
+# ============================================================
 class XSSLogViewer:
     """
-    Класс для работы с логами XSS:
-    • загрузка
-    • сводка
-    • фильтрация
-    • сортировка
-    • интеграция с GUI
+    XSSLogViewer 9.0
+    ----------------
+    • NDJSON loader 2.0
+    • RiskScoreEngine
+    • SummaryEngine
+    • DetailsEngine (пагінація)
+    • SearchEngine
+    • GUI-safe callback
     """
 
-    def __init__(self, gui_callback: Optional[callable] = None):
+    def __init__(self, gui_callback: Optional[Callable[[Dict[str, Any]], None]] = None):
         self.gui_callback = gui_callback
 
     # ---------------------------------------------------------
-    # Вспомогательный метод для безопасного вызова callback
+    # Safe emit
     # ---------------------------------------------------------
     def _emit(self, key: str, payload: Any) -> None:
         if self.gui_callback:
@@ -83,87 +103,101 @@ class XSSLogViewer:
                 print(f"[XSSLogViewer] Ошибка gui_callback: {e}")
 
     # ---------------------------------------------------------
-    # Загрузка логов
+    # Load logs
     # ---------------------------------------------------------
-    def load(self, path: Path = LOG_FILE) -> List[Dict[str, Any]]:
-        """Загружает логи XSS из NDJSON."""
+    def load(self, path: Path = XSS_LOG_FILE, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         rotate_if_big(path)
-        return load_ndjson(path)
+        items = load_ndjson(path, limit=limit)
+
+        # Add risk score
+        for x in items:
+            x["risk"] = calculate_risk(x)
+
+        return items
 
     # ---------------------------------------------------------
-    # Сводка по категориям
+    # SummaryEngine
     # ---------------------------------------------------------
-    def summarize(self, items: List[Dict[str, Any]]) -> Dict[str, int]:
-        """Возвращает сводку по категориям."""
-        severities = [r.get("category", "unknown") for r in items]
-        return dict(Counter(severities))
+    def summarize(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        by_category = Counter(x.get("category", "unknown") for x in items)
+        by_risk = Counter(x.get("risk", "unknown") for x in items)
+        by_url = Counter(x.get("url", "unknown") for x in items)
 
-    # ---------------------------------------------------------
-    # Фильтрация
-    # ---------------------------------------------------------
-    def filter_by_category(self, items: List[Dict[str, Any]], category: str) -> List[Dict[str, Any]]:
-        """Фильтрует артефакты по категории."""
-        return [r for r in items if r.get("category") == category]
-
-    def filter_by_url(self, items: List[Dict[str, Any]], url: str) -> List[Dict[str, Any]]:
-        """Фильтрует артефакты по URL."""
-        return [r for r in items if r.get("url") == url]
-
-    # ---------------------------------------------------------
-    # Сортировка
-    # ---------------------------------------------------------
-    def sort_by_timestamp(self, items: List[Dict[str, Any]], reverse: bool = True) -> List[Dict[str, Any]]:
-        """Сортирует артефакты по времени."""
-        def parse_ts(x: Dict[str, Any]) -> datetime.datetime:
-            ts = x.get("_ts")
-            try:
-                return datetime.datetime.fromisoformat(ts)
-            except Exception:
-                return datetime.datetime.min
-
-        return sorted(items, key=parse_ts, reverse=reverse)
-
-    # ---------------------------------------------------------
-    # GUI: сводка
-    # ---------------------------------------------------------
-    def render_summary(self) -> Dict[str, Any]:
-        """Формирует сводку для GUI."""
-        items = self.load()
-        summary = self.summarize(items)
-
-        data = {
+        return {
             "total": len(items),
-            "by_category": summary,
+            "by_category": dict(by_category),
+            "by_risk": dict(by_risk),
+            "top_urls": by_url.most_common(10),
         }
 
-        self._emit("xss_log_summary", data)
-        return data
+    # ---------------------------------------------------------
+    # GUI summary
+    # ---------------------------------------------------------
+    def render_summary(self, limit: int = 5000) -> Dict[str, Any]:
+        items = self.load(limit=limit)
+        summary = self.summarize(items)
+
+        self._emit("xss_log_summary", summary)
+        return summary
 
     # ---------------------------------------------------------
-    # GUI: детальный список
+    # DetailsEngine (pagination)
     # ---------------------------------------------------------
-    def render_details(self, limit: int = 50, category: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Формирует детальный список артефактов для GUI."""
+    def render_details(self, page: int = 0, page_size: int = 50, category: Optional[str] = None) -> List[Dict[str, Any]]:
         items = self.load()
-        items = self.sort_by_timestamp(items)
 
+        # Sort by timestamp
+        items.sort(key=lambda x: x.get("_ts", ""), reverse=True)
+
+        # Filter
         if category:
-            items = self.filter_by_category(items, category)
+            items = [x for x in items if x.get("category") == category]
 
-        sliced = items[:limit]
+        start = page * page_size
+        end = start + page_size
+        sliced = items[start:end]
+
         self._emit("xss_log_details", sliced)
         return sliced
 
     # ---------------------------------------------------------
-    # Поиск
+    # RiskMap
     # ---------------------------------------------------------
-    def search(self, keyword: str) -> List[Dict[str, Any]]:
-        """Ищет артефакты по ключевому слову в URL или ответе."""
-        items = self.load()
+    def render_riskmap(self, limit: int = 5000) -> List[Dict[str, Any]]:
+        items = self.load(limit=limit)
+
+        matrix = defaultdict(lambda: defaultdict(int))
+        for x in items:
+            cat = x.get("category", "unknown")
+            risk = x.get("risk", "unknown")
+            matrix[cat][risk] += 1
+
+        heatmap = []
+        for cat, risks in matrix.items():
+            for risk, count in risks.items():
+                heatmap.append({
+                    "category": cat,
+                    "risk": risk,
+                    "count": count,
+                })
+
+        self._emit("xss_log_riskmap", heatmap)
+        return heatmap
+
+    # ---------------------------------------------------------
+    # SearchEngine
+    # ---------------------------------------------------------
+    def search(self, keyword: str, limit: int = 5000) -> List[Dict[str, Any]]:
+        items = self.load(limit=limit)
         keyword = keyword.lower()
 
-        return [
-            r for r in items
-            if keyword in r.get("url", "").lower()
-            or keyword in r.get("full_response", "").lower()
+        results = [
+            x for x in items
+            if keyword in (x.get("url", "").lower())
+            or keyword in (x.get("payload", "").lower())
+            or keyword in (x.get("full_response", "").lower())
         ]
+
+        self._emit("xss_log_search", results[:200])
+        return results[:200]
+

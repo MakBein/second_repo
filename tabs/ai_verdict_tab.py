@@ -1,18 +1,28 @@
-# xss_security_gui/ai_verdict_tab.py
+# xss_security_gui/ai_verdict_tab.py (SAFE MODE 20.0)
+
 import tkinter as tk
 from tkinter import ttk
 from typing import Dict, Any, List, Optional
 import queue
 import threading
 
+from xss_security_gui.settings import (
+    AI_SAFE_MODE,
+    AI_FALLBACK_ON_ERROR,
+)
+
 from xss_security_gui.ai_core.risk_engine import analyze_security_risk
 from xss_security_gui.js_inspector import extract_js_insights
 
 
+# ============================================================
+#  Worker (SAFE MODE)
+# ============================================================
+
 class AIVerdictWorker(threading.Thread):
     """
-    Окремий воркер-потік для AI-аналізу, щоб не блокувати GUI.
-    Приймає задачі через чергу, повертає результати через іншу чергу.
+    Окремий воркер-потік для AI-аналізу.
+    SAFE MODE гарантує, що GUI не впаде.
     """
 
     def __init__(self, task_queue: "queue.Queue[Dict[str, Any]]", result_queue: "queue.Queue[Dict[str, Any]]"):
@@ -35,8 +45,24 @@ class AIVerdictWorker(threading.Thread):
                     js_insights = extract_js_insights(raw_js)
                     result = analyze_security_risk(js_insights, raw_js)
                     result["task_id"] = task_id
+
                 except Exception as e:
-                    result = {"task_id": task_id, "error": str(e)}
+                    print(f"[AI Core] AIVerdictWorker error: {e}")
+
+                    if AI_SAFE_MODE or AI_FALLBACK_ON_ERROR:
+                        result = {
+                            "task_id": task_id,
+                            "error": f"AI SAFE MODE: {e}",
+                            "risk_score": 0.0,
+                            "risk_level": "info",
+                            "ml_score": 0.0,
+                            "nn_score": 0.0,
+                            "heuristic_score": 0.0,
+                            "entropy": 0.0,
+                            "complexity": 0.0,
+                        }
+                    else:
+                        raise
 
                 self._results.put(result)
 
@@ -45,41 +71,46 @@ class AIVerdictWorker(threading.Thread):
         self._tasks.put({"type": "__STOP__"})
 
 
+# ============================================================
+#  AI Verdict Tab (SAFE MODE)
+# ============================================================
+
 class AIVerdictTab(ttk.Frame):
     """
     Вкладка AI Verdict:
-    - приймає JS-код
-    - ганяє через AI Core (risk_engine)
-    - показує результати в таблиці
-    - має сортування, фільтри, кольорові рівні ризику
+    - асинхронний AI-аналіз
+    - SAFE MODE: GUI ніколи не падає
+    - кольорові рівні ризику
+    - сортування, фільтри, прогрес
     """
 
     def __init__(self, master: tk.Misc, **kwargs):
         super().__init__(master, **kwargs)
 
-        # === Черги для воркера ===
+        # Черги
         self._task_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         self._result_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
 
-        # === Воркер ===
+        # Worker
         self._worker = AIVerdictWorker(self._task_queue, self._result_queue)
         self._worker.start()
 
-        # === Стан ===
+        # Стан
         self._next_task_id = 1
         self._current_filter_level: Optional[str] = None
         self._sort_desc = True
 
-        # === UI ===
+        # UI
         self._build_ui()
 
-        # === Пулінг результатів ===
+        # Polling
         self._poll_results()
 
-    # ------------------------------------------------------------------ UI
+    # ============================================================
+    #  UI
+    # ============================================================
 
     def _build_ui(self) -> None:
-        # Верхня панель: кнопки, фільтри, статус
         top_frame = ttk.Frame(self)
         top_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
 
@@ -100,34 +131,22 @@ class AIVerdictTab(ttk.Frame):
         filter_combo.bind("<<ComboboxSelected>>", self._on_filter_changed)
 
         self.status_var = tk.StringVar(value="Idle")
-        status_label = ttk.Label(top_frame, textvariable=self.status_var)
-        status_label.pack(side=tk.RIGHT)
+        ttk.Label(top_frame, textvariable=self.status_var).pack(side=tk.RIGHT)
 
-        # Прогрес-індикатор
+        # Progress
         self.progress = ttk.Progressbar(top_frame, mode="indeterminate", length=120)
         self.progress.pack(side=tk.RIGHT, padx=(0, 10))
 
-        # Основна таблиця
+        # Table
         columns = ("risk_score", "risk_level", "ml_score", "nn_score", "heuristic_score", "entropy", "complexity")
         self.tree = ttk.Treeview(self, columns=columns, show="headings", height=12)
         self.tree.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        self.tree.heading("risk_score", text="Risk", command=lambda: self._sort_by("risk_score"))
-        self.tree.heading("risk_level", text="Level", command=lambda: self._sort_by("risk_level"))
-        self.tree.heading("ml_score", text="ML", command=lambda: self._sort_by("ml_score"))
-        self.tree.heading("nn_score", text="NN", command=lambda: self._sort_by("nn_score"))
-        self.tree.heading("heuristic_score", text="Heur", command=lambda: self._sort_by("heuristic_score"))
-        self.tree.heading("entropy", text="Entropy", command=lambda: self._sort_by("entropy"))
-        self.tree.heading("complexity", text="Complex", command=lambda: self._sort_by("complexity"))
-
         for col in columns:
+            self.tree.heading(col, text=col, command=lambda c=col: self._sort_by(c))
             self.tree.column(col, width=80, anchor=tk.CENTER)
 
-        # Кольорові стилі для рівнів ризику
-        style = ttk.Style(self)
-        style.map("Treeview", foreground=self._map_treeview_color)
-
-        # Нижній блок: деталі / reasons
+        # Details
         bottom_frame = ttk.Frame(self)
         bottom_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=(0, 5))
 
@@ -138,36 +157,20 @@ class AIVerdictTab(ttk.Frame):
 
         self.tree.bind("<<TreeviewSelect>>", self._on_row_selected)
 
-        # Локальний кеш результатів: task_id -> result
         self._results_by_id: Dict[str, Dict[str, Any]] = {}
 
-    # ------------------------------------------------------------------ Color mapping
-
-    def _map_treeview_color(self, *_):
-        # ttk.Style.map callback не дає доступу до item, тому робимо через tags
-        # а тут просто повертаємо дефолт
-        return [("!disabled", "black")]
-
-    # ------------------------------------------------------------------ Public API
+    # ============================================================
+    #  Events
+    # ============================================================
 
     def analyze_js_snippet(self, raw_js: str) -> None:
-        """
-        Публічний метод: ти можеш викликати його з інших вкладок,
-        передаючи JS-код для аналізу.
-        """
         self._enqueue_task(raw_js)
-
-    # ------------------------------------------------------------------ Events
 
     def _on_analyze_clicked(self) -> None:
-        # Тут ти можеш взяти JS з іншого віджета (наприклад, з редактора)
-        # Для прикладу — простий input dialog або зовнішній виклик.
-        # Зараз просто заглушка:
         from tkinter import simpledialog
         raw_js = simpledialog.askstring("Analyze JS", "Встав JS-код для аналізу:")
-        if not raw_js:
-            return
-        self._enqueue_task(raw_js)
+        if raw_js:
+            self._enqueue_task(raw_js)
 
     def _on_filter_changed(self, _event=None) -> None:
         value = self.filter_var.get()
@@ -178,31 +181,30 @@ class AIVerdictTab(ttk.Frame):
         sel = self.tree.selection()
         if not sel:
             return
-        item_id = sel[0]
-        task_id = self.tree.set(item_id, "risk_score")  # не дуже, краще зберігати окремо
-        # Ми збережемо task_id в item tags або values — зробимо простіше:
-        task_id = self.tree.item(item_id, "text")
-        if not task_id:
-            return
 
+        item_id = sel[0]
+        task_id = self.tree.item(item_id, "text")
         result = self._results_by_id.get(task_id)
-        if not result:
-            return
 
         self.details_text.delete("1.0", tk.END)
 
-        if "error" in result:
-            self.details_text.insert(tk.END, f"[AI ERROR] {result['error']}\n")
+        if not result:
             return
 
-        self.details_text.insert(tk.END, f"Risk: {result.get('risk_score', 0.0):.2f} ({result.get('risk_level')})\n\n")
+        if "error" in result:
+            self.details_text.insert(tk.END, f"[AI SAFE MODE] {result['error']}\n")
+            return
+
+        self.details_text.insert(tk.END, f"Risk: {result['risk_score']:.2f} ({result['risk_level']})\n\n")
         self.details_text.insert(tk.END, "Summary:\n")
         self.details_text.insert(tk.END, result.get("llm_summary", "") + "\n\n")
         self.details_text.insert(tk.END, "Reasons:\n")
         for r in result.get("llm_reasons", []):
             self.details_text.insert(tk.END, f" - {r}\n")
 
-    # ------------------------------------------------------------------ Task handling
+    # ============================================================
+    #  Task handling
+    # ============================================================
 
     def _enqueue_task(self, raw_js: str) -> None:
         task_id = f"T{self._next_task_id}"
@@ -235,52 +237,38 @@ class AIVerdictTab(ttk.Frame):
         self.status_var.set(f"Done {task_id}")
 
         if "error" in result:
-            # можна показати в таблиці як окремий рядок з error
-            self._insert_row(task_id, {
-                "risk_score": 0.0,
-                "risk_level": "info",
-                "ml_score": 0.0,
-                "nn_score": 0.0,
-                "heuristic_score": 0.0,
-                "entropy": 0.0,
-                "complexity": 0.0,
-            }, error=True)
+            self._insert_row(task_id, result, error=True)
             return
 
         self._insert_row(task_id, result)
         self._refilter_tree()
 
-    # ------------------------------------------------------------------ Tree helpers
+    # ============================================================
+    #  Tree helpers
+    # ============================================================
 
     def _insert_row(self, task_id: str, result: Dict[str, Any], error: bool = False) -> None:
         score = result.get("risk_score", 0.0)
         level = result.get("risk_level", "info")
-        ml = result.get("ml_score", 0.0)
-        nn = result.get("nn_score", 0.0)
-        heuristic = result.get("heuristic_score", 0.0)
-        entropy = result.get("entropy", 0.0)
-        complexity = result.get("complexity", 0.0)
 
-        values = (f"{score:.2f}", level, f"{ml:.2f}", f"{nn:.2f}", f"{heuristic:.2f}", f"{entropy:.2f}", f"{complexity:.2f}")
+        values = (
+            f"{score:.2f}",
+            level,
+            f"{result.get('ml_score', 0.0):.2f}",
+            f"{result.get('nn_score', 0.0):.2f}",
+            f"{result.get('heuristic_score', 0.0):.2f}",
+            f"{result.get('entropy', 0.0):.2f}",
+            f"{result.get('complexity', 0.0):.2f}",
+        )
 
-        tags: List[str] = []
-        if error:
-            tags.append("error")
-        else:
-            tags.append(f"level_{level}")
+        tags = ["error"] if error else [f"level_{level}"]
 
         item_id = self.tree.insert("", tk.END, text=task_id, values=values, tags=tags)
 
-        # Кольори через tags
-        if level == "high":
-            self.tree.tag_configure("level_high", foreground="red")
-        elif level == "medium":
-            self.tree.tag_configure("level_medium", foreground="orange")
-        elif level == "low":
-            self.tree.tag_configure("level_low", foreground="green")
-        elif level == "info":
-            self.tree.tag_configure("level_info", foreground="gray")
-
+        self.tree.tag_configure("level_high", foreground="red")
+        self.tree.tag_configure("level_medium", foreground="orange")
+        self.tree.tag_configure("level_low", foreground="green")
+        self.tree.tag_configure("level_info", foreground="gray")
         self.tree.tag_configure("error", foreground="red")
 
         return item_id
@@ -289,14 +277,9 @@ class AIVerdictTab(ttk.Frame):
         level_filter = self._current_filter_level
 
         for item in self.tree.get_children(""):
-            if level_filter is None:
-                self.tree.item(item, open=True)
-                self.tree.detach(item)
-                self.tree.move(item, "", "end")
-                continue
-
             level = self.tree.set(item, "risk_level")
-            if level == level_filter:
+
+            if level_filter is None or level == level_filter:
                 self.tree.detach(item)
                 self.tree.move(item, "", "end")
             else:
@@ -320,7 +303,9 @@ class AIVerdictTab(ttk.Frame):
         for idx, item_id in enumerate(items):
             self.tree.move(item_id, "", idx)
 
-    # ------------------------------------------------------------------ Cleanup
+    # ============================================================
+    #  Cleanup
+    # ============================================================
 
     def destroy(self) -> None:
         try:
@@ -328,4 +313,5 @@ class AIVerdictTab(ttk.Frame):
         except Exception:
             pass
         super().destroy()
+
 

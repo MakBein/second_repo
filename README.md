@@ -26,10 +26,57 @@
 - 📁 Живые логи и генерация отчетов (TXT / PDF)
 - 🛠️ GUI JSON-редактор настроек и базы атак
 
+## AutoRecon: область запуска и результаты
+
+Реальные сетевые проверки AutoRecon выключены по умолчанию. Чтобы запускать их
+против систем, на проверку которых у вас есть разрешение, явно включите режим и
+задайте allowlist. Например, в PowerShell:
+
+```powershell
+$env:XSS_AUTORECON_ALLOW_REAL_RUN = "true"
+$env:XSS_AUTORECON_ALLOWED_TARGETS = "127.0.0.1,localhost"
+python main.py tk
+```
+
+Настройки также можно задать в `configs/settings.json`:
+
+```json
+{
+  "autorecon": {
+    "allow_real_run": true,
+    "allowed_targets": ["127.0.0.1", "localhost"]
+  }
+}
+```
+
+Оставляйте в списке только собственные или явно согласованные цели. Проверка
+области применяется и в AutoRecon, и во Flooder; редиректы ограничены origin
+цели. Flooder ограничен 200 запросами за запуск и требует авторизованную цель.
+Каталог проверочных payload-ов не меняется.
+
+Во время AutoRecon вкладка показывает временные отметки, прогресс этапов и
+подробные результаты. После завершения JSON- и HTML-отчёты сохраняются в
+`exports/`; HTML-отчёт содержит сводку рисков, findings, результаты этапов и
+метрики. Ошибки этапов отображаются вместе с уже собранными частичными
+результатами.
+
 🧱 Структура проекта xss_security_gui
 
 xss_security_gui/
-├── assets/                          # Статические ресурсы (иконки, изображения)
+├── assets/                                 # Статические ресурсы (иконки, изображения)
+│
+├── ai_core/
+│        __init__.py                        # єдина точка входу в AI-ядро
+│        train_nn_model.py                  # твій повний пайплайн тренування (XGBoost + synthetic)
+│        synthetic_xss.py                   # бібліотека синтетичних XSS-патернів
+│        features.py                        # побудова фіч
+│        js_inspector.py                    # розбір JS / XSS-поведінки
+│        ml_model.py                        # (опційно) обгортка для завантаження/інференсу
+│        model_store/
+│            nn_model_trained.joblib
+│            training_report.json
+│            ai_training.log
+│
 │
 ├── auto_recon/                      # Автоматизированное сканирование
 │   ├── assets/
@@ -211,7 +258,7 @@ pip install -r requirements.txt
 python main.py
 
 Пример запуска only GUI:
-python -m xss_security_gui.main
+python -m xss_security_gui.main tk
 
 Пример запуска краулера CLI&GUI:
 python -m xss_security_gui.main crawl <url>

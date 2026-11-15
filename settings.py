@@ -35,13 +35,17 @@ ALLOWED_TARGETS = [
 # ============================================================
 #  Базовые директории
 # ============================================================
+# Корінь проєкту
+BASE_DIR = Path(__file__).resolve().parent
 
-BASE_DIR: Path = Path(__file__).parent.resolve()
 LOG_DIR: Path = BASE_DIR / "logs"
 EXPORT_DIR: Path = BASE_DIR / "exports"
 PDF_DIR: Path = EXPORT_DIR / "reports"
 PAYLOADS_DIR: Path = BASE_DIR / "payloads"
 CONFIG_DIR: Path = BASE_DIR / "configs"
+# Папки
+AI_CORE_DIR: Path = BASE_DIR / "ai_core"
+MODEL_STORE_DIR: Path =  AI_CORE_DIR / "model_store"
 
 
 for d in (LOG_DIR, EXPORT_DIR, PDF_DIR, PAYLOADS_DIR, CONFIG_DIR):
@@ -72,6 +76,23 @@ if SETTINGS_JSON_PATH.exists():
     except Exception as e:
         print(f"[Settings] Ошибка загрузки settings.json: {e}")
         SETTINGS_JSON = {}
+
+# ============================================================
+#  AI Core Safe Mode (запобігає падінню GUI)
+# ============================================================
+
+
+
+# Шлях до моделі
+AI_MODEL_PATH = MODEL_STORE_DIR / "nn_model_trained.joblib"
+
+
+# SAFE MODE
+AI_SAFE_MODE = True
+AI_FALLBACK_ON_ERROR = True
+AI_DISABLE_ML = False
+AI_DISABLE_NN = False
+AI_DISABLE_LLM = False
 
 # ============================================================
 #  Автоопределение окружения
@@ -202,6 +223,16 @@ class Settings:
                 "crawl.max_api_endpoints": 200,
                 "crawl.domains_whitelist": [],
                 "crawl.error_log": str(LOG_DIR / "crawler_errors.log"),
+                # Anti-detection / Super Crawler
+                "anti_detection.tls_spoofing": True,
+                "anti_detection.playwright_stealth": True,
+                "anti_detection.dns_over_https": False,
+                "anti_detection.geo_ip_rotation": False,
+                "anti_detection.chrome_fingerprint": True,
+                "anti_detection.multi_session": True,
+                "anti_detection.auto_retry": True,
+                "anti_detection.use_tls_client": False,
+                "anti_detection.use_anti_detection_session": False,
                 # Crawler / JS detection
                 "crawler.enable_graphql_detection": True,
                 "js.enable_dynamic_detection": True,
@@ -218,6 +249,26 @@ class Settings:
                 "http.default_user_agent": "XSS-Security-GUI/6.5",
                 "http.aggressive_headers": True,
                 "http.proxies": None,
+                "http.verify_ssl": False,
+                # Auto-modules (auto_modules.auto_modules — Ultra HTTP)
+                "attack.auto_module_delay": None,
+                "attack.max_body_sample": 400_000,
+                "attack.request_retries": 2,
+                "attack.max_auto_endpoints": 500,
+                "attack.max_token_attempts": 80,
+                "attack.max_auth_header_variants": 3,
+                "attack.user_id_param_names": None,
+                "attack.waf_evasion": True,
+                "attack.waf_auto_scan": True,
+                "attack.waf_max_attempts": 8,
+                # RealTimeWatcher adaptive retry
+                "watcher.retry_max_attempts": 5,
+                "watcher.retry_base_timeout": 8.0,
+                "watcher.retry_backoff_base": 0.6,
+                "watcher.retry_backoff_cap": 15.0,
+                "watcher.retry_jitter": 0.35,
+                "watcher.locale_ru_rotation": True,
+                "watcher.locale_ru_weight": 0.55,
                 # IDOR
                 "idor.delay": 0.5,
                 # LFI
@@ -265,7 +316,17 @@ class Settings:
                     "access denied",
                     "firewall",
                     "request rejected",
+                    "cloudflare",
+                    "incapsula",
+                    "akamai",
+                    "perimeterx",
+                    "captcha",
+                    "rate limit",
                 ],
+                "sqli.waf_evasion_default": True,
+                "sqli.try_post_default": True,
+                "sqli.inter_attempt_delay": 0.05,
+                "sqli.max_workers": 5,
                 # SSRF
                 "ssrf.body_indicators": [
                     "169.254.",
@@ -368,6 +429,18 @@ class Settings:
         return v
 
 
+    def __getitem__(self, key: str) -> Any:
+        value = self.get(key, None)
+        if value is None and key not in self.data:
+            raise KeyError(key)
+        return value
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self.data[key] = value
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.data or self._KEY_ALIASES.get(key) in self.data or self._KEY_ALIASES_REVERSE.get(key) in self.data
+
     def get(self, key: str, default: Any = None) -> Any:
         """
         Универсальный getter:
@@ -429,8 +502,6 @@ ATTACK_LOGS_PATH = LOG_DIR / "attack_logs.md"
 HONEYPOT_EVENTS_JSONL = LOG_DIR / "honeypot_events.jsonl"
 NETWORK_LOG_PATH = LOG_DIR / "network_checks.log"
 GUI_STATE_PATH = LOG_DIR / "gui_state.json"
-
-
 
 # ============================================================
 #  Функции для универсальных путей

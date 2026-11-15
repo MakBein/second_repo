@@ -1,13 +1,12 @@
 # xss_security_gui/threat_tab_connector.py
 # ============================================================
-#  ThreatIntelConnector — High-Level API for ThreatConnector 6.0
+#  ThreatIntelConnector — High-Level API for ThreatConnector 7.0
+#  (расширенный поиск + threat-query API)
 # ============================================================
 
 from __future__ import annotations
-
-import hashlib
 from datetime import datetime, UTC
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Iterable
 
 from xss_security_gui.threat_analysis.threat_connector import (
     ThreatConnector,
@@ -17,12 +16,15 @@ from xss_security_gui.threat_analysis.threat_connector import (
 
 class ThreatIntelConnector:
     """
-    Высокоуровневый адаптер над ThreatConnector 6.0.
+    Высокоуровневый адаптер над ThreatConnector 7.0.
     Используется XSSAttacker, AutoRecon, DeepCrawler, Analyzer, GUI.
     """
 
-    def __init__(self) -> None:
-        backend = SQLiteBackend("threat_intel.db")
+    def __init__(self, backend: Optional[Any] = None) -> None:
+        """
+        backend — опциональный DI. Если не передан — создаётся GUI‑friendly SQLite backend.
+        """
+        backend = backend or SQLiteBackend("threat_intel.db")
         self.tc = ThreatConnector(backend=backend)
 
     # ============================================================
@@ -41,47 +43,150 @@ class ThreatIntelConnector:
     #  Internal unified sender
     # ============================================================
     def _send(self, module: str, target: str, result: Any) -> None:
+        """
+        Унифицированная отправка события в ThreatConnector.
+        ThreatConnector сам:
+            • добавляет timestamp
+            • добавляет module/target
+            • хеширует артефакт
+            • выполняет дедупликацию
+        """
         result = self._normalize(result)
+        result.setdefault("timestamp", datetime.now(UTC).isoformat())
 
-        raw = f"{module}:{target}:{str(result)}"
-        h = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-        artifact = {
-            "_hash": h,
-            "timestamp": datetime.now(UTC).isoformat(),
-            "module": module,
-            "target": target,
-            "result": result,
-        }
-
-        # ThreatConnector 6.0 expects: add_artifact(module, target, [artifact])
-        self.tc.add_artifact(module, target, [artifact])
+        try:
+            self.tc.emit(module, target, result)
+        except AttributeError:
+            self.tc.add_artifact(module, target, [result])
 
     # ============================================================
-    #  NEW: Generic event emitter (GUI → Threat Intel)
+    #  Generic event emitter (GUI → Threat Intel)
     # ============================================================
     def emit(self, module: str, target: str, data: Any) -> None:
         self._send(module, target, data)
 
     # ============================================================
-    #  NEW: Bulk event emitter (AutoRecon)
+    #  Bulk event emitter (AutoRecon, массовые результаты)
     # ============================================================
-    def bulk(self, module: str, target: str, items: List[Any]) -> None:
+    def bulk(self, module: str, target: str, items: Iterable[Any]) -> None:
         for item in items:
             self._send(module, target, item)
 
     # ============================================================
-    #  NEW: Summary generator (GUI → Threat Intel)
+    #  Summary generator (GUI → Threat Intel)
     # ============================================================
     def generate_report(self) -> Dict[str, Any]:
-        """
-        Возвращает агрегированный отчёт Threat Intel.
-        """
         try:
             data = self.tc.export_all()
             return self._normalize(data)
         except Exception:
             return {}
+
+    # ============================================================
+    #  Threat‑query API (расширенный поиск + пагинация)
+    # ============================================================
+    def query(
+        self,
+        *,
+        category: Optional[str] = None,
+        risk: Optional[str] = None,
+        module: Optional[str] = None,
+        search: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+        order_by: str = "timestamp",
+        order_desc: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """
+        Threat‑query API:
+        - category / risk / module — фильтры
+        - search — полнотекстовый поиск по JSON‑blob’у
+        - limit/offset — пагинация для GUI
+        - order_by — поле сортировки (timestamp/risk/module/category)
+        """
+        try:
+            return self.tc.query(
+                category=category,
+                risk=risk,
+                module=module,
+                search=search,
+                limit=limit,
+                offset=offset,
+                order_by=order_by,
+                order_desc=order_desc,
+            )
+        except AttributeError:
+            # Fallback: экспорт и ручная фильтрация (медленнее, но безопасно)
+            data = self.tc.export_all() or []
+            if isinstance(data, dict):
+                artifacts = data.get("artifacts", []) or []
+            elif isinstance(data, list):
+                artifacts = data
+            else:
+                artifacts = []
+
+            def match(a: Dict[str, Any]) -> bool:
+                if not isinstance(a, dict):
+                    return False
+                res = a.get("result")
+                if not isinstance(res, dict):
+                    res = {}
+                if category and res.get("category") != category:
+                    return False
+                if risk and str(res.get("risk", "")).lower() != str(risk).lower():
+                    return False
+                if module and str(a.get("module", "")).lower() != str(module).lower():
+                    return False
+                if search:
+                    blob = f"{a} {res}".lower()
+                    if search.lower() not in blob:
+                        return False
+                return True
+
+            filtered = [a for a in artifacts if match(a)]
+
+            def result_of(artifact: Dict[str, Any]) -> Dict[str, Any]:
+                result = artifact.get("result")
+                return result if isinstance(result, dict) else {}
+
+            key_map = {
+                "timestamp": lambda x: result_of(x).get(
+                    "timestamp", x.get("timestamp", "")
+                ),
+                "risk": lambda x: result_of(x).get("risk", ""),
+                "module": lambda x: x.get("module", ""),
+                "category": lambda x: result_of(x).get("category", ""),
+            }
+            key = key_map.get(order_by, key_map["timestamp"])
+            filtered = [artifact for artifact in filtered if isinstance(artifact, dict)]
+            filtered.sort(key=key, reverse=order_desc)
+
+            return filtered[offset : offset + limit]
+
+    # ============================================================
+    #  Count API (for lazy pagination)
+    # ============================================================
+    def count(
+        self,
+        *,
+        category: Optional[str] = None,
+        risk: Optional[str] = None,
+        module: Optional[str] = None,
+        search: Optional[str] = None,
+    ) -> int:
+        """Return total matching artifacts count for pagination."""
+        try:
+            return self.tc.count(
+                category=category,
+                risk=risk,
+                module=module,
+                search=search,
+            )
+        except (AttributeError, Exception):
+            return len(self.query(
+                category=category, risk=risk, module=module,
+                search=search, limit=999_999_999,
+            ))
 
     # ============================================================
     #  XSS
@@ -134,7 +239,13 @@ class ThreatIntelConnector:
     #  Deep Crawler
     # ============================================================
     def report_crawler(self, result: Dict[str, Any]) -> None:
-        target = result.get("root", "unknown")
+        from xss_security_gui.utils.pii_aggregator import (
+            aggregate_pii_from_crawler,
+            build_email_leak_artifact,
+            pii_has_data,
+        )
+
+        target = result.get("root") or result.get("url") or "unknown"
         self._send(
             "crawler",
             target,
@@ -146,6 +257,12 @@ class ThreatIntelConnector:
                 "source": "crawler",
             },
         )
+
+        pii = aggregate_pii_from_crawler(result)
+        if pii_has_data(pii):
+            artifact = build_email_leak_artifact(pii, target_url=str(target), source="crawler")
+            if artifact:
+                self._send("crawler", target, artifact)
 
     # ============================================================
     #  AutoRecon
@@ -177,3 +294,12 @@ class ThreatIntelConnector:
                 "source": "gui",
             },
         )
+
+    # ============================================================
+    #  Shutdown (важно для корректного завершения воркера)
+    # ============================================================
+    def shutdown(self) -> None:
+        try:
+            self.tc.shutdown()
+        except Exception:
+            pass

@@ -1,76 +1,179 @@
 # xss_security_gui/sqli_tab.py
 
-import json
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
-from typing import Any, Dict
+from __future__ import annotations
 
-from xss_security_gui.settings import settings
+import json
+import threading
+import tkinter as tk
+from pathlib import Path
+from tkinter import ttk, messagebox, filedialog
+from typing import Any, Dict, List, Optional
+
+from xss_security_gui.settings import SQLI_PAYLOAD_FILE, THREAT_INTEL_ARTIFACT_PATH, settings
 from xss_security_gui.threat_analysis.sqli_module import SQLiTester
 
 
 class SQLiTab(ttk.Frame):
+    """Вкладка SQLi із підтримкою WAF-evasion та узгодженими шляхами settings."""
+
     def __init__(self, parent, url: str, payload_file: str | None = None):
         super().__init__(parent)
 
+        self.loop_running = False
         self.url = url
+        self._tests_lock = threading.Lock()
 
-        # Безпечний доступ до settings (dict / об'єкт)
-        default_file = (
-            settings.get("sqli.payload_file")
-            if isinstance(settings, dict)
-            else getattr(settings, "SQLI_PAYLOAD_FILE", "sqli_payloads.json")
-        )
+        self.active_tests = 0
+        self.max_workers = int(settings.get("sqli.max_workers", 5) or 5)
 
-        self.payload_file = payload_file or default_file
-        self.payloads: Dict[str, list] = self._load_payloads()
+        default_file = payload_file or settings.get("payloads.sqli_file") or str(SQLI_PAYLOAD_FILE)
+        self.payload_file = str(default_file)
+        self.payloads: Dict[str, list] = self._load_payloads(silent=True)
+
+        # === UIQueueBridge для фоновых операций ===
+        from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
+        self._bridge = UIQueueBridge(self, poll_ms=50)
 
         self._build_ui()
 
-    # ---------------------------------------------------------
-    # Payload loader
-    # ---------------------------------------------------------
-    def _load_payloads(self) -> Dict[str, list]:
+    # ------------------------------------------------------------------
+    def _sqli_tester_kwargs(self) -> Dict[str, Any]:
+        delay = float(self.delay_var.get() or 0)
+        return {
+            "waf_evasion": bool(self.waf_var.get()),
+            "try_post_fallback": bool(self.post_var.get()),
+            "aggressive_headers": bool(self.aggressive_var.get()),
+            "inter_attempt_delay": max(0.0, delay),
+        }
+
+    def _make_tester(
+        self,
+        param: str,
+        base_value: str,
+        selected_payloads: Dict[str, List[str]],
+    ) -> SQLiTester:
+        return SQLiTester(
+            base_url=self.url.strip(),
+            param=param,
+            base_value=base_value,
+            payloads=selected_payloads,
+            output_callback=self._on_test_finish,
+            **self._sqli_tester_kwargs(),
+        )
+
+    # ------------------------------------------------------------------
+    # Цикл SQLi
+    # ------------------------------------------------------------------
+    def start_loop(self):
+        if self.loop_running:
+            return
+        if not self.payloads:
+            self._safe_log("❌ Payload-и не завантажені — цикл не запущено\n")
+            return
+
+        self.loop_running = True
+        self._safe_log("🔁 Цикл SQLi запущено\n")
+        self.run_sqli_cycle()
+
+    def stop_loop(self):
+        if self.loop_running:
+            self._safe_log("⛔ Цикл зупинено\n")
+        self.loop_running = False
+
+    def _on_test_finish(self, result: Dict[str, Any]):
+        with self._tests_lock:
+            self.active_tests = max(0, self.active_tests - 1)
+        self.display_result(result)
+
+    def run_sqli_cycle(self):
+        if not self.loop_running:
+            return
+
+        if self.active_tests < self.max_workers:
+            self._try_start_test_from_cycle()
+
+        self.after(300, self.run_sqli_cycle)
+
+    def _try_start_test_from_cycle(self) -> bool:
+        if not self.payloads:
+            self._safe_log("⚠️ Цикл: payload-и не завантажені, запуск неможливий\n")
+            return False
+
+        param = self.param_entry.get().strip()
+        base_value = self.value_entry.get().strip()
+        category = self.category_var.get()
+
+        if not param or not base_value:
+            self._safe_log("⚠️ Цикл: порожній параметр або значення — тест не буде запущено\n")
+            return False
+
+        if category == "Всі категорії":
+            selected_payloads = self.payloads
+        else:
+            cat_payloads = self.payloads.get(category) or []
+            if not cat_payloads:
+                self._safe_log(f"⚠️ Цикл: у категорії '{category}' немає payload-ів\n")
+                return False
+            selected_payloads = {category: cat_payloads}
+
+        with self._tests_lock:
+            if self.active_tests >= self.max_workers:
+                return False
+            self.active_tests += 1
+
+        # Запускаємо в фоне через UIQueueBridge
+        def worker():
+           tester = self._make_tester(param, base_value, selected_payloads)
+           tester.start()
+
+        self._bridge.post_bg(worker)
+
+        self._safe_log(
+           f"🔁 Цикл: запущено SQLi-тест (param={param}, category={category}, активних={self.active_tests})\n"
+        )
+        return True
+
+    # ------------------------------------------------------------------
+    def _load_payloads(self, silent: bool = False) -> Dict[str, list]:
+        path = Path(self.payload_file)
+        if not path.is_file():
+            if not silent:
+                messagebox.showerror("Помилка", f"Файл не знайдено:\n{path}")
+            return {}
         try:
-            with open(self.payload_file, "r", encoding="utf-8") as f:
+            with path.open("r", encoding="utf-8") as f:
                 data = json.load(f)
-
             if not isinstance(data, dict):
-                raise ValueError("Файл payload-ів повинен містити JSON-об'єкт з категоріями")
-
+                raise ValueError("Очікується JSON-об'єкт з категоріями → списки payload-ів")
             return data
-
         except Exception as e:
-            messagebox.showerror("Помилка", f"Не вдалося завантажити SQLi payload-и:\n{e}")
+            if not silent:
+                messagebox.showerror("Помилка", f"Не вдалося завантажити SQLi payload-и:\n{e}")
             return {}
 
-    # ---------------------------------------------------------
-    # UI builder
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
     def _build_ui(self):
         top = ttk.Frame(self)
         top.pack(fill="x", pady=5)
 
-        # URL (read-only)
         ttk.Label(top, text="Цільовий URL:").grid(row=0, column=0, sticky="w", padx=5)
         self.url_var = tk.StringVar(value=self.url)
-        ttk.Entry(top, textvariable=self.url_var, width=70, state="readonly").grid(
-            row=0, column=1, columnspan=3, sticky="we", padx=5
+        self.url_entry = ttk.Entry(top, textvariable=self.url_var, width=70)
+        self.url_entry.grid(row=0, column=1, columnspan=3, sticky="we", padx=5)
+        ttk.Button(top, text="Оновити URL", command=self.update_url).grid(
+            row=0, column=4, sticky="w", padx=5
         )
 
-        # Параметр
         ttk.Label(top, text="Параметр:").grid(row=1, column=0, sticky="w", padx=5)
         self.param_entry = ttk.Entry(top, width=20)
         self.param_entry.insert(0, "id")
         self.param_entry.grid(row=1, column=1, sticky="w", padx=5)
 
-        # Значення
         ttk.Label(top, text="Базове значення:").grid(row=1, column=2, sticky="e", padx=5)
         self.value_entry = ttk.Entry(top, width=20)
         self.value_entry.insert(0, "1")
         self.value_entry.grid(row=1, column=3, sticky="w", padx=5)
 
-        # Категорія payload-ів
         ttk.Label(top, text="Категорія payload-ів:").grid(row=2, column=0, sticky="w", padx=5)
         self.category_var = tk.StringVar(self)
         categories = ["Всі категорії"] + sorted(self.payloads.keys())
@@ -80,34 +183,94 @@ class SQLiTab(ttk.Frame):
         )
         self.category_combo.grid(row=2, column=1, sticky="w", padx=5)
 
-        # Buttons
+        opt = ttk.LabelFrame(top, text="WAF / мережа (ULTRA)")
+        opt.grid(row=3, column=0, columnspan=5, sticky="we", padx=5, pady=6)
+
+        self.waf_var = tk.BooleanVar(value=bool(settings.get("sqli.waf_evasion_default", True)))
+        ttk.Checkbutton(opt, text="Обхід WAF (варіанти /**/, регістр, POST)", variable=self.waf_var).pack(
+            side="left", padx=6
+        )
+
+        self.post_var = tk.BooleanVar(value=bool(settings.get("sqli.try_post_default", True)))
+        ttk.Checkbutton(opt, text="POST fallback", variable=self.post_var).pack(side="left", padx=6)
+
+        self.aggressive_var = tk.BooleanVar(value=bool(settings.get("http.aggressive_headers", False)))
+        ttk.Checkbutton(opt, text="Агресивні заголовки", variable=self.aggressive_var).pack(
+            side="left", padx=6
+        )
+
+        ttk.Label(opt, text="Затримка між спробами (с):").pack(side="left", padx=(12, 2))
+        self.delay_var = tk.DoubleVar(
+            value=float(settings.get("sqli.inter_attempt_delay", 0.05) or 0.05)
+        )
+        ttk.Spinbox(opt, from_=0.0, to=5.0, increment=0.05, textvariable=self.delay_var, width=6).pack(
+            side="left"
+        )
+
+        row4 = ttk.Frame(top)
+        row4.grid(row=4, column=0, columnspan=5, sticky="we", pady=4)
+
+        ttk.Label(row4, text="Макс. потоків:").pack(side="left", padx=5)
+        self.workers_var = tk.IntVar(value=self.max_workers)
+        ttk.Spinbox(
+            row4,
+            from_=1,
+            to=50,
+            textvariable=self.workers_var,
+            width=5,
+            command=self._update_workers,
+        ).pack(side="left", padx=5)
+
+        self.verbose_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row4, text="Детальний лог", variable=self.verbose_var).pack(side="left", padx=10)
+
+        ttk.Label(row4, text=f"ALLOW_REAL_RUN={getattr(settings, 'ALLOW_REAL_RUN', '?')} | "
+                              f"ціль у ALLOWED_TARGETS для реальних запитів",
+                  font=("TkDefaultFont", 8)).pack(side="left", padx=12)
+
         btn_frame = ttk.Frame(top)
-        btn_frame.grid(row=2, column=2, columnspan=2, sticky="e", padx=5)
+        btn_frame.grid(row=5, column=0, columnspan=5, sticky="e", padx=5, pady=4)
 
-        ttk.Button(btn_frame, text="💉 Запустити", command=self.run_tests).pack(side="left", padx=3)
-        ttk.Button(btn_frame, text="🧹 Очистити вивід", command=self.clear_output).pack(side="left", padx=3)
-        ttk.Button(btn_frame, text="📂 Вибрати payload-файл", command=self.choose_payload_file).pack(side="left", padx=3)
-        ttk.Button(btn_frame, text="🗑 Очистити лог артефактів", command=self.clear_artifact_log).pack(side="left", padx=3)
+        for txt, cmd in (
+            ("💉 Разовий запуск", self.run_tests),
+            ("🔁 Цикл", self.start_loop),
+            ("⛔ Зупинити", self.stop_loop),
+            ("🧹 Очистити вивід", self.clear_output),
+            ("📂 Payload-файл", self.choose_payload_file),
+            ("🗑 Артефакти Threat", self.clear_artifact_log),
+        ):
+            ttk.Button(btn_frame, text=txt, command=cmd).pack(side="left", padx=3)
 
-        # Output
         self.output = tk.Text(
             self, height=20, wrap="none", bg="black", fg="lime", insertbackground="white"
         )
         self.output.pack(fill="both", expand=True, padx=5, pady=5)
 
-    # ---------------------------------------------------------
-    # Thread-safe log
-    # ---------------------------------------------------------
-    def _safe_log(self, text: str) -> None:
-        self.after(0, lambda: self._append_text(text))
+        self.output.tag_config("HIGH", foreground="lime")
+        self.output.tag_config("INFO", foreground="yellow")
+        self.output.tag_config("ERROR", foreground="red")
 
-    def _append_text(self, text: str) -> None:
-        self.output.insert("end", text)
+        top.columnconfigure(1, weight=1)
+
+    # ------------------------------------------------------------------
+    def _safe_log(self, data: Any) -> None:
+        self.after(0, lambda d=data: self._append_text(d))
+
+    def _append_text(self, data: Any) -> None:
+        if isinstance(data, tuple):
+            text, tag = data
+            self.output.insert("end", text, tag)
+        else:
+            self.output.insert("end", data)
         self.output.see("end")
 
-    # ---------------------------------------------------------
-    # Actions
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
+    def _update_workers(self):
+        value = max(1, int(self.workers_var.get() or 1))
+        self.max_workers = value
+        self.workers_var.set(value)
+        self._safe_log(f"⚙️ Макс. потоків: {self.max_workers}\n")
+
     def run_tests(self):
         if not self.payloads:
             messagebox.showerror("Помилка", "Payload-и не завантажені")
@@ -121,38 +284,60 @@ class SQLiTab(ttk.Frame):
             self._safe_log("⚠️ Введіть параметр і значення перед запуском\n")
             return
 
+        with self._tests_lock:
+            if self.active_tests >= self.max_workers:
+                self._safe_log("⚠️ Досягнуто ліміт потоків, дочекайтесь завершення\n")
+                return
+            self.active_tests += 1
+
         if category == "Всі категорії":
             selected_payloads = self.payloads
         else:
             selected_payloads = {category: self.payloads.get(category, [])}
 
-        tester = SQLiTester(
-            base_url=self.url,
-            param=param,
-            base_value=base_value,
-            payloads=selected_payloads,
-            output_callback=self.display_result,
-        )
+        tester = self._make_tester(param, base_value, selected_payloads)
         tester.start()
 
-        self._safe_log(f"🚀 Запущено SQLi-тестування для {self.url} (param={param})\n")
+        self._safe_log(f"🚀 SQLi: {self.url} param={param} (WAF={'on' if self.waf_var.get() else 'off'})\n")
+
+    def update_url(self):
+        self.url = self.url_var.get().strip()
+        self._safe_log(f"🔄 URL оновлено: {self.url}\n")
 
     def display_result(self, result: Dict[str, Any]):
-        """
-        Гнучкий, безпечний вивід результатів.
-        """
-        status = result.get("status", "unknown")
-        length = result.get("response_length")
+        details = result.get("details", {})
+        if isinstance(details, str):
+            self._safe_log((f"❌ {details}\n", "ERROR"))
+            return
+
+        severity = result.get("severity") or details.get("severity") or "INFO"
+        length = details.get("response_length")
+        http_status = details.get("http_status", "?")
+        body_hit = details.get("body_hit", False)
+        header_hit = details.get("header_hit", False)
+        skipped = details.get("status") == "skipped"
+
         category = result.get("category", "?")
         payload = result.get("payload", "?")
 
-        if isinstance(length, (int, float)):
-            len_part = f"(len={length})"
+        if skipped:
+            tag = "INFO"
+            line = f"[{category}] {payload} → SKIPPED ({details.get('reason', '')})\n"
         else:
-            len_part = ""
+            tag = "HIGH" if severity == "HIGH" else ("ERROR" if severity == "ERROR" else "INFO")
+            len_part = f"(len={length})" if isinstance(length, (int, float)) else ""
+            line = (
+                f"[{category}] {payload} → {severity} "
+                f"(HTTP {http_status}) {len_part} "
+                f"(sql_err={body_hit}, waf_hdr={header_hit})\n"
+            )
 
-        line = f"[{category}] {payload} → {status} {len_part}\n"
-        self._safe_log(line)
+        self._safe_log((line, tag))
+
+        if self.verbose_var.get():
+            raw = details.get("raw")
+            if raw:
+                self._safe_log((f"RAW: {raw[:800]}\n", tag))
 
     def clear_output(self):
         self.output.delete("1.0", "end")
@@ -175,15 +360,17 @@ class SQLiTab(ttk.Frame):
         self._safe_log(f"✅ Payload-и завантажено з: {path}\n")
 
     def clear_artifact_log(self):
-        artifact_path = (
-            settings.get("threat_intel.artifact_path")
-            if isinstance(settings, dict)
-            else getattr(settings, "THREAT_INTEL_ARTIFACT_PATH", "threat_artifacts.json")
-        )
+        artifact_path = Path(settings.get("threat.artifact_path") or THREAT_INTEL_ARTIFACT_PATH)
 
         try:
-            with open(artifact_path, "w", encoding="utf-8") as f:
+            parent = artifact_path.parent
+            if str(parent):
+                parent.mkdir(parents=True, exist_ok=True)
+
+            with artifact_path.open("w", encoding="utf-8") as f:
                 json.dump([], f)
+
             self._safe_log(f"✅ Лог артефактів очищено: {artifact_path}\n")
+
         except Exception as e:
             self._safe_log(f"❌ Помилка очищення: {e}\n")

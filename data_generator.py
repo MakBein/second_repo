@@ -278,7 +278,7 @@ def generate_form_data(fields: List[str], count: int = 1) -> List[Dict[str, str]
 
 
 # ============================================================
-#  БATCH ГЕНЕРАЦИЯ
+#  BATCH ГЕНЕРАЦИЯ
 # ============================================================
 
 def generate_credit_cards(count: int = 10, card_type: str = "random") -> List[str]:
@@ -366,5 +366,4 @@ if __name__ == "__main__":
     print("\nГенерация данных для формы:")
     form_data = generate_form_data(["name", "email", "password", "phone", "address"], 3)
     for i, data in enumerate(form_data, 1):
-        print(f"Запись {i}: {data}")</content>
-<parameter name="filePath">C:\Users\sanch\PycharmProjects\itproger\xss_security_gui\data_generator.py
+        print(f"Запись {i}: {data}")

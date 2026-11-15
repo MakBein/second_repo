@@ -105,12 +105,29 @@ class BulkLogger:
             return
 
         try:
-            with open(self.log_file, "a", encoding="utf-8") as f:
+            # use io.open to avoid any accidental shadowing of built-in open
+            import io
+
+            with io.open(self.log_file, "a", encoding="utf-8") as f:
                 for entry in self.buffer:
                     f.write(entry + "\n")
             self.buffer.clear()
         except Exception as e:
-            logging.error(f"Failed to flush logs to {self.log_file}: {e}")
+            # Logging may be unavailable during Python shutdown (sys.meta_path None).
+            # Use a safe fallback that avoids calling logging.error when the runtime
+            # teardown has already started.
+            try:
+                import sys as _sys
+
+                if getattr(_sys, "meta_path", None) is None:
+                    # Python is shutting down: avoid any logging or printing.
+                    pass
+                else:
+                    logging.error(f"Failed to flush logs to {self.log_file}: {e}")
+            except Exception:
+                # Last-resort silent fallback
+                # Silent fallback: nothing we can reliably do here during teardown
+                pass
 
     def flush(self) -> None:
         """Явный flush"""

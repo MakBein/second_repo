@@ -10,9 +10,11 @@
 """
 
 import json
+import argparse
 from typing import Dict, Any, List
 
 from xss_security_gui.auto_recon.scanner import EndpointScanner, save_reflected_response
+from xss_security_gui.auto_recon.scope import RequestBudget
 from xss_security_gui.auto_recon.analyzer import AutoReconAnalyzerV2
 from xss_security_gui.threat_analysis.threat_connector import ThreatConnector
 from xss_security_gui.param_fuzzer import fuzz_url_params
@@ -48,6 +50,7 @@ def run_full_autorecon(
     target_url: str,
     base_params: Dict[str, Any] | None = None,
     method: str = "GET",
+    active_testing: bool = False,
 ) -> Dict[str, Any]:
     """
     Запускает полный AutoRecon-процесс для одного URL.
@@ -60,21 +63,34 @@ def run_full_autorecon(
     print(f"[🔍] Starting AutoRecon for: {target_url}")
 
     pipeline_output: Dict[str, Any] = {}
+    active_request_budget = RequestBudget(200)
 
     # 1. Скан эндпоинтов
-    scanner = EndpointScanner(target_url)
+    scanner = EndpointScanner(
+        target_url,
+        active_testing=active_testing,
+        active_request_budget=active_request_budget,
+    )
     endpoints = scanner.scan()
     pipeline_output["endpoints"] = endpoints
 
     # 2. Param Fuzzer
-    param_fuzz_results = fuzz_url_params(target_url, log_all=True)
+    param_fuzz_results = (
+        fuzz_url_params(
+            target_url,
+            log_all=True,
+            active_request_budget=active_request_budget,
+        )
+        if active_testing
+        else []
+    )
     pipeline_output["param_fuzzer"] = param_fuzz_results
 
     # 3. XSS-сканирование
     xss_results = scanner.scan_xss_on_endpoints()
     pipeline_output["xss_results"] = xss_results
     for r in xss_results:
-        if r.get("context") and r.get("context") != "❌ Not reflected":
+        if r.get("vulnerable") is True:
             save_reflected_response(r)
 
     # 4. XSS-fuzzing
@@ -115,7 +131,9 @@ def run_full_autorecon(
 #  CLI-запуск
 # ============================================================
 if __name__ == "__main__":
-    target = "https://gazprombank.ru/"
+    parser = argparse.ArgumentParser(description="Run passive AutoRecon against an authorized URL.")
+    parser.add_argument("target", help="URL in the configured authorized target scope")
+    target = parser.parse_args().target
     result = run_full_autorecon(
         target,
         base_params={"search": "test"},

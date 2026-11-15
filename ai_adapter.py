@@ -1,52 +1,59 @@
 # xss_security_gui/ai_adapter.py
 """
-AI Adapter — thin wrapper to connect your local `ai_core` module (if present)
-and provide a stable interface for threat analysis and online learning.
+AI Adapter — connects GUI to AI Core with real model training support.
 
-It tries to import `xss_security_gui.ai_core` or `ai_core` and will gracefully
-fall back to a lightweight built-in analyzer if the module is not found.
-
-Public API:
-- AIAssistant.analyze(threat) -> Dict[str, Any]
-- AIAssistant.learn(threat) -> None
+Modules:
+- AIAssistant: high-level interface with analyze() and learn()
+- train_ai_async(): trigger training from logs in background thread
+- get_training_status(): check model status
 """
 from __future__ import annotations
 
 import importlib
 import json
+import threading
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Callable
 
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True, parents=True)
 
+# Global state
+_training_in_progress = False
+_training_report = None
+
+
 class AIAssistant:
     def __init__(self) -> None:
         self.core = None
-        # Try to import package inside xss_security_gui first
+        self.train_fn = None
+        
+        # Try to import ai_core (real implementation with XGBoost)
         tried = []
         for mod in ("xss_security_gui.ai_core", "ai_core"):
             try:
                 self.core = importlib.import_module(mod)
+                # Try to instantiate AICore if exposed
+                if hasattr(self.core, "AICore"):
+                    try:
+                        self.core = getattr(self.core, "AICore")()
+                    except Exception:
+                        # Keep module as-is if instantiation fails
+                        pass
                 break
             except Exception as e:
                 tried.append((mod, str(e)))
                 self.core = None
-        # If core exposes an initializer, try to instantiate
-        if self.core and hasattr(self.core, "AICore"):
-            try:
-                self.core = getattr(self.core, "AICore")()
-            except Exception:
-                # keep module as-is
-                pass
+
+        # Import training function if available
+        try:
+            from xss_security_gui.ai_core.train_nn_model import train_from_logs
+            self.train_fn = train_from_logs
+        except Exception:
+            self.train_fn = None
 
     def analyze(self, threat: Any) -> Dict[str, Any]:
-        """Return analysis dict with at least 'summary' key.
-
-        If user-provided ai_core module exists and provides `analyze(threat)`
-        this adapter will call it. Otherwise it will run a simple heuristic
-        analyzer.
-        """
+        """Return analysis dict with at least 'summary' key."""
         if self.core:
             try:
                 if hasattr(self.core, "analyze"):
@@ -75,9 +82,7 @@ class AIAssistant:
             return {"summary": "error", "confidence": 0.0}
 
     def learn(self, threat: Any) -> None:
-        """Learn from a threat: if ai_core exposes `train`, call it, otherwise
-        append to a local training file for offline ingestion.
-        """
+        """Learn from a threat: if ai_core exposes `train`, call it."""
         if self.core and hasattr(self.core, "train"):
             try:
                 self.core.train(threat)
@@ -97,4 +102,67 @@ class AIAssistant:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
+
+
+# Singleton instance
+_ai_assistant = None
+
+
+def get_ai_assistant() -> AIAssistant:
+    """Get or create singleton AIAssistant."""
+    global _ai_assistant
+    if _ai_assistant is None:
+        _ai_assistant = AIAssistant()
+    return _ai_assistant
+
+
+def train_ai_async(on_done: Optional[Callable] = None, on_error: Optional[Callable] = None) -> bool:
+    """
+    Trigger AI training in background thread.
+    Returns True if training started, False if already in progress or no trainer available.
+    """
+    global _training_in_progress, _training_report
+
+    if _training_in_progress:
+        return False
+
+    assistant = get_ai_assistant()
+    if not assistant.train_fn:
+        return False
+
+    _training_in_progress = True
+
+    def _worker():
+        global _training_in_progress, _training_report
+        try:
+            report = assistant.train_fn()
+            _training_report = report
+            if callable(on_done):
+                try:
+                    on_done(report)
+                except Exception:
+                    pass
+        except Exception as e:
+            _training_report = {"error": str(e)}
+            if callable(on_error):
+                try:
+                    on_error(e)
+                except Exception:
+                    pass
+        finally:
+            _training_in_progress = False
+
+    thread = threading.Thread(target=_worker, daemon=True, name="AITraining")
+    thread.start()
+    return True
+
+
+def get_training_status() -> Dict[str, Any]:
+    """Get current training status and report."""
+    global _training_in_progress, _training_report
+    return {
+        "in_progress": _training_in_progress,
+        "report": _training_report,
+    }
+
 

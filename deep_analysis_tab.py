@@ -7,6 +7,7 @@ import json
 import os
 import threading
 import time
+import traceback
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -18,6 +19,7 @@ from xss_security_gui.utils.threat_sender import ThreatSenderMixin
 import xss_security_gui.settings as settings
 from xss_security_gui.network_checker import NetworkChecker
 from xss_security_gui.settings import JSON_CRAWL_EXPORT_PATH
+from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
 
 
 class DeepAnalysisTab(ttk.Frame, ThreatSenderMixin):
@@ -31,6 +33,7 @@ class DeepAnalysisTab(ttk.Frame, ThreatSenderMixin):
         self.sort_reverse = False
         self._deep_crawl_running = False
         self._attack_plan_running = False
+        self._bridge = UIQueueBridge(self, poll_ms=50)
         self.build_ui()
 
 
@@ -119,7 +122,17 @@ class DeepAnalysisTab(ttk.Frame, ThreatSenderMixin):
             messagebox.showerror("Ошибка загрузки JSON", f"{e}")
             self.full_data = []
 
-        cms_set = {s["cms"] for s in self.full_data if isinstance(s.get("cms"), str)}
+        cms_set = set()
+
+        for s in self.full_data:
+            cms = s.get("cms")
+            if not cms:
+                continue
+
+            if isinstance(cms, list):
+                cms_set.update(cms)
+            else:
+                cms_set.add(cms)
         self.cms_filter["values"] = ["Все"] + sorted(cms_set)
         self.cms_filter.current(0)
         self.populate_table(self.full_data)
@@ -339,16 +352,18 @@ class DeepAnalysisTab(ttk.Frame, ThreatSenderMixin):
                     self.populate_table(self.full_data)
                     self._deep_crawl_running = False
 
-                self.after(0, finish_ok)
+                self._bridge.post_ui(finish_ok)
+
 
             except Exception as e:
-                def finish_err():
-                    self.detail_box.insert("end", f"❌ Ошибка Deep Crawl: {e}\n")
-                    self._deep_crawl_running = False
+                traceback.print_exc()
+                self._bridge.post_ui(lambda err=e: self._finish_deep_crawl_err(err))
 
-                self.after(0, finish_err)
+        self._bridge.post_bg(worker)
 
-        threading.Thread(target=worker, daemon=True).start()
+    def _finish_deep_crawl_err(self, err: Exception):
+        self.detail_box.insert("end", f"❌ Ошибка Deep Crawl: {err}\n")
+        self._deep_crawl_running = False
 
     def ask_target_url(self):
         popup = tk.Toplevel(self)
@@ -396,15 +411,17 @@ class DeepAnalysisTab(ttk.Frame, ThreatSenderMixin):
                     with open(plan_path, encoding="utf-8") as f:
                         plan = json.load(f)
                 except Exception as e:
-                    self.after(0, lambda: self._log_attack(f"❌ Ошибка загрузки attack_plan: {e}"))
+                    # важливо: захоплюємо e в lambda
+                    self._bridge.post_ui(self._log_attack, f"❌ Ошибка загрузки attack_plan: {e}")
                     self._attack_plan_running = False
                     return
 
                 targets = plan.get("targets", []) or []
                 token_tests = plan.get("token_tests", []) or []
                 plan_settings = plan.get("settings", {}) or {}
-                delay = plan_settings.get("delay", settings.settings.get("crawl.delay", 1.0))
+                delay = plan_settings.get("delay", settings.get("crawl.delay", 1.0))
 
+                # --- основні цілі ---
                 for t in targets:
                     if not isinstance(t, dict):
                         continue
@@ -419,7 +436,7 @@ class DeepAnalysisTab(ttk.Frame, ThreatSenderMixin):
                     if not url or not payloads:
                         line = f"⚠️ Пропуск цели без url/payloads: {t}"
                         attack_summary.append(line)
-                        self.after(0, lambda l=line: self._log_attack(l))
+                        self._bridge.post_ui(self._log_attack, line)
                         continue
 
                     for p in payloads:
@@ -441,25 +458,29 @@ class DeepAnalysisTab(ttk.Frame, ThreatSenderMixin):
                             hit = "✅ HIT" if status in (200, 201, 302) and reflected else "❌ MISS"
                             line = f"{hit} [{status}] {elapsed:.0f}ms → {url} ← {p}"
                             attack_summary.append(line)
-                            self.after(0, lambda l=line: self._log_attack(l))
+                            self._bridge.post_ui(self._log_attack, line)
 
                             self.send_to_threat_intel("attack_request", [{
-                                "url": url, "method": method, "payload": p,
-                                "status": status, "reflected": reflected,
-                                "elapsed_ms": elapsed
+                                "url": url,
+                                "method": method,
+                                "payload": p,
+                                "status": status,
+                                "reflected": reflected,
+                                "elapsed_ms": elapsed,
                             }])
 
                         except Exception as ex:
                             line = f"💥 Ошибка на {url}: {ex}"
                             attack_summary.append(line)
-                            self.after(0, lambda l=line: self._log_attack(l))
+                            self._bridge.post_ui(self._log_attack, line)
 
                         time.sleep(delay)
 
+                # --- токен‑тести ---
                 for test in token_tests:
                     if not isinstance(test, dict):
                         continue
-                    url = test.get("url") or "https://example.com/api/protected"
+                    url = test.get("url") or "https://gazprombank.ru/api/protected"
                     hname = test.get("header")
                     tpl = test.get("value_template")
                     candidates = test.get("candidates") or []
@@ -467,7 +488,7 @@ class DeepAnalysisTab(ttk.Frame, ThreatSenderMixin):
                     if not hname or not tpl or not candidates:
                         line = f"⚠️ Пропуск token_test без header/value_template/candidates: {test}"
                         attack_summary.append(line)
-                        self.after(0, lambda l=line: self._log_attack(l))
+                        self._bridge.post_ui(self._log_attack, line)
                         continue
 
                     for token in candidates:
@@ -487,38 +508,64 @@ class DeepAnalysisTab(ttk.Frame, ThreatSenderMixin):
                                 valid = False
 
                             attack_summary.append(line)
-                            self.after(0, lambda l=line: self._log_attack(l))
+                            self._bridge.post_ui(self._log_attack, line)
 
                             self.send_to_threat_intel("attack_token_test", [{
-                                "url": url, "header": hname, "token": token,
-                                "status": r.status_code, "valid": valid,
-                                "elapsed_ms": elapsed, "severity": severity
+                                "url": url,
+                                "header": hname,
+                                "token": token,
+                                "status": r.status_code,
+                                "valid": valid,
+                                "elapsed_ms": elapsed,
+                                "severity": severity,
                             }])
 
                         except Exception as err:
                             line = f"⚠️ Ошибка токена {token}: {err}"
                             attack_summary.append(line)
-                            self.after(0, lambda l=line: self._log_attack(l))
+                            self._bridge.post_ui(self._log_attack, line)
 
                         time.sleep(delay)
 
-                self.send_to_threat_intel("attack_plan", [{"result": line} for line in attack_summary])
+                # summary в Threat Intel
+                try:
+                    self.send_to_threat_intel("attack_plan", [
+                        {"result": line} for line in attack_summary
+                    ])
+                except Exception as e:
+                    self._bridge.post_ui(
+                        self._log_attack,
+                        f"⚠️ Ошибка отправки attack_plan в Threat Intel: {e}",
+                    )
 
                 def finish_ok():
                     self._log_attack("✔️ План атак завершён.")
                     self.attack_output.see("end")
                     self._attack_plan_running = False
 
-                self.after(0, finish_ok)
+                self._bridge.post_ui(finish_ok)
 
             except Exception as e:
-                def finish_err():
-                    self._log_attack(f"❌ Ошибка выполнения attack_plan: {e}")
+                # глобальний catch, щоб потік не вмер тихо
+                def finish_err(err=e):
+                    self._log_attack(f"❌ Ошибка выполнения attack_plan: {err}")
                     self._attack_plan_running = False
 
-                self.after(0, finish_err)
+                self._bridge.post_ui(finish_err)
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._bridge.post_bg(worker)
 
     def _log_attack(self, line: str):
-        self.attack_output.insert("end", line + "\n")
+        try:
+            self.attack_output.insert("end", line + "\n")
+            self.attack_output.see("end")  # автоскролл вниз
+        except Exception:
+            # если вкладка уже уничтожена / окно закрыто — просто игнорируем
+            pass
+
+    def destroy(self):
+        try:
+            self._bridge.stop()
+        except Exception:
+            pass
+        super().destroy()

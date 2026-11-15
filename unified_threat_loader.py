@@ -1,265 +1,280 @@
 # xss_security_gui/unified_threat_loader.py
 """
-Unified Threat Loader - загружает данные из multiple источников:
-1. analyzer1.json (исторические данные)
-2. real_breaches.json (реалистичные сценарии с техниками обхода)
-3. threat_history.json (AI-собранные угрозы)
+Unified Threat Loader — enterprise-уровень агрегации угроз.
 
-Анализирует и классифицирует угрозы с помощью AI.
-Сохраняет результаты для тренирования.
+Источники:
+1. analyzer1.json (исторические артефакты)
+2. real_breaches.json (реалистичные сценарии атак)
+3. threat_history.json (история AI/GUI событий)
+
+Функции:
+- безопасная загрузка всех источников
+- нормализация формата угроз
+- AI-анализ (если доступен)
+- экспорт в формат ThreatAnalysisTab
+- сохранение объединённого анализа
 """
 
 import json
+import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
+from xss_security_gui.threat_data_loader import ThreatDataLoader, ThreatCategory, ThreatRisk
+
+logger = logging.getLogger(__name__)
+
 
 class UnifiedThreatLoader:
     """Загружает и объединяет угрозы из различных источников"""
-    
-    def __init__(self, base_dir: Optional[Path] = None):
+
+    def __init__(self, base_dir: Optional[Path | str] = None):
         if base_dir is None:
-            base_dir = Path(__file__).parent
-        self.base_dir = base_dir
-        self.logs_dir = base_dir / "logs"
+            base_dir = Path(__file__).resolve().parent
+        else:
+            base_dir = Path(base_dir)
+
+        self.base_dir: Path = base_dir
+        self.logs_dir: Path = base_dir / "logs"
+
         self.threats: List[Dict[str, Any]] = []
-        self.statistics = {
+
+        self.statistics: Dict[str, Any] = {
             "from_analyzer": 0,
             "from_real_breaches": 0,
             "from_history": 0,
             "total": 0,
             "by_category": {},
             "by_risk": {},
+            "by_source": {},
         }
+
+    # ============================================================
+    #  LOW-LEVEL JSON LOADER
+    # ============================================================
+
+    def _load_json(self, filename: str) -> Optional[Any]:
+        path = self.logs_dir / filename
+        if not path.exists():
+            logger.info("UnifiedThreatLoader: файл %s не найден", path)
+            return None
+
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            logger.info("UnifiedThreatLoader: загружен %s (%s)", filename, path)
+            return data
+        except Exception as e:
+            logger.exception("UnifiedThreatLoader: ошибка загрузки %s: %s", filename, e)
+            return None
+
+    # ============================================================
+    #  SOURCE LOADERS
+    # ============================================================
 
     def load_all_sources(self) -> bool:
         """Загружает угрозы из всех доступных источников"""
-        success = True
-        
-        # Load analyzer1.json
-        if self._load_analyzer():
-            pass
-        
-        # Load real_breaches.json
-        if self._load_real_breaches():
-            pass
-        
-        # Load threat_history.json
-        if self._load_history():
-            pass
-        
+        self._load_analyzer()
+        self._load_real_breaches()
+        self._load_history()
+
         self.statistics["total"] = len(self.threats)
+        logger.info("UnifiedThreatLoader: всего угроз после объединения: %d", len(self.threats))
         return len(self.threats) > 0
 
     def _load_analyzer(self) -> bool:
-        """Загружает analyzer1.json"""
-        path = self.logs_dir / "analyzer1.json"
-        if not path.exists():
+        data = self._load_json("analyzer1.json")
+        if not data:
             return False
-        
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            artifacts = data.get("artifacts", [])
-            self.threats.extend(artifacts)
-            self.statistics["from_analyzer"] = len(artifacts)
-            return True
-        except Exception as e:
-            print(f"[⚠️] Error loading analyzer1.json: {e}")
-            return False
+
+        artifacts = data.get("artifacts", []) or []
+        artifacts = [a for a in artifacts if isinstance(a, dict)]
+        self.threats.extend(artifacts)
+        self.statistics["from_analyzer"] = len(artifacts)
+        logger.info("UnifiedThreatLoader: из analyzer1.json загружено %d артефактов", len(artifacts))
+        return True
 
     def _load_real_breaches(self) -> bool:
-        """Загружает real_breaches.json с реалистичными сценариями"""
-        path = self.logs_dir / "real_breaches.json"
-        if not path.exists():
+        data = self._load_json("real_breaches.json")
+        if not data:
             return False
-        
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            scenarios = data.get("scenarios", [])
-            self.threats.extend(scenarios)
-            self.statistics["from_real_breaches"] = len(scenarios)
-            return True
-        except Exception as e:
-            print(f"[⚠️] Error loading real_breaches.json: {e}")
-            return False
+
+        scenarios = data.get("scenarios", []) or []
+        scenarios = [s for s in scenarios if isinstance(s, dict)]
+        self.threats.extend(scenarios)
+        self.statistics["from_real_breaches"] = len(scenarios)
+        logger.info("UnifiedThreatLoader: из real_breaches.json загружено %d сценариев", len(scenarios))
+        return True
 
     def _load_history(self) -> bool:
-        """Загружает threat_history.json"""
-        path = self.logs_dir / "threat_history.json"
-        if not path.exists():
-            return False
-        
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                history = json.load(f)
-            
-            if isinstance(history, list):
-                # Format: [{"timestamp": ..., "entry": {...}}, ...]
-                threats_from_history = [h.get("entry") for h in history if "entry" in h]
-                self.threats.extend(threats_from_history)
-                self.statistics["from_history"] = len(threats_from_history)
-            return len(threats_from_history) > 0
-        except Exception as e:
-            print(f"[⚠️] Error loading threat_history.json: {e}")
+        data = self._load_json("threat_history.json")
+        if not data:
             return False
 
-    def analyze_with_ai(self):
-        """Анализирует все загруженные угрозы с помощью AI助手"""
+        if isinstance(data, list):
+            entries = [
+                h.get("entry") for h in data
+                if isinstance(h, dict) and isinstance(h.get("entry"), dict)
+            ]
+            self.threats.extend(entries)
+            self.statistics["from_history"] = len(entries)
+            logger.info("UnifiedThreatLoader: из threat_history.json загружено %d записей", len(entries))
+            return True
+
+        return False
+
+    # ============================================================
+    #  AI ANALYSIS
+    # ============================================================
+
+    def analyze_with_ai(self) -> None:
+        """Анализирует угрозы через AI, если доступен адаптер"""
         try:
             from xss_security_gui.ai_adapter import get_ai_assistant
             ai = get_ai_assistant()
-            
-            analyzed_threats = []
-            for threat in self.threats:
+        except Exception as e:
+            logger.warning("UnifiedThreatLoader: AI недоступен: %s", e)
+            return
+
+        analyzed: List[Dict[str, Any]] = []
+
+        for threat in self.threats:
+            try:
                 result = ai.analyze(threat)
-                threat_with_analysis = {
+                ai.learn(threat)
+                analyzed.append({
                     **threat,
                     "ai_analysis": result,
                     "analyzed_at": datetime.now().isoformat(),
-                }
-                analyzed_threats.append(threat_with_analysis)
-                
-                # Learn for future training
-                ai.learn(threat)
-            
-            self.threats = analyzed_threats
-            print(f"[✅] Analyzed {len(analyzed_threats)} threats with AI")
-        except Exception as e:
-            print(f"[⚠️] AI analysis error: {e}")
+                })
+            except Exception as e:
+                logger.exception("UnifiedThreatLoader: ошибка AI для угрозы: %s", e)
+                analyzed.append(threat)
+
+        self.threats = analyzed
+        logger.info("UnifiedThreatLoader: AI проанализировал %d угроз", len(analyzed))
+
+    # ============================================================
+    #  STATISTICS
+    # ============================================================
 
     def get_statistics(self) -> Dict[str, Any]:
-        """Возвращает статистику загруженных угроз"""
-        stats = {
-            **self.statistics,
-            "by_category": {},
-            "by_risk": {},
-            "by_source": {},
-        }
-        
+        by_category: Dict[str, int] = {}
+        by_risk: Dict[str, int] = {}
+        by_source: Dict[str, int] = {}
+
         for threat in self.threats:
-            # By category
-            category = threat.get("result", {}).get("category", "unknown")
-            stats["by_category"][category] = stats["by_category"].get(category, 0) + 1
-            
-            # By risk
-            risk = threat.get("result", {}).get("risk", "unknown")
-            stats["by_risk"][risk] = stats["by_risk"].get(risk, 0) + 1
-            
-            # By source
+            result = threat.get("result", {}) or {}
+
+            category = result.get("category", "unknown")
+            by_category[category] = by_category.get(category, 0) + 1
+
+            risk = ThreatRisk.normalize(result.get("risk"))
+            by_risk[risk] = by_risk.get(risk, 0) + 1
+
             source = threat.get("module", "unknown")
-            stats["by_source"][source] = stats["by_source"].get(source, 0) + 1
-        
-        self.statistics = {**self.statistics, **stats}
+            by_source[source] = by_source.get(source, 0) + 1
+
+        self.statistics["by_category"] = by_category
+        self.statistics["by_risk"] = by_risk
+        self.statistics["by_source"] = by_source
+
         return self.statistics
 
+    # ============================================================
+    #  NORMALIZATION FOR GUI
+    # ============================================================
+
     def export_to_gui_format(self) -> List[Dict[str, Any]]:
-        """Преобразует все загруженные угрозы в формат для GUI"""
-        from xss_security_gui.threat_data_loader import ThreatDataLoader
-        
-        loader = ThreatDataLoader()
-        gui_threats = []
-        
+        """
+        Нормализует угрозы в формат ThreatAnalysisTab через ThreatDataLoader.convert_artifact_for_gui
+        """
+        loader = ThreatDataLoader(base_dir=self.base_dir)
+        gui_threats: List[Dict[str, Any]] = []
+
         for threat in self.threats:
             try:
                 if "result" in threat:
-                    # Format from analyzer1.json or real_breaches.json
-                    gui_threat = loader.convert_artifact_for_gui(threat)
+                    gui = loader.convert_artifact_for_gui(threat)
                 else:
-                    # Already in GUI format or from history
-                    gui_threat = threat
-                
-                gui_threats.append(gui_threat)
+                    gui = threat
+
+                if gui:
+                    gui_threats.append(gui)
             except Exception as e:
-                print(f"[⚠️] Error converting threat to GUI format: {e}")
-        
+                logger.exception("UnifiedThreatLoader: ошибка конвертации угрозы в GUI формат: %s", e)
+
+        logger.info("UnifiedThreatLoader: в GUI формат конвертировано %d угроз", len(gui_threats))
         return gui_threats
 
-    def save_combined_analysis(self, output_file: str = None) -> str:
-        """Сохраняет объединённый анализ всех угроз"""
+    # ============================================================
+    #  SAVE COMBINED ANALYSIS
+    # ============================================================
+
+    def save_combined_analysis(self, output_file: Optional[str | Path] = None) -> str:
         if output_file is None:
             output_file = self.logs_dir / "combined_threat_analysis.json"
         else:
             output_file = Path(output_file)
-        
-        output_file.parent.mkdir(exist_ok=True, parents=True)
-        
+
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+
         data = {
             "timestamp": datetime.now().isoformat(),
             "statistics": self.get_statistics(),
             "threats": self.threats,
         }
-        
-        with open(output_file, 'w', encoding='utf-8') as f:
+
+        with output_file.open("w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        
-        print(f"[✅] Combined analysis saved to: {output_file}")
+
+        logger.info("UnifiedThreatLoader: combined analysis saved to %s", output_file)
         return str(output_file)
 
 
+# ============================================================
+#  LOAD INTO GUI
+# ============================================================
+
 def load_all_threats_to_gui(threat_tab) -> int:
     """
-    Загружает ВСЕ угрозы из всех источников в GUI
-    
-    :param threat_tab: ThreatAnalysisTab instance
-    :return: количество загруженных угроз
+    Загружает ВСЕ угрозы из всех источников в ThreatAnalysisTab.
     """
     loader = UnifiedThreatLoader()
-    
-    print("[*] Loading threats from all sources...")
+
+    logger.info("UnifiedThreatLoader: старт загрузки всех источников...")
     if not loader.load_all_sources():
-        print("[⚠️] No threats found in any source")
+        logger.warning("UnifiedThreatLoader: угрозы не найдены ни в одном источнике")
         return 0
-    
-    print(f"[✅] Loaded {len(loader.threats)} threats total")
-    
-    # Analyze with AI
-    print("[*] Analyzing threats with AI...")
+
+    logger.info("UnifiedThreatLoader: всего сырых угроз: %d", len(loader.threats))
+
+    logger.info("UnifiedThreatLoader: запуск AI анализа...")
     loader.analyze_with_ai()
-    
-    # Get statistics
-    stats = loader.get_statistics()
-    print(f"\n[📊] Statistics:")
-    for category, count in stats["by_category"].items():
-        print(f"  {category}: {count}")
-    
-    # Convert to GUI format and load
-    print("[*] Loading into GUI...")
+
+    logger.info("UnifiedThreatLoader: конвертация в GUI формат...")
     gui_threats = loader.export_to_gui_format()
-    
+
     count = 0
+    errors = 0
+
     for threat in gui_threats:
         try:
-            if hasattr(threat_tab, 'add_threat'):
-                threat_tab.add_threat(threat)
-                count += 1
+            threat_tab.add_threat(threat)
+            count += 1
         except Exception as e:
-            print(f"[⚠️] Error adding threat to GUI: {e}")
-    
-    # Save combined analysis
+            errors += 1
+            logger.exception("UnifiedThreatLoader: ошибка добавления угрозы в GUI: %s", e)
+
     loader.save_combined_analysis()
-    
-    print(f"[✅] Loaded {count} threats into Threat Tab")
+
+    logger.info(
+        "UnifiedThreatLoader: загружено в Threat Tab %d угроз, ошибок: %d",
+        count,
+        errors,
+    )
     return count
 
 
-if __name__ == "__main__":
-    # Example usage
-    loader = UnifiedThreatLoader()
-    
-    print("Loading all threat sources...")
-    if loader.load_all_sources():
-        stats = loader.get_statistics()
-        print(f"\n[📊] Statistics:")
-        for key, value in stats.items():
-            print(f"  {key}: {value}")
-        
-        # Save analysis
-        loader.save_combined_analysis()
-    else:
-        print("[⚠️] No threats loaded")
 

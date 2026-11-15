@@ -37,7 +37,7 @@ def extract_js_insights(js_code: str) -> Dict[str, Any]:
     enable_dynamic = settings.get("js.enable_dynamic_detection", True)
     enable_frameworks = settings.get("js.enable_framework_detection", True)
 
-    return {
+    return _json_safe({
         "functions": _extract_functions(js_code),
         "classes": _extract_classes(js_code),
         "methods": _extract_methods(js_code),
@@ -65,7 +65,7 @@ def extract_js_insights(js_code: str) -> Dict[str, Any]:
 
         "csp_bypass_indicators": _detect_csp_bypass(js_code),
         "jquery_calls": _extract_jquery_http(js_code),
-    }
+    })
 
 
 # ============================================================
@@ -336,6 +336,19 @@ CSP_BYPASS_PATTERNS = [
 
 def _detect_csp_bypass(js: str) -> List[str]:
     return [p for p in CSP_BYPASS_PATTERNS if re.search(p, js)]
+
+# ============================================================
+# 🛡 JSON NORMALIZER
+# ============================================================
+
+def _json_safe(obj):
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (set, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    return obj
 
 def analyze_js_file(path: str) -> Dict[str, Any]:
     """Читает JS-файл и возвращает расширенный отчёт."""

@@ -33,6 +33,7 @@ from typing import Dict, Any, List
 from xss_security_gui.dom_parser import DOMParser
 from xss_security_gui.site_decomposer import SiteDecomposerEngine
 from xss_security_gui.settings import crawler_results_path
+from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
 
 class SiteMapTab(ttk.Frame):
     def __init__(self, parent, threat_tab=None):
@@ -84,8 +85,9 @@ class SiteMapTab(ttk.Frame):
         self.data: Dict[str, Any] = {}
 
         self._filter_text = ""
+        self._bridge = UIQueueBridge(self, poll_ms=100)
         self.load_json()
-        threading.Thread(target=self.auto_refresh_loop, daemon=True).start()
+        self._bridge.post_bg(self.auto_refresh_loop)
 
     # ============================================================
     #                      Статистика
@@ -123,43 +125,40 @@ class SiteMapTab(ttk.Frame):
             messagebox.showwarning("Ввод", "Введите целевой URL для декомпозиции")
             return
 
-        try:
-            engine = SiteDecomposerEngine(url)
-            report = engine.run()
-            engine.export_json()
+        self._bridge.post_ui(messagebox.showinfo, "📊 Декомпозиция сайта", "Запущено в фоне...")
+        engine = SiteDecomposerEngine(url)
+
+        def _on_done(report, _error):
+            try:
+                engine.export_json()
+            except Exception:
+                pass
+            inputs = report.inputs if hasattr(report, "inputs") else report.get("inputs", [])
+            events = report.events if hasattr(report, "events") else report.get("events", [])
 
             if self.threat_tab:
-                for inp in report.get("inputs", []):
+                for inp in inputs:
                     self.threat_tab.add_threat(
-                        {
-                            "type": "FORM_INPUT",
-                            "input": inp,
-                            "url": url,
-                            "source": "Site Decomposer",
-                        }
+                        {"type": "FORM_INPUT", "input": inp, "url": url, "source": "Site Decomposer"}
                     )
-
-                for ev in report.get("events", []):
+                for ev in events:
+                    risk = ev.get("risk_level", "UNKNOWN") if isinstance(ev, dict) else getattr(ev, "risk_level", "UNKNOWN")
                     self.threat_tab.add_threat(
-                        {
-                            "type": "DOM_EVENT",
-                            "event": ev,
-                            "url": url,
-                            "risk": ev.get("risk_level", "UNKNOWN"),
-                            "source": "Site Decomposer",
-                        }
+                        {"type": "DOM_EVENT", "event": ev, "url": url, "risk": risk, "source": "Site Decomposer"}
                     )
 
             msg = (
                 f"🔍 Декомпозиция завершена\n\n"
-                f"✅ Форм: {len(report.get('inputs', []))}\n"
-                f"✅ Событий: {len(report.get('events', []))}\n"
-                f"✅ Угроз: {sum(1 for e in report.get('events', []) if e.get('risk_level') in ['HIGH', 'MEDIUM'])}"
+                f"✅ Форм: {len(inputs)}\n"
+                f"✅ Событий: {len(events)}\n"
+                f"✅ Угроз: {sum(1 for e in events if (e.get('risk_level') if isinstance(e, dict) else getattr(e, 'risk_level', '')) in ['HIGH', 'MEDIUM'])}"
             )
             messagebox.showinfo("📊 Декомпозиция сайта", msg)
 
-        except Exception as e:
-            messagebox.showerror("Ошибка декомпозиции", str(e))
+        def _on_error(_report, err):
+            messagebox.showerror("Ошибка декомпозиции", str(err))
+
+        engine.run_async(callback=lambda report, err: self._bridge.post_ui(_on_done if err is None else _on_error, report, err))
 
     # ============================================================
     #                      Автообновление JSON
@@ -415,3 +414,10 @@ class SiteMapTab(ttk.Frame):
             .replace("&", "_")
             .replace("=", "_")
         )
+
+    def destroy(self):
+        try:
+            self._bridge.stop()
+        except Exception:
+            pass
+        super().destroy()

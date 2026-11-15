@@ -98,21 +98,10 @@ def fuzz_payload(
     timeout: float = DEFAULT_TIMEOUT
 ) -> Dict[str, Any]:
     """
-    Отправка одного пейлоада и анализ ответа.
-
-    Args:
-        action_url: URL формы для тестирования
-        method: HTTP метод (GET/POST)
-        inputs: Список имён полей формы
-        payload: XSS payload для тестирования
-        gui_callback: Опциональный callback для GUI
-        timeout: Таймаут запроса в секундах
-
-    Returns:
-        Словарь с результатами тестирования
+    Реальный боевой XSS‑тест одного payload для одного параметра.
     """
+
     if not inputs:
-        logger.warning(f"[FormFuzz] Пустой список inputs для {action_url}")
         return {
             "url": action_url,
             "method": method,
@@ -120,15 +109,16 @@ def fuzz_payload(
             "payload": payload,
             "status": None,
             "vulnerable": False,
-            "error": "Пустой список inputs",
+            "error": "Empty inputs",
             "category": "Error",
             "snippet": ""
         }
 
-    data = {key: payload for key in inputs}
-    headers = create_aggressive_headers(payload)
+    # Подставляем payload только в один параметр
+    param = inputs[0]
+    data = {param: payload}
 
-    # 🔥 Топ-20 агрессивных заголовков
+    # Агрессивные заголовки
     headers = {
         "User-Agent": payload,
         "Referer": payload,
@@ -153,22 +143,35 @@ def fuzz_payload(
     }
 
     try:
-        # Нормализация URL
         normalized_url = normalize_url(action_url)
 
-        # Отправка запроса
+        # --- Реальный HTTP‑запрос ---
         if method.upper() == "POST":
-            r = requests.post(normalized_url, data=data, headers=headers, timeout=timeout, allow_redirects=True)
+            r = requests.post(
+                normalized_url,
+                data=data,
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=True
+            )
         else:
-            r = requests.get(normalized_url, params=data, headers=headers, timeout=timeout, allow_redirects=True)
+            r = requests.get(
+                normalized_url,
+                params=data,
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=True
+            )
 
         response_text = r.text
-        # Ограничиваем размер response для экономии памяти
-        if len(response_text) > MAX_RESPONSE_SIZE:
-            response_text = response_text[:MAX_RESPONSE_SIZE] + f"\n...[Обрезано {len(r.text) - MAX_RESPONSE_SIZE} символов]"
-
-        reflected = payload in response_text
         status = r.status_code
+
+        # Ограничение размера
+        if len(response_text) > MAX_RESPONSE_SIZE:
+            response_text = response_text[:MAX_RESPONSE_SIZE] + "\n...[TRUNCATED]"
+
+        # --- Проверка Reflected XSS ---
+        reflected = payload in response_text
 
         result = {
             "url": normalized_url,
@@ -183,41 +186,40 @@ def fuzz_payload(
         }
 
         if reflected:
-            # 🔎 Контекстный анализ
             detector = XSSDetector()
+
+            # Контекст HTML
             ctx = detector.detect_xss_context(response_text, payload)
+
+            # DOM‑based XSS
             inline_hits = detector.scan_inline_js_for_payload(response_text, payload)
 
             category = ctx or (inline_hits[0][0] if inline_hits else "Reflected HTML")
-            payload_pos = response_text.find(payload)
-            snippet = inline_hits[0][1] if inline_hits else response_text[
-                                                            max(0,
-                                                                payload_pos - SNIPPET_CONTEXT_WINDOW): payload_pos + len(
-                                                                payload) + SNIPPET_CONTEXT_WINDOW
-                                                            ]
+
+            # Snippet
+            pos = response_text.find(payload)
+            snippet = (
+                inline_hits[0][1]
+                if inline_hits
+                else response_text[max(0, pos - SNIPPET_CONTEXT_WINDOW): pos + len(payload) + SNIPPET_CONTEXT_WINDOW]
+            )
 
             result["category"] = category
             result["snippet"] = snippet.strip()[:SNIPPET_MAX_LENGTH]
 
-            # 📝 Логирование
+            # Логирование
             os.makedirs("logs", exist_ok=True)
             with open("logs/form_fuzz_hits.log", "a", encoding="utf-8") as f:
                 f.write(f"[{datetime.now()}] {category} XSS in {method} → {normalized_url}\n")
-                f.write(f"Inputs: {inputs}\nPayload: {payload}\nStatus: {status}\n")
+                f.write(f"Param: {param}\nPayload: {payload}\nStatus: {status}\n")
                 f.write(f"Snippet: {result['snippet']}\n\n")
 
-            logger.warning(f"[Fuzz] {method} {normalized_url} → ⚠️ {category} XSS [{status}]")
-        else:
-            logger.debug(f"[Fuzz] {method} {normalized_url} → ✓ [{status}]")
-
-        # 🔐 Передача отчёта в Threat Intel
+        # Threat Intel
         report_threatintel(result, gui_callback)
-
         return result
 
     except requests.Timeout as e:
-        logger.error(f"[FormFuzz] Таймаут при отправке формы {action_url}: {e}")
-        error_result = {
+        return {
             "url": action_url,
             "method": method,
             "inputs": inputs,
@@ -228,26 +230,22 @@ def fuzz_payload(
             "category": "Timeout",
             "snippet": ""
         }
-        report_threatintel(error_result, gui_callback)
-        return error_result
+
     except requests.RequestException as e:
-        logger.error(f"[FormFuzz] Сетевая ошибка при отправке формы {action_url}: {e}")
-        error_result = {
+        return {
             "url": action_url,
             "method": method,
             "inputs": inputs,
             "payload": payload,
             "status": None,
             "vulnerable": False,
-            "error": f"RequestException: {str(e)}",
+            "error": f"NetworkError: {str(e)}",
             "category": "NetworkError",
             "snippet": ""
         }
-        report_threatintel(error_result, gui_callback)
-        return error_result
+
     except Exception as e:
-        logger.exception(f"[FormFuzz] Неожиданная ошибка при отправке формы {action_url}: {e}")
-        error_result = {
+        return {
             "url": action_url,
             "method": method,
             "inputs": inputs,
@@ -258,82 +256,73 @@ def fuzz_payload(
             "category": "Error",
             "snippet": ""
         }
-        report_threatintel(error_result, gui_callback)
-        return error_result
 
 
 def fuzz_form(
     action_url: str,
     method: str,
-    inputs: List[str],
-    base_payloads: Optional[List[str]] = None,
+    inputs: List[Dict[str, Any]],
+    param_payloads: Dict[str, List[str]],
     max_workers: int = DEFAULT_MAX_WORKERS,
     gui_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     timeout: float = DEFAULT_TIMEOUT,
     allowlist: Optional[List[str]] = None
 ) -> List[Dict[str, Any]]:
     """
-    Запуск многопоточного фуззинга формы.
-
-    Args:
-        action_url: URL формы для тестирования
-        method: HTTP метод (GET/POST)
-        inputs: Список имён полей формы
-        base_payloads: Базовые payload'ы (если None, загружаются из файла)
-        max_workers: Максимальное количество потоков
-        gui_callback: Опциональный callback для GUI
-        timeout: Таймаут запросов в секундах
-        allowlist: Список разрешённых префиксов URL (если None, проверка пропускается)
-
-    Returns:
-        Список результатов тестирования
-
-    Raises:
-        ValueError: Если URL не в allowlist или inputs пустой
+    Пер‑параметрний XSS‑фуззинг форми.
+    Кожен параметр отримує свої payload‑и.
     """
-    # Валидация входных данных
+
+    # Валидация
     if not inputs:
         raise ValueError("inputs не может быть пустым")
 
     if not action_url:
         raise ValueError("action_url не может быть пустым")
 
-    # Проверка allowlist
+    # Allowlist
     if allowlist:
         if not any(action_url.startswith(prefix) for prefix in allowlist):
             raise ValueError(f"URL {action_url} не находится в allowlist")
 
-    # Нормализация URL
     action_url = normalize_url(action_url)
 
-    base_payloads = base_payloads or load_payloads()
     results = []
+    tasks = []
 
-    # Расширяем мутации и добавляем агрессивные варианты
-    # Используем list для сохранения порядка, но убираем дубликаты
-    mutated_variants = []
-    seen = set()
+    # --- Генерация задач по каждому параметру ---
+    for inp in inputs:
+        name = inp.get("name")
+        if not name:
+            continue
 
-    for base in base_payloads:
-        for variant in mutate_payload(base):
-            if variant not in seen:
-                seen.add(variant)
-                mutated_variants.append(variant)
+        payloads = param_payloads.get(name, [])
 
-        # Добавляем агрессивные payload'ы
-        for agg_payload in AGGRESSIVE_PAYLOADS:
-            if agg_payload not in seen:
-                seen.add(agg_payload)
-                mutated_variants.append(agg_payload)
+        for payload in payloads:
+            tasks.append({
+                "param": name,
+                "payload": payload,
+                "method": method,
+                "url": action_url
+            })
 
-    logger.info(f"[FormFuzz] Запуск фуззинга {action_url} с {len(mutated_variants)} payload'ами")
+    logger.info(f"[FormFuzz] Пер‑параметрный фуззинг {action_url}: {len(tasks)} задач")
 
-    # Многопоточный запуск с обработкой исключений
+    # --- Многопоточный запуск ---
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
-            executor.submit(fuzz_payload, action_url, method, inputs, p, gui_callback, timeout)
-            for p in mutated_variants
+            executor.submit(
+                fuzz_payload,
+                task["url"],
+                task["method"],
+                [task["param"]],
+                task["payload"],
+                gui_callback,
+                timeout
+            )
+            for task in tasks
         ]
+
         for future in as_completed(futures):
             try:
                 results.append(future.result())
@@ -351,5 +340,5 @@ def fuzz_form(
                     "snippet": ""
                 })
 
-    logger.info(f"[FormFuzz] Фуззинг завершён: {len(results)} результатов")
+    logger.info(f"[FormFuzz] Завершено: {len(results)} результатов")
     return results

@@ -24,6 +24,8 @@ import matplotlib.pyplot as plt
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
+
+
 from xss_security_gui.report_merger import ReportMerger
 from xss_security_gui.crawler import crawl_site
 from xss_security_gui.api_parser import extract_api_data
@@ -34,6 +36,7 @@ from xss_security_gui.settings import (
     LOG_HONEYPOT_HITS,
     PARAM_FUZZ_LOG_PATH,
 )
+from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
 
 
 class OverviewTab(ttk.Frame):
@@ -62,6 +65,7 @@ class OverviewTab(ttk.Frame):
 
         # Маппинг «лейбл → (StringVar, функция‑счётчик)»
         self.label_vars: Dict[str, tuple[tk.StringVar, Callable[[], Any]]] = {}
+        self._bridge = UIQueueBridge(self, poll_ms=50)
 
         self.build_ui()
         self.after(4000, self.refresh_stats)
@@ -130,7 +134,11 @@ class OverviewTab(ttk.Frame):
 
         def callback(report: Dict[str, Any], error: Optional[Exception]):
             if error:
-                self.after(0, lambda: messagebox.showerror("Threat Report Merger", f"Ошибка объединения отчётов:\n{error}"))
+                self._bridge.post_ui(
+                    messagebox.showerror,
+                    "Threat Report Merger",
+                    f"Ошибка объединения отчётов:\n{error}",
+                )
                 return
 
             def send():
@@ -140,7 +148,7 @@ class OverviewTab(ttk.Frame):
                 except Exception as e:
                     messagebox.showerror("Threat Report Merger", f"Ошибка отправки в Threat Intel:\n{e}")
 
-            self.after(0, send)
+            self._bridge.post_ui(send)
 
         merger = ReportMerger()
         merger.merge_async(callback)
@@ -155,18 +163,23 @@ class OverviewTab(ttk.Frame):
             messagebox.showerror("Ошибка", "Укажи корректный URL (http/https).")
             return
 
-        def gui_callback(payload: Dict[str, Any]) -> None:
+        def gui_callback(payload: Dict[str, Any]) -> None:     # noinspection PyUnusedLocal
             analyzer = getattr(self.app, "analyzer", None)
             if analyzer and hasattr(analyzer, "update_from_crawler"):
-                self.app.after(0, analyzer.update_from_crawler, payload)
+                self._bridge.post_ui(analyzer.update_from_crawler, payload)
+
 
         def worker() -> None:
             try:
                 crawl_site(url, gui_callback=gui_callback, parallel=True)
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Ошибка краулера", f"Не удалось выполнить краулинг:\n{e}"))
+                self._bridge.post_ui(
+                    messagebox.showerror,
+                    "Ошибка краулера",
+                    f"Не удалось выполнить краулинг:\n{e}",
+                )
 
-        threading.Thread(target=worker, daemon=True, name="OverviewCrawler").start()
+        self._bridge.post_bg(worker)
         messagebox.showinfo("Запущено", "Краулер работает.\nРезультаты смотри во вкладке «Анализатор».")
 
     # ========================================================
@@ -182,14 +195,17 @@ class OverviewTab(ttk.Frame):
         def worker():
             try:
                 results = extract_api_data(log_path, threat_tab=self.threat_tab)
-                self.last_api_results = results
+                self._bridge.post_ui(setattr, self, "last_api_results", results)
                 total = sum(len(v) for v in results.values())
-                self.after(0, lambda: messagebox.showinfo("✅ Парсинг завершён",
-                                                         f"Найдено {total} индикаторов.\nРезультаты отправлены в Threat Intel."))
+                self._bridge.post_ui(
+                    messagebox.showinfo,
+                    "✅ Парсинг завершён",
+                    f"Найдено {total} индикаторов.\nРезультаты отправлены в Threat Intel.",
+                )
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("❌ Ошибка парсинга", str(e)))
+                self._bridge.post_ui(messagebox.showerror, "❌ Ошибка парсинга", str(e))
 
-        threading.Thread(target=worker, daemon=True, name="OverviewAPIParser").start()
+        self._bridge.post_bg(worker)
 
     def run_api_parser_file(self) -> None:
         """Запуск API‑парсера по выбранному лог‑файлу."""
@@ -202,22 +218,24 @@ class OverviewTab(ttk.Frame):
         def worker():
             try:
                 results = extract_api_data(path, threat_tab=self.threat_tab)
-                self.last_api_results = results
+                self._bridge.post_ui(setattr, self, "last_api_results", results)
                 total = sum(len(v) for v in results.values())
-                self.after(
-                    0,
-                    lambda: messagebox.showinfo(
-                        "✅ Парсинг завершён",
-                        f"Найдено {total} индикаторов.\nРезультаты отправлены в Threat Intel.",
-                    ),
+                self._bridge.post_ui(
+                    messagebox.showinfo,
+                    "✅ Парсинг завершён",
+                    f"Найдено {total} индикаторов.\nРезультаты отправлены в Threat Intel.",
                 )
             except Exception as e:
-                self.after(
-                    0,
-                    lambda: messagebox.showerror("❌ Ошибка парсинга", str(e)),
-                )
+                self._bridge.post_ui(messagebox.showerror, "❌ Ошибка парсинга", str(e))
 
-        threading.Thread(target=worker, daemon=True, name="OverviewAPIParserFile").start()
+        self._bridge.post_bg(worker)
+
+    def destroy(self) -> None:
+        try:
+            self._bridge.stop()
+        except Exception:
+            pass
+        super().destroy()
 
 
     # ========================================================
@@ -297,22 +315,44 @@ class OverviewTab(ttk.Frame):
     # ========================================================
 
     def _load_threat_log_objects(self) -> List[Dict[str, Any]]:
+        """
+        Универсальный загрузчик Threat Intel (NDJSON):
+        - поддерживает dict, list, вложенные массивы
+        - возвращает всегда List[dict]
+        """
         if not os.path.exists(self.threat_log_path):
             return []
+
         objs: List[Dict[str, Any]] = []
+
         try:
             with open(self.threat_log_path, encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if not line:
                         continue
+
                     try:
                         obj = json.loads(line)
-                        objs.append(obj)
+
+                        # 1) dict → сразу добавляем
+                        if isinstance(obj, dict):
+                            objs.append(obj)
+
+                        # 2) list → разворачиваем, берём только dict
+                        elif isinstance(obj, list):
+                            for item in obj:
+                                if isinstance(item, dict):
+                                    objs.append(item)
+
+                        # 3) всё остальное игнорируем
+
                     except Exception:
                         continue
+
         except Exception:
             return []
+
         return objs
 
     def show_threat_module_chart(self) -> None:
@@ -324,13 +364,14 @@ class OverviewTab(ttk.Frame):
         counter = Counter()
         for obj in objs:
             module = obj.get("module") or obj.get("type") or "unknown"
-            counter[module] += 1
+            counter[str(module)] += 1
 
         if not counter:
             messagebox.showinfo("Нет данных", "Не удалось извлечь модули из Threat‑лога.")
             return
 
-        modules = list(counter.keys())
+        # Сортируем по убыванию
+        modules = [k for k, _ in sorted(counter.items(), key=lambda x: x[1], reverse=True)]
         counts = [counter[m] for m in modules]
 
         plt.figure(figsize=(8, 5))
@@ -350,6 +391,7 @@ class OverviewTab(ttk.Frame):
 
         counter = Counter()
         for obj in objs:
+            # result.severity приоритетнее, затем severity на корне
             result = obj.get("result") or {}
             sev = result.get("severity") or obj.get("severity") or "info"
             counter[str(sev)] += 1
@@ -399,21 +441,50 @@ class OverviewTab(ttk.Frame):
     # ========================================================
 
     def get_data_path(self) -> str:
-        # Предпочтение deep_crawl.json, fallback на crawler_results.json
-        return (
-            self.deep_crawl_path
-            if os.path.exists(self.deep_crawl_path)
-            else self.crawler_path
-        )
+        """
+        Возвращает путь к актуальному JSON с данными.
+        Приоритет:
+            1) deep_crawl.json — если существует и валиден
+            2) crawler_results.json — fallback
+        """
+        # 1) deep_crawl.json
+        if os.path.exists(self.deep_crawl_path):
+            try:
+                with open(self.deep_crawl_path, encoding="utf-8") as f:
+                    json.load(f)
+                return str(self.deep_crawl_path)
+            except Exception:
+                pass  # файл есть, но повреждён → fallback
+
+        # 2) crawler_results.json
+        if os.path.exists(self.crawler_path):
+            try:
+                with open(self.crawler_path, encoding="utf-8") as f:
+                    json.load(f)
+                return str(self.crawler_path)
+            except Exception:
+                pass
+
+        return ""  # ничего нет
 
     def count_lines(self, path: str) -> int:
+        """
+        Быстрый и безопасный подсчёт строк в файле.
+        Работает даже на больших логах (построчное чтение).
+        """
         if not os.path.exists(path):
             return 0
+
+        count = 0
         try:
-            with open(path, encoding="utf-8") as f:
-                return sum(1 for line in f if line.strip())
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if line.strip():
+                        count += 1
         except Exception:
             return 0
+
+        return count
 
     # ========================================================
     #  Метрики
@@ -444,43 +515,72 @@ class OverviewTab(ttk.Frame):
     def count_threat_types(self) -> str:
         if not os.path.exists(self.threat_log_path):
             return "—"
+
         counter = Counter()
+
         try:
             with open(self.threat_log_path, encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if not line:
                         continue
+
                     try:
                         obj = json.loads(line)
-                        typ = obj.get("type") or obj.get("module") or "unknown"
-                        counter[typ] += 1
+
+                        # --- Нормализация Threat Intel ---
+                        # 1) Если dict → обрабатываем напрямую
+                        if isinstance(obj, dict):
+                            typ = obj.get("type") or obj.get("module") or "unknown"
+                            counter[str(typ)] += 1
+                            continue
+
+                        # 2) Если list → разворачиваем
+                        if isinstance(obj, list):
+                            for item in obj:
+                                if isinstance(item, dict):
+                                    typ = item.get("type") or item.get("module") or "unknown"
+                                    counter[str(typ)] += 1
+                            continue
+
+                        # 3) Всё остальное игнорируем
+
                     except Exception:
                         continue
+
         except Exception:
             return "—"
 
         if not counter:
             return "—"
-        return ", ".join(f"{k}:{v}" for k, v in counter.items())
+
+        # Красивый, отсортированный вывод: type:count, type:count...
+        return ", ".join(f"{k}:{v}" for k, v in sorted(counter.items()))
 
     def last_threat_timestamp(self) -> str:
         if not os.path.exists(self.threat_log_path):
             return "—"
+
         try:
-            with open(self.threat_log_path, encoding="utf-8") as f:
-                lines = [line for line in f if line.strip()]
-            if not lines:
+            objs = self._load_threat_log_objects()
+            if not objs:
                 return "—"
-            last = json.loads(lines[-1])
+
+            # Берём последний объект по порядку в файле
+            last = objs[-1]
             ts = last.get("timestamp")
             if not ts:
                 return "—"
+
+            # Аккуратный парсинг ISO‑формата
             try:
-                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                # datetime импортирован как модуль, поэтому:
+                dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
                 return dt.strftime("%Y-%m-%d %H:%M:%S")
             except Exception:
-                return ts
+                # Если формат нестандартный — возвращаем как есть
+                return str(ts)
+
         except Exception:
             return "—"
 

@@ -13,12 +13,14 @@
 
 import json
 import sys
+import os
 from pathlib import Path
 from datetime import datetime, timedelta
 import random
 
 # Добавляем путь для импорта
-sys.path.insert(0, str(Path(__file__).parent))
+base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, base_dir)
 
 from xss_security_gui.data_generator import (
     generate_credit_card,
@@ -60,6 +62,15 @@ def generate_threat_intel_artifacts():
                 "risk": "high",
                 "email_leak": {
                     "emails": emails_list,
+                    "phones": [generate_phone_number() for _ in range(len(emails_list))],
+                    "credit_cards": [generate_credit_card() for _ in range(min(2, len(emails_list)))],
+                    "cvv": [f"{random.randint(100, 999)}" for _ in range(min(2, len(emails_list)))],
+                    "card_expiry": [f"{random.randint(1,12):02d}/{random.randint(26,30)}" for _ in range(min(2, len(emails_list)))],
+                    "account_numbers": [f"40817810{random.randint(10000000, 99999999)}" for _ in range(len(emails_list))],
+                    "passwords": smtp_pass,
+                    "logins": smtp_users,
+                    "full_names": [generate_name() for _ in range(len(emails_list))],
+                    "addresses": [generate_address() for _ in range(len(emails_list))],
                     "smtp_users": smtp_users,
                     "smtp_passwords": smtp_pass,
                 },
@@ -327,4 +338,5 @@ def main():
 if __name__ == "__main__":
     success = main()
     sys.exit(0 if success else 1)
+
 

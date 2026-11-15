@@ -195,7 +195,7 @@ class BatchProcessor:
         self.batch = self.batch[self.batch_size:]
 
         try:
-            self.callback(batch_to_send)
+            self._dispatch_callback(self.callback, batch_to_send)
             self._last_flush = time.time()
             self.log.debug(f"Flushed {len(batch_to_send)} items")
         except Exception as e:
@@ -225,4 +225,13 @@ class BatchProcessor:
         """Очистить батч"""
         with self._lock:
             self.batch.clear()
+
+    @staticmethod
+    def _dispatch_callback(callback: Callable, payload: List[Dict[str, Any]]) -> None:
+        owner = getattr(callback, "__self__", None)
+        after = getattr(owner, "after", None)
+        if callable(after):
+            after(0, lambda p=payload: callback(p))
+        else:
+            callback(payload)
 

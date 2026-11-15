@@ -8,7 +8,7 @@ import threading
 from datetime import datetime
 from typing import Dict, Any, Iterable, List
 
-from xss_security_gui.threat_analysis.threat_connector import ThreatBackendBase
+from xss_security_gui.threat_analysis.backends.base_backend import ThreatBackendBase
 from xss_security_gui.threat_data_loader import ThreatRisk
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

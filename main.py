@@ -11,11 +11,11 @@ import datetime
 import json
 import logging
 import queue
-from typing import Optional, Dict, Callable
+from typing import Optional, Dict, Callable, Any, TypeVar
 
 import tkinter as tk
-from tkinter import ttk
-
+from tkinter import messagebox, simpledialog, ttk
+TabType = TypeVar("TabType", bound=ttk.Frame)
 # ==============================
 #  Безопасная консоль UTF-8
 # ==============================
@@ -40,7 +40,10 @@ from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
 # ============================================================
 #  Combat Engine
 # ============================================================
-from xss_security_gui.combat_crawler import run_combat_crawl
+from xss_security_gui.combat_crawler import (
+    is_active_target_allowed,
+    run_combat_crawl,
+)
 from xss_security_gui.combat_results_tab import CombatResultsTab
 
 # ============================================================
@@ -75,8 +78,8 @@ _logger = logging.getLogger(__name__)
 from xss_security_gui.tabs.ai_verdict_tab import AIVerdictTab
 from xss_security_gui.tabs.ai_training_tab import AITrainingTab
 from xss_security_gui.tabs.xss_flooder_tab import XSSFlooderTab
-from xss_security_gui.ai_core.nn_model import load_trained_model
 from xss_security_gui.live_monitor import LiveAttackMonitor
+from xss_security_gui.threat_analysis.live_attack_monitor import AttackStreamProcessor
 from xss_security_gui.crawler import (
     crawl_site,
     save_outputs,
@@ -96,7 +99,6 @@ from xss_security_gui.mutator_task_manager import MutatorTaskManager
 from xss_security_gui.threat_analysis.threat_connector import LIVE_MONITOR_QUEUE, ThreatConnector
 from xss_security_gui.network_tab import NetworkTab
 from xss_security_gui.utils.disable_ssl_warnings import disable_ssl_warnings
-
 disable_ssl_warnings()
 
 # ============================================================
@@ -129,30 +131,31 @@ from xss_security_gui.gui.security_dashboard_panel import SecurityDashboardPanel
 from xss_security_gui.dom_parser_tab import DOMParserTab
 from xss_security_gui.attack_report_tab import AttackReportTab
 from xss_security_gui.autoanalyzer_tab import AutoAnalyzerTab
-from xss_security_gui.gui.defense_evasion_lab import DefenseEvasionLab
 from xss_security_gui.gui.mutator_tasks_panel import MutatorTasksPanel
 from xss_security_gui.gui.real_time_monitoring_tab import RealTimeMonitoringTab
 from xss_security_gui.threat_analysis.accounts_tab import AccountsTab
 from xss_security_gui.threat_analysis.account_intelligence_tab import AccountIntelligenceTab
 
 # ============================================================
-#  GUI вкладки из папки tabs/
+#  GUI вкладки (Threat Intelligence / Analyzer / Breaches )
 # ============================================================
-from xss_security_gui.tabs.analyzer_source_tab import AnalyzerSourceTab
-from xss_security_gui.tabs.real_breaches_tab import RealBreachesTab
-from xss_security_gui.tabs.history_tab import HistoryTab
-from xss_security_gui.tabs.threat_sources_tab import ThreatSourcesTab
-from xss_security_gui.tabs.proxy_tab import ProxyTab
-from xss_security_gui.tabs.tree_view_tab import SuperCrawlerTreeViewTab
-from xss_security_gui.tabs.monitor_tab import SuperCrawlerMonitorTab
+from xss_security_gui.proxy_tab import ProxyTab
+from xss_security_gui.tree_view_tab import SuperCrawlerTreeViewTab
+from xss_security_gui.monitor_tab import SuperCrawlerMonitorTab
 from xss_security_gui.tabs.auto_modules_tab import AutoModulesTab
 
 # ============================================================
 #  AutoRecon
 # ============================================================
-from xss_security_gui.auto_recon.scanner import EndpointScanner
-from xss_security_gui.auto_recon.payloads import PayloadGenerator
-from xss_security_gui.auto_recon.planner import AttackPlanner
+from xss_security_gui.auto_recon.orchestrator import (
+    AutoReconOrchestrator,
+    run_full_autorecon,
+    run_aggressive_scan,
+)
+from xss_security_gui.auto_recon.scope import (
+    is_target_authorized,
+    normalize_http_url,
+)
 from xss_security_gui.threat_tab_connector import ThreatIntelConnector
 
 # ============================================================
@@ -165,14 +168,10 @@ from xss_security_gui.file_loader import load_file, save_json
 # ============================================================
 from xss_security_gui.real_time_watcher import RealTimeThreatWatcher
 from xss_security_gui.integrations.email_leak_worker import EmailLeakWorker
+from xss_security_gui.integrations.email_leak_tab import EmailLeakWorkerTab
 
 # Thread worker utility
 from xss_security_gui.utils.thread_worker import init_global_worker, run_in_thread
-
-# ============================================================
-#  PyQt Attack GUI
-# ============================================================
-from xss_security_gui.gui.attack_gui import AttackGUI
 
 # ============================================================
 #  Deep Crawler 5.0
@@ -223,8 +222,11 @@ class XSSSecurityGUI(tk.Tk):
         # Sidebar + Content Area
         self.sidebar: Optional[ttk.Frame] = None
         self.content_area: Optional[ttk.Frame] = None
-        self.tabs: Dict[str, Callable[[ttk.Frame], tk.Widget]] = {}
-        self._tab_instances: Dict[str, tk.Widget] = {}
+        self.tabs: Dict[str, Callable[[ttk.Frame], ttk.Frame]] = {}
+        self._tab_instances: Dict[str, ttk.Frame] = {}
+        # self.tabs: Dict[str, Callable[[ttk.Frame], tk.Widget]] = {}
+        # self._tab_instances: Dict[str, tk.Widget] = {}
+
 
         self.honeypot_log = None
         self.log_view = None
@@ -240,13 +242,14 @@ class XSSSecurityGUI(tk.Tk):
         self.analyzer: Optional[XSSAnalyzerApp] = None
         self.full_analysis_tab: Optional[FullAnalysisTab] = None
         self.real_time_watcher: Optional[RealTimeThreatWatcher] = None
-        self._email_leak_initialized: bool = False
         self.email_leak_worker: Optional[EmailLeakWorker] = None
         self.mutator_manager: MutatorTaskManager = MutatorTaskManager(max_workers=6)
 
         # Combat Mode
         self.combat_tab: Optional[CombatResultsTab] = None
         self._combat_result_queue: queue.Queue = queue.Queue()
+        self._latest_combat_report: Optional[Dict[str, Any]] = None
+        self._autorecon_running = False
 
         # MutatorManager callback → UIQueueBridge
         self.mutator_manager.on_task_finished = (
@@ -273,9 +276,6 @@ class XSSSecurityGUI(tk.Tk):
         except Exception as e:
             _logger.warning("[⚠️] GlobalWorker init failed: %s", e)
 
-        # AI Core — load NN model in background
-        self.after(500, self._load_ai_model_async)
-
         # URL input + dynamic tabs
         self.add_url_entry()
         self.load_dynamic_tabs()
@@ -287,6 +287,7 @@ class XSSSecurityGUI(tk.Tk):
         self.add_super_crawl_button()
         self.add_crawl_graph_button()
         self.add_combat_button()
+        self.add_autorecon_button()
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -298,19 +299,6 @@ class XSSSecurityGUI(tk.Tk):
 
         current_theme = settings.get("gui.theme")
         _logger.info("[GUI] Тема интерфейса: %s", current_theme)
-
-    # ============================================================
-    #  Ленивая инициализация AI модели
-    # ============================================================
-    def _load_ai_model_async(self):
-        def _worker():
-            try:
-                load_trained_model("models/nn_model_trained.joblib")
-                _logger.info("[✅ AI] NN Model loaded successfully")
-            except Exception as e:
-                _logger.warning("[⚠️ AI] NN Model not loaded: %s", e)
-
-        run_in_thread(_worker)
 
     # ============================================================
     #  ThreatConnector lazy init
@@ -353,11 +341,7 @@ class XSSSecurityGUI(tk.Tk):
     # ============================================================
     def _create_security_dashboard_tab(self, parent):
         try:
-            return SecurityDashboardPanel(
-                parent,
-                ui=self._ui_queue_bridge,
-                threat_monitor=self._live_attack_monitor,
-            )
+            return SecurityDashboardPanel(parent)
         except Exception as e:
             _logger.warning("[⚠️] SecurityDashboardPanel init failed: %s", e)
             frame = ttk.Frame(parent)
@@ -371,13 +355,23 @@ class XSSSecurityGUI(tk.Tk):
     # ============================================================
     def _create_supercrawler_monitor_tab(self, parent):
         if self.supercrawler_monitor_tab is None:
-            self.supercrawler_monitor_tab = SuperCrawlerMonitorTab(parent)
+            # передаємо root_url з головного інпуту
+            self.supercrawler_monitor_tab = SuperCrawlerMonitorTab(
+                parent,
+                root_url=self.url_var.get(),
+            )
         return self.supercrawler_monitor_tab
 
     def _create_supercrawler_tree_tab(self, parent):
         if self.supercrawler_tree_tab is None:
             self.supercrawler_tree_tab = SuperCrawlerTreeViewTab(parent)
         return self.supercrawler_tree_tab
+
+    def _on_live_attack_event(self, data: Dict[str, Any]):
+        try:
+            self._event_queue.put(data)
+        except Exception as e:
+            print("[_on_live_attack_event] error:", e)
 
     # ============================================================
     #  Построение вкладок GUI — Burp Suite Sidebar Edition
@@ -466,8 +460,20 @@ class XSSSecurityGUI(tk.Tk):
         self.supercrawl_progress.pack(pady=5)
         self.supercrawl_progress["value"] = 0
 
-        # LiveAttackMonitor
-        self._live_attack_monitor = LiveAttackMonitor(ttk.Frame(), LIVE_MONITOR_QUEUE)
+        # LiveAttackMonitor (GUI)
+        self._event_queue = queue.Queue()
+
+        self._live_attack_gui = LiveAttackMonitor(
+            parent=self.content_area,
+            event_queue=self._event_queue
+        )
+        self._live_attack_gui.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # AttackStreamProcessor (backend)
+        self._attack_stream = AttackStreamProcessor(
+            ui=self._ui_queue_bridge,
+            gui_callback=self._on_live_attack_event
+        )
 
         # ------------------------------------------------------------
         # 1. Основные инструменты
@@ -476,7 +482,11 @@ class XSSSecurityGUI(tk.Tk):
         self._add_sidebar_tab("🕷️ SuperCrawler Monitor", lambda p: self._create_supercrawler_monitor_tab(p))
         self._add_sidebar_tab("🌳 SuperCrawler Tree View", lambda p: self._create_supercrawler_tree_tab(p))
         self._add_sidebar_tab("🛰️ SSRF Tester", lambda p: SSRFTab(p, self.url_var.get()))
-        self._add_sidebar_tab("📦 Threat Intel", lambda p: ThreatAnalysisTab(p))
+        self._add_sidebar_tab(
+            "📦 Threat Intel",
+            lambda p: ThreatAnalysisTab(p, result_queue=self._combat_result_queue)
+        )
+
         self._add_sidebar_tab(
             "🕷️ Анализатор",
             lambda p: XSSAnalyzerApp(p, status_var=self.status, threat_tab=self.threat_tab),
@@ -543,17 +553,30 @@ class XSSSecurityGUI(tk.Tk):
         self._add_sidebar_tab("🛠️ Настройки JSON", lambda p: SettingsEditor(p))
         self._add_sidebar_tab("⚙️ Настройки", lambda p: SettingsTab(p))
         self._add_sidebar_tab("🌍 Environment", lambda p: EnvironmentTab(p, env_path=BASE_DIR / ".env"))
-        self._add_sidebar_tab("📡 AutoRecon Dashboard", lambda p: AutoReconDashboardTab(p))
+        self._add_sidebar_tab(
+            "📡 AutoRecon Dashboard",
+            lambda p: AutoReconDashboardTab(
+                p,
+                url_var=self.url_var,
+            threat_tab=self.threat_tab,
+                on_complete=self._on_autorecon_complete,
+                on_email_audit=self._start_email_leak_audit,
+            ),
+        )
+        self._add_sidebar_tab(
+            "EmailLeakWorker",
+            lambda p: EmailLeakWorkerTab(
+                p,
+                worker_provider=self._get_email_leak_worker,
+                target_provider=lambda: self.url_var.get(),
+            ),
+        )
         self._add_sidebar_tab("🛰 Internal Scan", lambda p: InternalScanTab(p))
 
         # ------------------------------------------------------------
         # 7. Threat Intelligence
         # ------------------------------------------------------------
         self._add_sidebar_group("Threat Intelligence")
-        self._add_sidebar_tab("🔍 Analyzer Source", lambda p: AnalyzerSourceTab(p, threat_tab=self.threat_tab))
-        self._add_sidebar_tab("💥 Real Breaches", lambda p: RealBreachesTab(p, threat_tab=self.threat_tab))
-        self._add_sidebar_tab("📅 History", lambda p: HistoryTab(p, threat_tab=self.threat_tab))
-        self._add_sidebar_tab("📚 Threat Sources", lambda p: ThreatSourcesTab(p, threat_tab=self.threat_tab))
         self._add_sidebar_tab("🛰 Internal Hosts", lambda p: InternalHostsTab(p))
         self._add_sidebar_tab(
             "📡 Real-Time Monitoring",
@@ -570,7 +593,9 @@ class XSSSecurityGUI(tk.Tk):
         self._add_sidebar_tab("🔍 Auto Analyzer", lambda p: AutoAnalyzerTab(p, threat_tab=self.threat_tab))
         self._add_sidebar_tab(
             "🛡️ Defense Evasion Tasks",
-            lambda p: MutatorTasksPanel(p, self.mutator_manager, ui_bridge=self._ui_queue_bridge),
+            lambda p: MutatorTasksPanel(
+                p, self.mutator_manager, ui_bridge=self._ui_queue_bridge
+            ),
         )
 
         # Открыть первую вкладку
@@ -611,7 +636,8 @@ class XSSSecurityGUI(tk.Tk):
         target_parent = container if container is not None else self.sidebar
         btn = ttk.Button(target_parent, text=label, command=lambda: self._open_tab(label))
         btn.pack(fill="x", padx=12, pady=2)
-        self.tabs[label] = factory
+        self.tabs[label] = factory  # type: Callable[[ttk.Frame], ThreatAnalysisTab]
+
 
     def _toggle_group(self, title: str):
         info = self._group_containers.get(title)
@@ -639,7 +665,15 @@ class XSSSecurityGUI(tk.Tk):
             # Threat Intel — singleton
             if label == "📦 Threat Intel":
                 if self.threat_tab is None:
-                    self.threat_tab = self.tabs[label](self.content_area)
+                    # 🔥 Явно вказуємо тип, чтобы PyCharm не думал что это Widget
+                    self.threat_tab: ThreatAnalysisTab = self.tabs[label](
+                        self.content_area,
+                        result_queue=self._combat_result_queue
+                    )
+
+                    # 🔥 Запускаем Combat Event Reader (читает события из CombatCrawler)
+                    self.threat_tab.start_combat_event_reader()
+
                 self.threat_tab.pack(fill="both", expand=True)
 
                 try:
@@ -647,13 +681,12 @@ class XSSSecurityGUI(tk.Tk):
                 except Exception as e:
                     _logger.warning("[⚠️] Не удалось инициализировать XSSDetector: %s", e)
 
-                self.after(500, self._init_email_leak)
-
                 if self.real_time_watcher is None:
                     self.real_time_watcher = RealTimeThreatWatcher(
                         threat_tab=self.threat_tab,
                         url=self.url_var.get(),
                         interval=15,
+                        result_queue=self._combat_result_queue
                     )
                     self.real_time_watcher.start()
 
@@ -667,6 +700,9 @@ class XSSSecurityGUI(tk.Tk):
                         result_queue=self._combat_result_queue,
                         threat_tab=self.threat_tab,
                     )
+                    if self._latest_combat_report is not None:
+                        self.combat_tab.set_report(self._latest_combat_report)
+                self._tab_instances[label] = self.combat_tab
                 self.combat_tab.pack(fill="both", expand=True)
                 return
 
@@ -682,7 +718,7 @@ class XSSSecurityGUI(tk.Tk):
                     _logger.error("[❌] Failed to create tab '%s': %s", label, e)
                     frame = ttk.Frame(self.content_area)
                     ttk.Label(
-                        frame,
+            frame,
                         text=f"Ошибка создания вкладки '{label}': {e}",
                     ).pack(fill="both", expand=True)
                     self._tab_instances[label] = frame
@@ -695,26 +731,111 @@ class XSSSecurityGUI(tk.Tk):
     # ============================================================
     #  Email Leak Integration init
     # ============================================================
-    def _init_email_leak(self):
-        def _ui():
-            if not self.threat_tab:
-                self._ui_queue_bridge.post_ui(lambda: self._init_email_leak())
-                return
+    def _get_email_leak_worker(self) -> EmailLeakWorker:
+        if self.email_leak_worker is None:
+            self.email_leak_worker = EmailLeakWorker(
+                threat_tab=self.threat_tab,
+                ui_bridge=self._ui_queue_bridge,
+                target_provider=lambda: self.url_var.get(),
+                on_complete=self._on_email_leak_audit_complete,
+            )
+        else:
+            self.email_leak_worker.threat_tab = self.threat_tab
+        return self.email_leak_worker
 
-            if not hasattr(self, "email_leak_worker") or self.email_leak_worker is None:
-                self.email_leak_worker = EmailLeakWorker(
-                    threat_tab=self.threat_tab,
-                    ui_bridge=self._ui_queue_bridge,
+    def _start_email_leak_audit(self, raw_target: Optional[str] = None):
+        """Start active email-exposure verification from the AutoRecon Dashboard."""
+        try:
+            target = normalize_http_url(raw_target or self.url_var.get())
+        except ValueError as exc:
+            messagebox.showerror("Email Exposure Audit", str(exc), parent=self)
+            return
+        if not is_target_authorized(target):
+            messagebox.showerror(
+                "Email Exposure Audit заблокирован",
+                "Цель отсутствует в ALLOW_REAL_RUN / ALLOWED_TARGETS.\n\n"
+                f"Цель: {target}",
+                parent=self,
+            )
+            return
+        if not messagebox.askyesno(
+            "Подтверждение Email Exposure Audit",
+            "Будут собраны доступные страницы, адреса email и сведения о same-origin "
+            "GET/POST-формах. При активной проверке разрешённые plain-text значения "
+            "могут быть отправлены только в совпадающие поля same-origin форм. "
+            "Пароли, файлы и исполняемые payload не отправляются. "
+            "Редиректы проверяются пошагово и допускаются только внутри origin цели.\n\n"
+            f"Запустить проверку {target}?",
+            parent=self,
+        ):
+            return
+
+        raw_values = simpledialog.askstring(
+            "Поля для активной проверки",
+            'Необязательно: JSON с именами полей и обычными тестовыми значениями, '
+            'например {"q":"audit-check"}. Оставьте пустым для пассивного аудита.',
+            parent=self,
+        )
+        if raw_values is None:
+            return
+        try:
+            form_values = json.loads(raw_values) if raw_values.strip() else {}
+            if not isinstance(form_values, dict) or any(
+                not isinstance(name, str) or not isinstance(value, str)
+                for name, value in form_values.items()
+            ):
+                raise ValueError("Ожидался JSON-объект со строковыми именами и значениями.")
+        except (json.JSONDecodeError, ValueError) as exc:
+            messagebox.showerror("Email Exposure Audit", str(exc), parent=self)
+            return
+
+        worker = self._get_email_leak_worker()
+        try:
+            started = worker.start(
+                target,
+                active_testing=bool(form_values),
+                form_values=form_values,
+            )
+        except (TypeError, ValueError) as exc:
+            messagebox.showerror("Email Exposure Audit", str(exc), parent=self)
+            return
+        if not started:
+            messagebox.showinfo(
+                "Email Exposure Audit",
+                "Проверка уже выполняется.",
+                parent=self,
+            )
+
+    def _on_email_leak_audit_complete(self, result: Dict[str, Any]) -> None:
+        email_tab = self._tab_instances.get("EmailLeakWorker")
+        if isinstance(email_tab, EmailLeakWorkerTab):
+            if result.get("status") == "failed":
+                email_tab.set_error(str(result.get("error", "unknown error")))
+            else:
+                email_tab.set_result(result)
+
+        dashboard = self._tab_instances.get("📡 AutoRecon Dashboard")
+        if isinstance(dashboard, AutoReconDashboardTab):
+            if result.get("status") == "completed":
+                dashboard.status_var.set(
+                    f"Email audit complete — {result.get('page_count', 0)} pages, "
+                    f"{len(result.get('emails', []))} masked emails, "
+                    f"{result.get('requests', 0)} requests"
+                )
+                dashboard._append_output(
+                    "\n📧 Email Exposure Audit complete: "
+                    f"{result.get('page_count', 0)} pages, "
+                    f"{result.get('form_count', 0)} forms, "
+                    f"{len(result.get('emails', []))} masked email addresses, "
+                    f"{len(result.get('form_submissions', []))} form submissions.\n"
+                )
+                dashboard.refresh_dashboard()
+            else:
+                dashboard.status_var.set(
+                    f"Email audit {result.get('status')}: "
+                    f"{result.get('error', 'no additional details')}"
                 )
 
-            if self.email_leak_worker.is_running():
-                self.threat_tab.status_var.set("📡 Email Leak Integration уже выполняется…")
-                return
-
-            self.threat_tab.status_var.set("📦 Email Leak Integration: запуск…")
-            self.email_leak_worker.start()
-
-        self._ui_queue_bridge.post_ui(_ui)
 
     # ============================================================
     #  Mutator task completion
@@ -804,11 +925,16 @@ class XSSSecurityGUI(tk.Tk):
         self.log(f"[🎛️] Запуск AttackGUI для: {url}")
 
         def _ui():
-            win = tk.Toplevel(self)
-            win.title(f"AttackGUI — {url}")
+            try:
+                from xss_security_gui.gui.attack_gui import AttackGUI
+            except ImportError as exc:
+                self.log(f"[❌] AttackGUI недоступен: {exc}")
+                return
+        win = tk.Toplevel(self)
+        win.title(f"AttackGUI — {url}")
 
-            attack_frame = AttackGUI(win, domain=url)
-            attack_frame.pack(fill="both", expand=True)
+        attack_frame = AttackGUI(win, domain=url)
+        attack_frame.pack(fill="both", expand=True)
 
         self._ui_queue_bridge.post_ui(_ui)
 
@@ -860,6 +986,134 @@ class XSSSecurityGUI(tk.Tk):
             command=self._launch_combat_cycle,
         )
         btn.pack(side="left", padx=5)
+
+    def add_autorecon_button(self):
+        btn = ttk.Button(
+            self.url_frame,
+            text="🎯 AutoRecon RT",
+            command=self._launch_autorecon,
+        )
+        btn.pack(side="left", padx=5)
+
+    def _launch_autorecon(self):
+        """Run scoped AutoRecon after explicit authorization confirmation."""
+        if getattr(self, "_autorecon_running", False):
+            self.log("⚠️ AutoRecon уже выполняется.")
+            return
+        raw_url = self.url_var.get().strip()
+        if not raw_url:
+            self.log("⚠️ Введіть цільовий URL перед запуском AutoRecon.")
+            return
+        try:
+            url = normalize_http_url(raw_url)
+        except ValueError as exc:
+            self.log(f"[❌] AutoRecon scope error: {exc}")
+            return
+        if not is_target_authorized(url):
+            messagebox.showerror(
+                "AutoRecon заблокирован",
+                "Цель не разрешена политикой ALLOW_REAL_RUN / ALLOWED_TARGETS.\n\n"
+                f"Цель: {url}",
+                parent=self,
+            )
+            return
+        if not messagebox.askyesno(
+            "Подтверждение AutoRecon",
+            "Цель входит в утвержденный allowlist.\n\n"
+            "AutoRecon просканирует до 100 страниц (не более 200 сетевых запросов; "
+            "ответ до 1 MiB). EndpointScanner проверяет отражение инертными "
+            "canary-маркерами; отдельный активный этап может отправлять выбранные "
+            "XSS-проверочные payloads в GET/POST-параметры. Поля паролей, файлов "
+            "и секретов исключаются; отражение canary не является подтверждением XSS. "
+            "Все запросы остаются в пределах этого origin. "
+            "POST-запросы могут менять данные приложения. "
+            "Редиректы проходят только после проверки каждого перехода; "
+            "разрешены лишь URL того же origin.\n\n"
+            f"Начать аудит {url}?",
+            parent=self,
+        ):
+            return
+
+        self._autorecon_running = True
+        self.log(f"🎯 AutoRecon Orchestrator → {url}")
+        self.status.set("AutoRecon: SCANNING…")
+        self._open_tab("📡 AutoRecon Dashboard")
+        self._ui_queue_bridge.post_bg(
+            self._autorecon_worker,
+            self._on_autorecon_done,
+            url,
+            True,
+        )
+
+    def _autorecon_worker(
+        self, url: str, active_testing: bool = False
+    ) -> Dict[str, Any]:
+        def progress(msg: Dict[str, Any]) -> None:
+            self._ui_queue_bridge.post_ui(self._on_autorecon_progress, msg)
+
+        return run_full_autorecon(
+            url,
+            config={"active_testing": active_testing},
+            callback=progress,
+        )
+
+    def _on_autorecon_progress(self, msg: Dict[str, Any]) -> None:
+        stage = str(msg.get("stage") or "AUTO")
+        status = str(msg.get("status") or "")
+        details = msg.get("details") or {}
+        extra = ""
+        if details:
+            extra = " " + json.dumps(details, ensure_ascii=False, default=str)[:180]
+        self.log(f"[AutoRecon][{stage}] {status}{extra}")
+        self.status.set(f"AutoRecon: {stage} / {status}")
+
+    def _on_autorecon_done(self, result: Any) -> None:
+        self._autorecon_running = False
+        if isinstance(result, Exception):
+            self.log(f"[❌] AutoRecon failed: {type(result).__name__}: {result}")
+            self.status.set("AutoRecon: error")
+            return
+        self._on_autorecon_complete(result if isinstance(result, dict) else {"result": result})
+
+    def _on_autorecon_complete(self, result: Dict[str, Any]) -> None:
+        if result.get("status") == "blocked":
+            reason = result.get("error", "Scope authorization failed")
+            self.log(f"[🚫] AutoRecon blocked: {reason}")
+            self.status.set("AutoRecon: scope blocked")
+            return
+        meta = result.get("metadata") or {}
+        risk = meta.get("risk_level", "unknown")
+        score = meta.get("risk_score", 0)
+        duration = meta.get("duration_seconds")
+        self.log(
+            f"✅ AutoRecon complete | risk={risk} score={score} duration={duration}"
+        )
+        self.status.set(f"AutoRecon done — {risk}")
+
+        connector = self.get_threat_connector()
+        if connector:
+            try:
+                connector.emit("auto_recon", (meta.get("targets") or [self.url_var.get()])[0], {
+                    "risk_level": risk,
+                    "risk_score": score,
+                    "threat_summary": result.get("threat_summary"),
+                })
+            except Exception as e:
+                self.log(f"[⚠️] Threat Intel emit failed: {e}")
+
+        if self.threat_tab and hasattr(self.threat_tab, "add_threat"):
+            try:
+                self.threat_tab.add_threat({
+                    "module": "AutoReconOrchestrator",
+                    "target": (meta.get("targets") or [self.url_var.get()])[0],
+                    "result": {
+                        "category": "auto_recon",
+                        "risk": risk,
+                        "score": score,
+                    },
+                })
+            except Exception as e:
+                self.log(f"[⚠️] ThreatTab update failed: {e}")
 
     # ============================================================
     #  Super Crawler
@@ -1052,14 +1306,31 @@ class XSSSecurityGUI(tk.Tk):
 """
         )
 
+        active_testing = False
+        if is_active_target_allowed(url):
+            active_testing = messagebox.askyesno(
+                "Подтвердите активный аудит",
+                "Цель находится в ALLOWED_TARGETS и ALLOW_REAL_RUN включен.\n\n"
+                "Активная проверка отправит безвредный reflection-canary в формы "
+                "GET/POST (кроме форм с паролями и загрузкой файлов). "
+                "POST может изменить данные на сервере.\n\n"
+                "Продолжить активную проверку?",
+                parent=self,
+            )
+        else:
+            self.log(
+                "ℹ️ Цель не разрешена в ALLOWED_TARGETS или ALLOW_REAL_RUN отключен; "
+                "активные GET/POST-проверки пропущены. Сбор страниц продолжится."
+            )
+
         threading.Thread(
             target=self._combat_cycle_worker,
-            args=(url,),
+            args=(url, active_testing),
             daemon=True,
             name="CombatCycle",
         ).start()
 
-    def _combat_cycle_worker(self, url: str):
+    def _combat_cycle_worker(self, url: str, active_testing: bool = False):
         """Workers for combat cycle"""
         try:
             from xss_security_gui.combat_crawler import run_combat_crawl
@@ -1073,15 +1344,11 @@ class XSSSecurityGUI(tk.Tk):
             report = run_combat_crawl(
                 target_url=url,
                 result_queue=self._combat_result_queue,
-                progress_callback=progress_callback
+                progress_callback=progress_callback,
+                active_testing=active_testing,
             )
 
-            # Отправить результаты в очередь для GUI
-            self._combat_result_queue.put({
-                "type": "combat_complete",
-                "data": report,
-                "timestamp": datetime.datetime.now().isoformat()
-            })
+            self._ui_queue_bridge.post_ui(self._on_combat_cycle_complete, report)
 
             self.after(0, lambda: self.log(f"""
     ╔════════════════════════════════════════╗
@@ -1095,6 +1362,11 @@ class XSSSecurityGUI(tk.Tk):
             import traceback
             self.after(0, lambda: self.log(f"[❌] Помилка боевого цикла: {type(e).__name__}: {e}"))
             self.after(0, lambda: self.log(traceback.format_exc()))
+
+    def _on_combat_cycle_complete(self, report: Dict[str, Any]) -> None:
+        self._latest_combat_report = report
+        if self.combat_tab is not None:
+            self.combat_tab.set_report(report)
 
     # ============================================================
     #  Deep Crawl worker
@@ -1529,6 +1801,17 @@ class XSSSecurityGUI(tk.Tk):
             pass
 
         try:
+            self._autorecon_running = False
+        except Exception:
+            pass
+
+        try:
+            if getattr(self, "_attack_stream", None) is not None:
+                self._attack_stream.stop()
+        except Exception as e:
+            _logger.warning("[⚠️] AttackStreamProcessor stop failed: %s", e)
+
+        try:
             if hasattr(self, "_ui_queue_bridge") and self._ui_queue_bridge is not None:
                 self._ui_queue_bridge.stop()
         except Exception as e:
@@ -1581,7 +1864,8 @@ def show_usage():
     python -m xss_security_gui.main tk             # Запуск XSSSecurityGUI
     python -m xss_security_gui.main crawl <url>    # Краулинг сайта
     python -m xss_security_gui.main js <path.js>   # Анализ JS-файла
-    python -m xss_security_gui.main recon <url>    # Авторазведка
+    python -m xss_security_gui.main recon <url>    # AutoRecon Orchestrator (recon→analyze→attack→report)
+    python -m xss_security_gui.main recon <url> --aggressive
     python -m xss_security_gui.main fuzz <url>     # XSStrike Fuzzer
     python -m xss_security_gui.main --version      # Показать версию
     python -m xss_security_gui.main --help         # Показать справку
@@ -1618,6 +1902,8 @@ if __name__ == "__main__":
 
         domain = args[2] if len(args) >= 3 else "https://gazprombank.ru"
 
+        from xss_security_gui.gui.attack_gui import AttackGUI
+
         root = tk.Tk()
         root.title("AttackGUI")
 
@@ -1628,7 +1914,13 @@ if __name__ == "__main__":
 
     elif cmd == "tk":
         print(f"[🛡️ XSSSecurityGUI] Запуск: {datetime.datetime.now().isoformat()}")
-        app = XSSSecurityGUI()
+        try:
+            app = XSSSecurityGUI()
+        except Exception as e:
+            import traceback
+            print(f"[❌] GUI не запустился: {type(e).__name__}: {e}")
+            traceback.print_exc()
+            sys.exit(1)
         app.mainloop()
 
     elif cmd in ("crawl", "js", "recon", "fuzz"):
@@ -1679,22 +1971,35 @@ if __name__ == "__main__":
 
                     ui_call(app.get_threat_connector().emit, "js_inspector", js_path, report)
 
-                elif cmd == "recon" and len(args) == 3:
+                elif cmd == "recon" and len(args) >= 3:
                     url = args[2]
-                    ui_log(f"🔁 Авторозвідка: {url}")
+                    aggressive = "--aggressive" in args
+                    ui_log(f"🎯 AutoRecon Orchestrator: {url} (aggressive={aggressive})")
 
-                    endpoints = EndpointScanner(url).scan()
-                    payloads = PayloadGenerator(endpoints).generate()
-                    responses = AttackPlanner(payloads).execute()
+                    def progress(msg):
+                        stage = msg.get("stage", "?")
+                        status = msg.get("status", "")
+                        ui_log(f"[{stage}] {status} {msg.get('details') or ''}")
 
-                    ui_call(app.get_threat_connector().bulk, "auto_recon", url, responses)
+                    runner = run_aggressive_scan if aggressive else run_full_autorecon
+                    report = runner(url, callback=progress)
 
-                    report = app.get_threat_connector().generate_report()
                     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                     filename = f"auto_recon_{ts}.json"
                     save_json(LOG_DIR / filename, report)
-                    ui_log(f"📁 Звіт збережено: logs/{filename}")
-                    ui_log("📡 AutoRecon → Threat Intel відправлено")
+                    ui_log(f"📁 Звіт: logs/{filename}")
+
+                    meta = (report or {}).get("metadata") or {}
+                    ui_log(
+                        f"✅ risk={meta.get('risk_level')} score={meta.get('risk_score')}"
+                    )
+                    ui_call(
+                        app.get_threat_connector().emit,
+                        "auto_recon",
+                        url,
+                        report.get("threat_summary") if isinstance(report, dict) else report,
+                    )
+                    ui_log("📡 AutoRecon Orchestrator → Threat Intel")
 
                 elif cmd == "fuzz" and len(args) == 3:
                     url = args[2]
@@ -1811,6 +2116,3 @@ if __name__ == "__main__":
             self.after(0, lambda: self.log(f"[❌] Помилка боевого цикла: {type(e).__name__}: {e}"))
             import traceback
             self.after(0, lambda: self.log(traceback.format_exc()))
-
-
-

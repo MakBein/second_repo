@@ -126,12 +126,21 @@ class SiteDecomposerEngine:
             try:
                 report = self.run()
                 if callback:
-                    callback(report, None)
+                    self._dispatch_callback(callback, report, None)
             except Exception as e:
                 if callback:
-                    callback(None, e)
+                    self._dispatch_callback(callback, None, e)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    @staticmethod
+    def _dispatch_callback(callback, report, error) -> None:
+        owner = getattr(callback, "__self__", None)
+        after = getattr(owner, "after", None)
+        if callable(after):
+            after(0, lambda r=report, e=error: callback(r, e))
+        else:
+            callback(report, error)
 
     def export_json(self, path: str = "decomposition_logs/report.json"):
         if not self.report:

@@ -1,50 +1,61 @@
-"""xss_security_gui.utils.ai_bridge
+"""Asynchronous adapter between GUI findings and the AI risk engine."""
 
-Small helper to run AI Core calls in background threads and safely deliver results to GUI callbacks.
-"""
-from typing import Any, Callable, Optional
-import threading
+from __future__ import annotations
 
-from xss_security_gui.utils.safe_call import safe_invoke
+import json
+import logging
+from typing import Any, Callable
 
-_GLOBAL_AI = None
+from xss_security_gui.ai_core.risk_engine import analyze_security_risk
+from xss_security_gui.utils.thread_worker import run_in_thread
 
-
-def get_global_ai():
-    global _GLOBAL_AI
-    if _GLOBAL_AI is None:
-        try:
-            from xss_security_gui.ai_core import AICore
-            _GLOBAL_AI = AICore()
-        except Exception:
-            _GLOBAL_AI = None
-    return _GLOBAL_AI
+_logger = logging.getLogger(__name__)
 
 
-def analyze_async(threat: Any, callback: Optional[Callable[[Any], None]] = None, name: Optional[str] = None) -> threading.Thread:
-    """Run AI analyze(threat) in a background thread and call ``callback(result)`` when done.
+def analyze_async(
+    finding: Any,
+    *,
+    callback: Callable[[dict[str, Any]], None],
+    name: str = "AIAnalysis",
+) -> None:
+    """Analyze a finding off the UI thread and deliver a compact verdict."""
+    if not callable(callback):
+        raise TypeError("callback must be callable")
 
-    The callback will be invoked via safe_invoke so bound widget methods will be scheduled
-    on the Tk mainloop.
-    """
+    if isinstance(finding, dict):
+        raw_text = json.dumps(finding, ensure_ascii=False, default=str)
+        insights = finding.get("js_insights")
+        if not isinstance(insights, dict):
+            insights = {}
+    else:
+        raw_text = str(finding)
+        insights = {}
 
-    def worker():
-        try:
-            ai = get_global_ai()
-            if not ai:
-                res = {"error": "AI core unavailable"}
-            else:
-                res = ai.analyze(threat)
-        except Exception as e:
-            res = {"error": str(e)}
+    def deliver_error(error: Exception) -> None:
+        _logger.warning("Asynchronous AI analysis failed: %s", error)
+        callback({
+            "summary": f"AI analysis unavailable: {type(error).__name__}",
+            "confidence": 0.0,
+            "error": str(error),
+        })
 
-        if callback:
-            try:
-                safe_invoke(callback, res)
-            except Exception:
-                pass
+    def deliver_result(result: dict[str, Any]) -> None:
+        verdict = dict(result)
+        verdict["summary"] = (
+            result.get("llm_summary")
+            or f"Risk level: {result.get('risk_level', 'unknown')}"
+        )
+        verdict["confidence"] = result.get("risk_score", 0.0)
+        callback(verdict)
 
-    t = threading.Thread(target=worker, daemon=True, name=name or "AIAnalyze")
-    t.start()
-    return t
+    run_in_thread(
+        analyze_security_risk,
+        insights,
+        raw_text,
+        name=name,
+        on_success=deliver_result,
+        on_error=deliver_error,
+    )
 
+
+__all__ = ["analyze_async"]

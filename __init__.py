@@ -1,15 +1,28 @@
 # xss_security_gui/__init__.py
-# 🛡️ XSS Security GUI — Core Initialization (v6.5 ULTRA)
+# 🛡️ XSS Security GUI — Core Initialization (v7.0 ULTRA CLEAN)
 
+import importlib
 import os
 import sys
-import json
 import shutil
 import logging
-import datetime
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from typing import Optional
 
+# ==============================
+#  UTF‑8 Console (Windows-safe)
+# ==============================
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+# ==============================
+#  Settings / Paths
+# ==============================
 from .settings import (
     settings,
     Settings,
@@ -19,16 +32,15 @@ from .settings import (
     EXPORT_DIR,
     PAYLOADS_DIR,
 )
-from .payloads import load_payloads
-from .dom_parser import DOMParser
-from .network_checker import NetworkChecker
 
-VERSION = "6.5.0"
+# ==============================
+#  Unified Version
+# ==============================
+VERSION = "7.0.0"
 
-# ============================================================
-# 📁 Директории проекта (единый источник — settings/BASE_DIR)
-# ============================================================
-
+# ==============================
+#  Directories
+# ==============================
 DIRS = {
     "logs": str(LOG_DIR),
     "target": str(CONFIG_DIR),
@@ -45,10 +57,9 @@ for path in DIRS.values():
 LOGS_DIR = DIRS["logs"]
 INIT_LOG = os.path.join(LOGS_DIR, "init.log")
 
-# ============================================================
-# 📝 Логирование (Rotating Logs + Console)
-# ============================================================
-
+# ==============================
+#  Logging (Rotating)
+# ==============================
 def setup_logging() -> logging.Logger:
     logger = logging.getLogger("XSS_GUI")
     logger.setLevel(logging.INFO)
@@ -78,10 +89,9 @@ def setup_logging() -> logging.Logger:
 
 logger = setup_logging()
 
-# ============================================================
-# 🧪 Проверки окружения
-# ============================================================
-
+# ==============================
+#  Environment Checks
+# ==============================
 def check_python_version() -> None:
     if sys.version_info < (3, 8):
         logger.error("Требуется Python 3.8 или выше.")
@@ -90,7 +100,6 @@ def check_python_version() -> None:
 
 
 def check_dependencies() -> None:
-    """Проверка внешних CLI-зависимостей."""
     if not shutil.which("ngrok"):
         logger.warning("Ngrok не найден. Туннель будет недоступен.")
         print("[⚠️] Ngrok не найден. Туннель будет недоступен.")
@@ -100,27 +109,43 @@ def check_dependencies() -> None:
 
 
 def check_libraries() -> None:
-    """Проверка обязательных Python-библиотек."""
     required = ["requests", "urllib3", "bs4", "pythonping"]
+    missing = []
     for lib in required:
         try:
             __import__(lib)
         except ImportError:
-            logger.error(f"Отсутствует библиотека: {lib}")
-            print(f"[❌] Отсутствует библиотека: {lib}")
-            sys.exit(1)
+            missing.append(lib)
 
-# ============================================================
-# 🧩 AppContext — единый объект окружения
-# ============================================================
+    if missing:
+        logger.warning("Некоторые библиотеки отсутствуют: %s", ", ".join(missing))
+        print(f"[⚠️] Отсутствуют библиотеки: {', '.join(missing)}")
+        return
 
+
+def __getattr__(name: str):
+    if name == "load_payloads":
+        from .payloads import load_payloads
+        return load_payloads
+    if name == "DOMParser":
+        from .dom_parser import DOMParser
+        return DOMParser
+    if name == "NetworkChecker":
+        from .network_checker import NetworkChecker
+        return NetworkChecker
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+# ==============================
+#  AppContext
+# ==============================
 class AppContext:
     def __init__(self):
         self.version = VERSION
         self.paths = DIRS
         self.logger = logger
-        self.initialized_at = datetime.datetime.now().isoformat()
-        self.settings = settings  # гибридные настройки ULTRA 6.5
+        self.initialized_at = datetime.now(timezone.utc).isoformat()
+        self.settings = settings
 
     def summary(self) -> dict:
         return {
@@ -130,10 +155,9 @@ class AppContext:
             "profile": self.settings.profile,
         }
 
-# ============================================================
-# 🚀 Главная инициализация
-# ============================================================
-
+# ==============================
+#  Initialization
+# ==============================
 _initialized = False
 _context: Optional[AppContext] = None
 
@@ -148,17 +172,20 @@ def init_environment() -> AppContext:
     check_dependencies()
     check_libraries()
 
-    # === Загрузка payload'ов ===
-    load_payloads()
+    try:
+        module = importlib.import_module("xss_security_gui.payloads")
+        load_payloads = getattr(module, "load_payloads")
+        load_payloads()
+    except Exception as exc:
+        logger.warning("Failed to load payloads during init: %s", exc)
 
-    # === ThreatConnector: экспорт статистики payload'ов ===
     try:
         from xss_security_gui.payloads import PAYLOADS
         PAYLOADS.export_stats_to_threat_intel()
     except Exception as e:
         logger.warning(f"Не удалось отправить статистику payload'ов: {e}")
 
-    print(f"[🛡️ XSS GUI] Запуск: {datetime.datetime.now().isoformat()}")
+    print(f"[🛡️ XSS GUI] Запуск: {datetime.now(timezone.utc).isoformat()}")
     print(f"[📦 Версия GUI] {VERSION}")
     print("[✅] Инициализация завершена. Payload’ы загружены. Логи активны.")
 
@@ -168,17 +195,15 @@ def init_environment() -> AppContext:
     _initialized = True
     return _context
 
-# ============================================================
-# 🔄 Автоинициализация
-# ============================================================
-
-AUTO_INIT = os.environ.get("XSS_GUI_AUTO_INIT", "1") == "1"
+# ==============================
+#  Auto-init
+# ==============================
+AUTO_INIT = os.environ.get("XSS_GUI_AUTO_INIT", "0") == "1"
 CONTEXT = init_environment() if AUTO_INIT else None
 
-# ============================================================
-# 📦 Экспортируемые объекты пакета
-# ============================================================
-
+# ==============================
+#  Exports
+# ==============================
 __all__ = [
     "VERSION",
     "BASE_DIR",
@@ -193,4 +218,5 @@ __all__ = [
     "Settings",
     "DOMParser",
     "NetworkChecker",
+    "load_payloads",
 ]

@@ -1,34 +1,51 @@
 # xss_security_gui/threat_analysis/csrf_analyzer.py
 """
-CSRFAnalyzer 6.1
-----------------
-• Извлекает CSRF-токены из HTML (input, meta, JS)
-• Анализирует заголовки на наличие CSRF-защиты
-• Возвращает унифицированный результат для Threat Intel
+CSRFAnalyzer 11.0 — Combat Edition
+==================================
+• Розширений пошук CSRF-токенів (input, meta, JS, hidden, SPA)
+• Аналіз заголовків на CSRF-захист (SameSite, Secure, Origin/Referer, CORS)
+• ThreatConnector / Threat Intel-friendly формат результатів
+• ZAP-рівень точності та структурованості
+• Підтримка асинхронного запуску (ThreadWorker 10.0)
 """
 
+from __future__ import annotations
+
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Callable
+
 from bs4 import BeautifulSoup
+from xss_security_gui.utils.thread_worker import run_in_thread
+from xss_security_gui.utils.safe_call import safe_invoke
 
 
 class CSRFAnalyzer:
-    """Модуль анализа CSRF-токенов и заголовков."""
+    """Поглиблений модуль аналізу CSRF-токенів та заголовків (11.0, ThreatConnector-ready)."""
 
-    DEFAULT_KEYWORDS = ["csrf", "token"]
+    DEFAULT_KEYWORDS = ["csrf", "xsrf", "token", "auth", "secure"]
 
-    def __init__(self, html: str, source_url: str = "unknown", keywords: List[str] | None = None):
-        self.soup = BeautifulSoup(html, "html.parser")
+    def __init__(
+        self,
+        html: str,
+        source_url: str = "unknown",
+        keywords: Optional[List[str]] = None,
+        threat_connector: Any | None = None,
+    ):
+        self.html = html or ""
+        self.soup = BeautifulSoup(self.html, "html.parser")
         self.source_url = source_url
         self.keywords = keywords if keywords is not None else self.DEFAULT_KEYWORDS
+        self.threat_connector = threat_connector
 
+    # ---------------------------------------------------------
+    # Token Extraction
+    # ---------------------------------------------------------
     def extract_tokens(self) -> List[Dict[str, Any]]:
-        """Извлекает CSRF-токены из HTML."""
         tokens: List[Dict[str, Any]] = []
 
-        # === input-теги ===
+        # input-теги
         for input_tag in self.soup.find_all("input"):
-            name = input_tag.get("name", "").lower()
+            name = (input_tag.get("name") or "").lower()
             if any(k in name for k in self.keywords):
                 tokens.append({
                     "type": "input",
@@ -36,9 +53,19 @@ class CSRFAnalyzer:
                     "value": input_tag.get("value"),
                 })
 
-        # === meta-теги ===
+        # hidden-поля
+        for hidden in self.soup.find_all("input", {"type": "hidden"}):
+            name = (hidden.get("name") or "").lower()
+            if any(k in name for k in self.keywords):
+                tokens.append({
+                    "type": "hidden",
+                    "name": hidden.get("name"),
+                    "value": hidden.get("value"),
+                })
+
+        # meta-теги
         for meta in self.soup.find_all("meta"):
-            name = meta.get("name", "").lower()
+            name = (meta.get("name") or "").lower()
             if any(k in name for k in self.keywords):
                 tokens.append({
                     "type": "meta",
@@ -46,71 +73,103 @@ class CSRFAnalyzer:
                     "value": meta.get("content"),
                 })
 
-        # === JS-токены ===
+        # JS-токени
         for script in self.soup.find_all("script"):
-            if script.string:
-                text = script.string.lower()
-                if any(k in text for k in self.keywords):
-                    tokens.append({
-                        "type": "js",
-                        "snippet": text[:200],
-                    })
+            text = script.string or ""
+            lower = text.lower()
+            if any(k in lower for k in self.keywords):
+                tokens.append({
+                    "type": "js",
+                    "snippet": lower[:200],
+                })
 
-        logging.debug(f"[CSRFAnalyzer] Найдено {len(tokens)} токенов на {self.source_url}")
+        # SPA-фреймворки
+        if "window.__initial_state__" in self.html.lower() or "window.__INITIAL_STATE__" in self.html:
+            tokens.append({
+                "type": "spa",
+                "snippet": "window.__INITIAL_STATE__ detected",
+            })
+
+        logging.debug(f"[CSRFAnalyzer] Found {len(tokens)} tokens on {self.source_url}")
         return tokens
 
+    # ---------------------------------------------------------
+    # Header Analysis
+    # ---------------------------------------------------------
     def analyze_headers(self, headers: Dict[str, str]) -> Dict[str, Any]:
-        """Анализирует заголовки на наличие CSRF-защиты."""
         issues: List[Dict[str, Any]] = []
 
         for k, v in headers.items():
             lk = k.lower()
+            lv = v.lower()
 
             # CSRF headers
             if any(keyword in lk for keyword in self.keywords):
-                issues.append({"header": k, "value": v})
+                issues.append({"header": k, "value": v, "info": "csrf-header-present"})
 
-            # Origin / Referer
+            # Origin / Referer policy
             if "origin" in lk or "referer" in lk:
-                issues.append({"header": k, "value": v})
+                issues.append({"header": k, "value": v, "info": "origin-referer-present"})
 
             # CORS
             if "access-control" in lk:
-                issues.append({"header": k, "value": v})
+                issues.append({"header": k, "value": v, "info": "cors-policy"})
 
-            # SameSite cookie
-            if "set-cookie" in lk and "samesite" not in v.lower():
-                issues.append({
-                    "header": k,
-                    "value": v,
-                    "warning": "missing SameSite",
-                })
+            # SameSite / Secure / HttpOnly у Set-Cookie
+            if "set-cookie" in lk:
+                if "samesite" not in lv:
+                    issues.append({"header": k, "value": v, "warning": "missing SameSite"})
+                if "secure" not in lv:
+                    issues.append({"header": k, "value": v, "warning": "missing Secure"})
+                if "httponly" not in lv:
+                    issues.append({"header": k, "value": v, "warning": "missing HttpOnly"})
 
-        logging.debug(f"[CSRFAnalyzer] Проверено {len(headers)} заголовков, найдено {len(issues)} потенциальных проблем")
+        logging.debug(
+            f"[CSRFAnalyzer] Checked {len(headers)} headers, found {len(issues)} potential issues"
+        )
         return {"issues": issues, "headers_checked": len(headers)}
 
+    # ---------------------------------------------------------
+    # Full Analysis (ThreatConnector-friendly)
+    # ---------------------------------------------------------
     def run_analysis(self, headers: Dict[str, str]) -> Dict[str, Any]:
-        """Запускает полный анализ CSRF: токены + заголовки."""
         tokens = self.extract_tokens()
         header_analysis = self.analyze_headers(headers)
 
         severity = self._assess_severity(tokens, header_analysis["issues"])
 
         result = {
-            "module": "CSRF",
-            "target": self.source_url,
-            "tokens_found": tokens,
-            "header_analysis": header_analysis,
+            "module": "CSRFAnalyzer",
+            "category": "csrf_intel",
+            "url": self.source_url,
             "severity": severity,
-            "status": "secure" if severity == "SECURE" else "potential CSRF risk",
+            "status": "secure" if severity == "SECURE" else "potential-risk",
+            "details": {
+                "tokens_found": tokens,
+                "header_analysis": header_analysis,
+                "token_count": len(tokens),
+                "issue_count": len(header_analysis["issues"]),
+            },
         }
 
-        logging.info(f"[CSRFAnalyzer] Анализ завершён: {result['status']} для {self.source_url}")
+        logging.info(
+            f"[CSRFAnalyzer] Analysis complete: {result['status']} for {self.source_url}"
+        )
+
+        # ThreatConnector інтеграція
+        if self.threat_connector:
+            try:
+                self.threat_connector.add_artifact(result)
+            except Exception:
+                pass
+
         return result
 
+    # ---------------------------------------------------------
+    # Severity Assessment
+    # ---------------------------------------------------------
     @staticmethod
     def _assess_severity(tokens: List[Dict[str, Any]], issues: List[Dict[str, Any]]) -> str:
-        """Оценка риска по наличию токенов и проблем в заголовках."""
         if not tokens and issues:
             return "HIGH"
         if tokens and issues:
@@ -118,3 +177,31 @@ class CSRFAnalyzer:
         if tokens and not issues:
             return "SECURE"
         return "LOW"
+
+    # ---------------------------------------------------------
+    # Async / ThreadWorker інтеграція
+    # ---------------------------------------------------------
+    def run_analysis_async(
+        self,
+        headers: Dict[str, str],
+        callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> None:
+        def work_fn(progress, is_cancelled):
+            return self.run_analysis(headers)
+
+        def on_success(result: Dict[str, Any]) -> None:
+            if callback:
+                safe_invoke(callback, result)
+
+        def on_error(e: Exception) -> None:
+            if callback:
+                safe_invoke(callback, {"status": "error", "error": str(e)})
+
+        run_in_thread(
+            work_fn,
+            name="CSRFAnalyzer",
+            on_success=on_success,
+            on_progress=None,
+            on_error=on_error,
+            on_finally=None,
+        )

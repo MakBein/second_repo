@@ -1,5 +1,4 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
+#xss_security_gui/test_email_leak_fix.py
 """
 Тестовый скрипт для проверки Email Leak интеграции и исправлений GUI
 """
@@ -10,7 +9,8 @@ from pathlib import Path
 
 def test_analyzer1_exists():
     """Проверяет, что файл analyzer1.json существует"""
-    json_path = Path(__file__).parent / "logs" / "analyzer1.json"
+    json_path = Path(__file__).resolve().parents[1] / "logs" / "analyzer1.json"
+
     if json_path.exists():
         print("✅ analyzer1.json найден")
         return True
@@ -20,7 +20,8 @@ def test_analyzer1_exists():
 
 def test_analyzer1_content():
     """Проверяет, что в analyzer1.json есть Email Leak данные"""
-    json_path = Path(__file__).parent / "logs" / "analyzer1.json"
+    json_path = Path(__file__).resolve().parents[1] / "logs" / "analyzer1.json"
+
     
     try:
         with open(json_path, 'r', encoding='utf-8') as f:

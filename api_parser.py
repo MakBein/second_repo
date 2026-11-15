@@ -3,7 +3,8 @@ import re
 import os
 import json
 import datetime
-
+from typing import Dict, Optional
+import requests
 from xss_security_gui.threat_analysis.threat_connector import ThreatConnector
 
 
@@ -62,22 +63,87 @@ def detect_ip_type(ip: str) -> str:
 #   IP ENRICHMENT (GeoIP, ASN, ISP)
 # ============================================================
 
-def enrich_ip(ip: str) -> dict:
-    """
-    Обогащение IP: геолокация, ASN, ISP, тип сети.
-    Здесь — заглушка с примерной структурой.
-    Ты можешь подключить любой GeoIP/ASN-провайдер (MaxMind, IP2Location, ipinfo, etc.)
-    и просто заменить тело этой функции.
-    """
-    # TODO: заменить на реальный вызов GeoIP/ASN сервиса
-    # Пример структуры:
-    return {
-        "country": None,
-        "city": None,
-        "asn": None,
-        "isp": None,
-        "network_type": None,  # hosting, residential, mobile, tor, vpn, unknown
-    }
+
+def enrich_ip(ip: str) -> Dict[str, Optional[str]]:
+    try:
+        r = requests.get(f"https://ipwho.is/{ip}", timeout=5).json()
+
+        if not r.get("success", False):
+            return {
+                "country": None,
+                "city": None,
+                "asn": None,
+                "isp": None,
+                "network_type": None,
+                "latitude": None,
+                "longitude": None,
+                "accuracy": None,
+                "datacenter": None,
+            }
+
+        country = r.get("country")
+        city = r.get("city")
+
+        # Coordinates + accuracy
+        latitude = r.get("latitude")
+        longitude = r.get("longitude")
+        accuracy = r.get("location", {}).get("accuracy")
+
+        # ASN / ISP
+        conn = r.get("connection", {})
+        asn = conn.get("asn")
+        isp = conn.get("isp") or conn.get("org")
+
+        # Security flags (best way to detect datacenter)
+        sec = r.get("security", {})
+        is_hosting = sec.get("hosting")
+        is_vpn = sec.get("vpn")
+        is_tor = sec.get("tor")
+        is_proxy = sec.get("proxy")
+
+        # Network type logic
+        if is_hosting:
+            net_type = "hosting"
+        elif is_vpn:
+            net_type = "vpn"
+        elif is_tor:
+            net_type = "tor"
+        elif is_proxy:
+            net_type = "proxy"
+        else:
+            # fallback heuristic
+            org_lower = (isp or "").lower()
+            if any(x in org_lower for x in ("cloud", "datacenter", "colo", "llc", "gmbh")):
+                net_type = "hosting"
+            elif any(x in org_lower for x in ("mobile", "cellular", "wireless")):
+                net_type = "mobile"
+            else:
+                net_type = "residential"
+
+        return {
+            "country": country,
+            "city": city,
+            "asn": asn,
+            "isp": isp,
+            "network_type": net_type,
+            "latitude": latitude,
+            "longitude": longitude,
+            "accuracy": accuracy,
+            "datacenter": is_hosting,
+        }
+
+    except Exception:
+        return {
+            "country": None,
+            "city": None,
+            "asn": None,
+            "isp": None,
+            "network_type": None,
+            "latitude": None,
+            "longitude": None,
+            "accuracy": None,
+            "datacenter": None,
+        }
 
 
 # ============================================================
@@ -233,7 +299,7 @@ def extract_api_data(
                 else:
                     scope = classify_ipv6(ip)
 
-                geo = enrich_ip(ip)
+                geo = enrich_ip(ip) or {}
 
                 results["ips"].append({
                     "ip": ip,
