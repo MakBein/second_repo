@@ -595,20 +595,19 @@ RETRY_DELAYS = [1, 2, 4]  # Exponential backoff (1s → 2s → 4s)
 # 408 — Request Timeout
 # 429 — Too Many Requests (rate limit)
 # 5xx — Server errors
-RETRY_STATUS_CODES = {408, 429, 502, 503, 504}
+RETRY_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
-def should_retry(status_code: int) -> bool:
-    """
-    Determine if request should be retried.
-    Улучшено:
-    - вынесены коды в константу
-    - добавлены пояснения
-    - логика полностью сохранена
-    """
+def should_retry(
+    status_code: int | None,
+) -> bool:
+
     if not ENABLE_AUTO_RETRY:
         return False
 
-    return status_code >= 500 or status_code in RETRY_STATUS_CODES
+    if status_code is None:
+        return True
+
+    return status_code in RETRY_STATUS_CODES
 
 
 def build_anti_waf_headers(base: Optional[Dict[str, str]] = None) -> Dict[str, str]:

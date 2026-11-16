@@ -168,6 +168,35 @@ class DOMParser:
                 headers.append({"tag": f"h{level}", "text": h.get_text(strip=True)})
         return headers
 
+    def extract_elements(self) -> List[Dict[str, Any]]:
+        """
+        Full DOM inventory.
+        """
+
+        result = []
+
+        for element in self.soup.find_all(True):
+            result.append(
+                {
+                    "tag": element.name,
+                    "attrs": dict(element.attrs),
+                    "text": element.get_text(
+                        strip=True
+                    )[:300],
+                    "children_count": len(
+                        element.find_all(
+                            recursive=False
+                        )
+                    ),
+                    "has_events": any(
+                        key.startswith("on")
+                        for key in element.attrs
+                    ),
+                }
+            )
+
+        return result
+
     # === Lists ===
     def extract_lists(self) -> List[Dict[str, Any]]:
         lists = []
@@ -223,6 +252,7 @@ class DOMParser:
     def extract_all(self) -> dict:
         results = {
             "forms": self.extract_forms(),
+            "elements": self.extract_elements(),
             "iframes": self.extract_iframes(),
             "meta_tags": self.extract_meta_tags(),
             "dom_events": self.extract_dom_events(),
@@ -239,6 +269,10 @@ class DOMParser:
             "svg": self.extract_svg(),
             "tables": self.extract_tables(),
             "media": self.extract_media(),
+            "json_ld": self.extract_json_ld(),
+            "headers": self.extract_headers(),
+            "lists": self.extract_lists(),
+            "canonical": self.extract_canonical(),
             "inline_styles": self.extract_inline_styles()
         }
 
