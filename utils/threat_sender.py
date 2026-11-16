@@ -7,6 +7,29 @@ from typing import Any, Dict, List, Union
 FALLBACK_LOGGER = logging.getLogger("ThreatSender")
 
 
+def normalize_threat_artifact(
+        artifact,
+):
+    """
+    Backward compatibility helper.
+    """
+
+    if artifact is None:
+        return {}
+
+    if isinstance(
+            artifact,
+            (dict, list),
+    ):
+        return artifact
+
+    return {
+        "value": str(
+            artifact
+        )
+    }
+
+
 class ThreatSenderMixin:
     """
     ThreatSenderMixin — Red Team Enterprise Edition
@@ -124,3 +147,5 @@ class ThreatSenderMixin:
 
         except Exception as e:
             log.error(f"[ThreatSender] Unexpected error: {e}", exc_info=True)
+
+

@@ -6,7 +6,23 @@ from __future__ import annotations
 import time
 import uuid
 from typing import Any, Dict, Optional
+from enum import Enum
+from dataclasses import dataclass
 
+
+class MetricType(str, Enum):
+    INFO = "INFO"
+    SUCCESS = "SUCCESS"
+    WARNING = "WARNING"
+    ERROR = "ERROR"
+
+@dataclass
+class OperationMetrics:
+    operation_id: str = ""
+    operation_name: str = ""
+    duration: float = 0.0
+    success: bool = True
+    items_processed: int = 0
 
 class MetricsCollector:
     def __init__(self) -> None:
@@ -54,6 +70,10 @@ _COLLECTOR: Optional[MetricsCollector] = None
 
 def get_metrics_collector() -> MetricsCollector:
     global _COLLECTOR
+
     if _COLLECTOR is None:
         _COLLECTOR = MetricsCollector()
+
+    assert _COLLECTOR is not None
+
     return _COLLECTOR

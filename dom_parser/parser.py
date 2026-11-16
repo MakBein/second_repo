@@ -1,10 +1,8 @@
 # xss_security_gui/dom_parser.py
 """
-<<<<<<<< HEAD:dom_parser/parser.py
-DOMParser ULTRA 6.1
 ========
 DOMParser ULTRA 7.0 — Backward Compatibility Layer
->>>>>>>> origin/main:dom_parser.py
+
 Парсер DOM для XSS Security Suite:
 - Извлечение форм, скриптов, событий, медиа и др.
 - Интеграция с settings.py и ThreatConnector
@@ -17,8 +15,9 @@ DOMParser ULTRA 7.0 — Backward Compatibility Layer
     from xss_security_gui.dom_parser import DOMParser
 """
 
-<<<<<<<< HEAD:dom_parser/parser.py
+
 import os
+import asyncio
 import json
 from bs4 import BeautifulSoup, Comment
 from typing import Any, Dict, List, Optional
@@ -169,6 +168,35 @@ class DOMParser:
                 headers.append({"tag": f"h{level}", "text": h.get_text(strip=True)})
         return headers
 
+    def extract_elements(self) -> List[Dict[str, Any]]:
+        """
+        Full DOM inventory.
+        """
+
+        result = []
+
+        for element in self.soup.find_all(True):
+            result.append(
+                {
+                    "tag": element.name,
+                    "attrs": dict(element.attrs),
+                    "text": element.get_text(
+                        strip=True
+                    )[:300],
+                    "children_count": len(
+                        element.find_all(
+                            recursive=False
+                        )
+                    ),
+                    "has_events": any(
+                        key.startswith("on")
+                        for key in element.attrs
+                    ),
+                }
+            )
+
+        return result
+
     # === Lists ===
     def extract_lists(self) -> List[Dict[str, Any]]:
         lists = []
@@ -224,6 +252,7 @@ class DOMParser:
     def extract_all(self) -> dict:
         results = {
             "forms": self.extract_forms(),
+            "elements": self.extract_elements(),
             "iframes": self.extract_iframes(),
             "meta_tags": self.extract_meta_tags(),
             "dom_events": self.extract_dom_events(),
@@ -240,6 +269,10 @@ class DOMParser:
             "svg": self.extract_svg(),
             "tables": self.extract_tables(),
             "media": self.extract_media(),
+            "json_ld": self.extract_json_ld(),
+            "headers": self.extract_headers(),
+            "lists": self.extract_lists(),
+            "canonical": self.extract_canonical(),
             "inline_styles": self.extract_inline_styles()
         }
 
@@ -271,31 +304,66 @@ class DOMParser:
             self._safe_log(f"[⚠️] Ошибка записи лога DOMParser: {e}")
 
         return results
-========
-# Re-export из нового пакета
-from xss_security_gui.dom_parser.parser import DOMParser, DOMParserAsync
-from xss_security_gui.dom_parser import (
-    DOMParserException,
-    HTMLSizeExceeded,
-    ParseTimeout,
-    InvalidHTML,
-    AsyncExecutor,
-    DOMParserCache,
-    MetricsCollector,
-    ProgressTracker,
-)
 
-__all__ = [
-    "DOMParser",
-    "DOMParserAsync",
-    "DOMParserException",
-    "HTMLSizeExceeded",
-    "ParseTimeout",
-    "InvalidHTML",
-    "AsyncExecutor",
-    "DOMParserCache",
-    "MetricsCollector",
-    "ProgressTracker",
-]
 
->>>>>>>> origin/main:dom_parser.py
+class DOMParserAsync(DOMParser):
+    """
+    Async wrapper for DOMParser.
+    """
+
+    def __init__(
+            self,
+            html: str,
+            threat_tab=None,
+            progress_callback=None,
+    ):
+        super().__init__(
+            html=html,
+            threat_tab=threat_tab,
+        )
+
+        self.progress_callback = (
+            progress_callback
+        )
+
+    async def parse_async(
+            self,
+    ) -> dict:
+
+        if self.progress_callback:
+
+            try:
+
+                self.progress_callback(
+                    {
+                        "percentage": 0,
+                        "status": "starting",
+                    }
+                )
+
+            except Exception:
+                pass
+
+        loop = asyncio.get_running_loop()
+
+        result = await loop.run_in_executor(
+            None,
+            self.extract_all,
+        )
+
+        if self.progress_callback:
+
+            try:
+
+                self.progress_callback(
+                    {
+                        "percentage": 100,
+                        "status": "complete",
+                    }
+                )
+
+            except Exception:
+                pass
+
+        return result
+

@@ -10,7 +10,7 @@ Burp Suite Pro‑level DOM Inspector:
 - Dynamic DOM snapshot
 - Threat Intel integration
 """
-
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import os
@@ -19,6 +19,11 @@ from typing import Optional, Dict, Any, List
 import requests
 
 from playwright.sync_api import sync_playwright
+from xss_security_gui.crawler import (
+    get_random_session,
+    should_retry,
+    build_anti_waf_headers,
+)
 
 from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
 from xss_security_gui.utils.threat_sender import ThreatSenderMixin
@@ -30,6 +35,28 @@ try:
 except ImportError as exc:
     DOMParser = None
     _DOM_PARSER_IMPORT_ERROR = exc
+
+
+# ---------------------------------------------------------------------
+# Automatic Retry Strategy
+# ---------------------------------------------------------------------
+
+MAX_RETRIES = 5
+RETRY_DELAYS = [1, 2, 4]  # Exponential backoff (1s → 2s → 4s)
+
+# Retry-worthy HTTP status codes:
+# 408 — Request Timeout
+# 429 — Too Many Requests (rate limit)
+# 5xx — Server errors
+RETRY_STATUS_CODES = {
+    408,
+    429,
+    500,
+    502,
+    503,
+    504,
+}
+
 
 
 class DOMParserTab(ttk.Frame, ThreatSenderMixin):
@@ -56,6 +83,11 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
         self.console_log: List[Dict[str, Any]] = []
         self.js_endpoints: List[str] = []
         self.dynamic_dom: Optional[str] = None
+        self.security_headers: Dict[str, Any] = {}
+        self.cookies: List[Dict[str, Any]] = []
+        self.metadata: Dict[str, Any] = {}
+        self.blocked: bool = False
+        self.http_status: Optional[int] = None
 
         # UI engine
         self._bridge = UIQueueBridge(self, poll_ms=60)
@@ -218,7 +250,34 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
         # NEW: Dynamic DOM
         self.dynamic_dom_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.dynamic_dom_frame, text="🧬 Dynamic DOM")
-        self.dynamic_dom_text = self._make_textbox(self.dynamic_dom_frame, "#66ff66")
+        self.dynamic_dom_text = self._make_textbox(
+            self.dynamic_dom_frame,
+            "#66ff66"
+        )
+
+        # NEW: Security Headers
+        self.security_headers_frame = ttk.Frame(self.notebook)
+        self.notebook.add(
+            self.security_headers_frame,
+            text="🛡 Security Headers"
+        )
+
+        self.security_headers_text = self._make_textbox(
+            self.security_headers_frame,
+            "#ff6666"
+        )
+
+        # NEW: Cookies
+        self.cookies_frame = ttk.Frame(self.notebook)
+        self.notebook.add(
+            self.cookies_frame,
+            text="🍪 Cookies"
+        )
+
+        self.cookies_text = self._make_textbox(
+            self.cookies_frame,
+            "#ffaa66"
+        )
 
         # ============================
         # STATUS BAR
@@ -261,68 +320,243 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
     # ============================================================
 
     def fetch_and_parse(self):
-        """Загрузить страницу с URL и запустить анализ."""
+        """
+        Завантажити URL або локальний HTML файл.
+        """
+
         url = self.url_entry.get().strip()
+
+        print("=" * 80)
+        print("[DOM] FETCH REQUEST")
+        print(f"[DOM] Input: {url}")
+
         if not url:
-            messagebox.showwarning("⚠️ Требуется URL", "Пожалуйста, введите URL")
+            messagebox.showwarning(
+                "⚠️ Требуется URL",
+                "Пожалуйста, введите URL",
+            )
             return
 
         if not url.startswith(("http://", "https://")) and not os.path.isfile(url):
-            url = "https://" + url
+            url = f"https://{url}"
 
-        self._bridge.post_bg(self._fetch_and_parse_thread, url)
+        print(f"[DOM] Normalized URL: {url}")
+
+        self._update_status(
+            "⏳ Загрузка страницы...",
+            True,
+        )
+
+        self._bridge.post_bg(
+            self._fetch_and_parse_thread,
+            None,
+            url,
+        )
 
     def _fetch_and_parse_thread(self, url: str):
-        """Фоновый поток: загрузка страницы + запуск анализа."""
+        """
+        Фонове завантаження сторінки.
+        """
+
+        print("=" * 80)
+        print(f"[DOM] WORKER STARTED")
+        print(f"[DOM] Target: {url}")
+
         try:
-            self._update_status("⏳ Загрузка страницы...", True)
 
-            # Файл → читаем локально
+            # ------------------------------------------------------
+            # LOCAL FILE
+            # ------------------------------------------------------
+
             if os.path.isfile(url):
-                try:
-                    with open(url, "r", encoding="utf-8") as f:
-                        self.current_html = f.read()
-                    self.dynamic_dom = self.current_html
-                    self._update_status("🔍 Анализ DOM (локальный файл)...", True)
-                    self._bridge.post_ui(self.parse_html)
-                    return
-                except Exception as e:
-                    self._update_status(f"❌ Ошибка чтения файла: {e}", False)
-                    self._bridge.post_ui(
-                        messagebox.showerror,
-                        "Ошибка",
-                        f"Ошибка чтения файла: {e}",
-                    )
-                    return
+                print(f"[DOM] Reading local file: {url}")
 
-            # URL → Playwright / requests
-            if self.use_playwright_var.get():
-                result = self._fetch_page_playwright_ultra(url)
-            else:
-                result = self._fetch_page_requests(url)
+                with open(
+                        url,
+                        "r",
+                        encoding="utf-8",
+                ) as f:
+                    html = f.read()
 
-            if not result.get("success"):
-                self._update_status(f"❌ Ошибка загрузки: {result.get('error')}", False)
-                self._bridge.post_ui(
-                    messagebox.showerror,
-                    "Ошибка",
-                    f"Ошибка загрузки: {result.get('error')}",
+                self.current_html = html
+                self.dynamic_dom = html
+
+                print(
+                    f"[DOM] Local HTML loaded: {len(html)} bytes"
                 )
+
+                self._update_status(
+                    "✅ HTML файл загружен",
+                    False,
+                )
+
+                self._bridge.post_ui(self.parse_html)
+
                 return
 
-            # HTML + доп. данные
-            self.current_html = result.get("html")
-            self.dynamic_dom = result.get("dom") or self.current_html
-            self.network_log = result.get("network", [])
-            self.console_log = result.get("console", [])
-            self.js_endpoints = result.get("js_endpoints", [])
+            # ------------------------------------------------------
+            # WEB FETCH
+            # ------------------------------------------------------
 
-            self._update_status("🔍 Анализ DOM...", True)
-            self._bridge.post_ui(self.parse_html)
+            engine = (
+                "playwright"
+                if self.use_playwright_var.get()
+                else "requests"
+            )
+
+            print(f"[DOM] Fetch engine: {engine}")
+
+            if self.use_playwright_var.get():
+
+                result = self._fetch_page_playwright_ultra(
+                    url
+                )
+
+            else:
+
+                result = self._fetch_page_requests(
+                    url
+                )
+
+            if not result.get("success"):
+                error = result.get("error")
+
+                print(
+                    f"[DOM] Fetch failed: {error}"
+                )
+
+                self._update_status(
+                    f"❌ Ошибка загрузки: {error}",
+                    False,
+                )
+
+                self._bridge.post_ui(
+                    messagebox.showerror,
+                    "Ошибка загрузки",
+                    str(error),
+                )
+
+                return
+
+            html = result.get("html") or ""
+
+            print(
+                f"[DOM] HTML loaded: {len(html)} bytes"
+            )
+
+            self.current_html = html
+            self.dynamic_dom = (
+                    result.get("dom")
+                    or html
+            )
+
+            self.network_log = (
+                    result.get("network")
+                    or []
+            )
+
+            self.console_log = (
+                    result.get("console")
+                    or []
+            )
+
+            self.js_endpoints = (
+                    result.get("js_endpoints")
+                    or []
+            )
+
+            self.security_headers = (
+                result.get(
+                    "security_headers",
+                    {}
+                )
+            )
+
+            self.cookies = (
+                result.get(
+                    "cookies",
+                    []
+                )
+            )
+
+            self.metadata = (
+                    result.get("metadata")
+                    or {}
+            )
+
+            self.blocked = (
+                    result.get("blocked")
+                    or False
+            )
+
+            self.http_status = result.get(
+                "status"
+            )
+
+            if self.blocked:
+                print(
+                    "[DOM] Security/WAF page detected"
+                )
+
+                self._update_status(
+                    "⚠️ Possible security block detected",
+                    False,
+                )
+
+            print(
+                f"[DOM] Network entries: {len(self.network_log)}"
+            )
+
+            print(
+                f"[DOM] Console entries: {len(self.console_log)}"
+            )
+
+            print(
+                f"[DOM] JS endpoints: {len(self.js_endpoints)}"
+            )
+
+            print(
+                f"[DOM] HTTP Status: {self.http_status}"
+            )
+
+            print(
+                f"[DOM] Blocked: {self.blocked}"
+            )
+
+            print(
+                f"[DOM] Final URL: "
+                f"{self.metadata.get('final_url')}"
+            )
+
+            self._update_status(
+                "✅ HTML загружен",
+                False,
+            )
+
+            self._bridge.post_ui(
+                self.parse_html
+            )
 
         except Exception as e:
-            self._update_status(f"❌ Ошибка: {e}", False)
-            self._bridge.post_ui(messagebox.showerror, "Ошибка", f"Ошибка загрузки: {e}")
+
+            import traceback
+
+            traceback.print_exc()
+
+            print(
+                f"[DOM] WORKER CRASH: {e}"
+            )
+
+            self._update_status(
+                f"❌ Ошибка: {e}",
+                False,
+            )
+
+            self._bridge.post_ui(
+                messagebox.showerror,
+                "DOM Parser Error",
+                str(e),
+            )
 
     # ============================================================
     # PLAYWRIGHT ENGINE (ULTRA)
@@ -336,6 +570,10 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
         - Console logs
         - JS endpoints
         """
+        print("=" * 80)
+        print("[PLAYWRIGHT] START")
+        print(f"[PLAYWRIGHT] URL = {url}")
+
         try:
             network_log: List[Dict[str, Any]] = []
             console_log: List[Dict[str, Any]] = []
@@ -343,19 +581,44 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
 
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
-                context = browser.new_context()
+                print("[PLAYWRIGHT] Browser launched")
+                session = get_random_session()
+                headers = build_anti_waf_headers()
+
+                context = browser.new_context(
+                    user_agent=session["user_agent"],
+                    viewport=session["viewport"],
+                    extra_http_headers=headers,
+                )
 
                 page = context.new_page()
 
                 # --- Network capture ---
                 def on_request(request):
-                    network_log.append({
-                        "method": request.method,
-                        "url": request.url,
-                        "headers": dict(request.headers),
-                        "resource_type": request.resource_type,
-                        "post_data": request.post_data,
-                    })
+
+                    try:
+                        post_data = request.post_data
+
+                        if (
+                                isinstance(post_data, str)
+                                and len(post_data) > 5000
+                        ):
+                            post_data = (
+                                    post_data[:5000]
+                                    + "\n...[truncated]"
+                            )
+                    except Exception:
+                        post_data = "<binary-data>"
+
+                    network_log.append(
+                        {
+                            "method": request.method,
+                            "url": request.url,
+                            "headers": dict(request.headers),
+                            "resource_type": request.resource_type,
+                            "post_data": post_data,
+                        }
+                    )
 
                 def on_response(response):
                     try:
@@ -434,10 +697,194 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
 
                 page.add_init_script(js_hook)
 
-                page.goto(url, timeout=20000, wait_until="networkidle")
+                response = None
+
+                for attempt in range(MAX_RETRIES):
+
+                    try:
+
+                        response = page.goto(
+                            url,
+                            timeout=30000,
+                            wait_until="domcontentloaded",
+                        )
+
+                        status = (
+                            response.status
+                            if response
+                            else 200
+                        )
+
+                        print(
+                            f"[PLAYWRIGHT] Attempt #{attempt + 1}"
+                        )
+
+                        print(
+                            f"[PLAYWRIGHT] HTTP STATUS: {status}"
+                        )
+
+                        if should_retry(status):
+
+                            if attempt < len(RETRY_DELAYS):
+
+                                delay = RETRY_DELAYS[attempt]
+
+                            else:
+
+                                delay = RETRY_DELAYS[-1]
+
+                            print(
+                                f"[PLAYWRIGHT] Retry after {delay}s"
+                            )
+
+                            time.sleep(delay)
+
+                            continue
+
+                        break
+
+                    except Exception as ex:
+
+                        print(
+                            f"[PLAYWRIGHT] Navigation error: {ex}"
+                        )
+
+                        if attempt >= MAX_RETRIES - 1:
+                            raise
+
+                        if attempt < len(RETRY_DELAYS):
+
+                            delay = RETRY_DELAYS[attempt]
+
+                        else:
+
+                            delay = RETRY_DELAYS[-1]
+
+                        time.sleep(delay)
+
+                print("[PLAYWRIGHT] Page loaded")
+
+                print(
+                    f"[PLAYWRIGHT] FINAL URL: {page.url}"
+                )
+
+                final_status = (
+                    response.status
+                    if response
+                    else None
+                )
+
+                response_headers = (
+                    response.headers
+                    if response
+                    else {}
+                )
+
+                security_headers = {
+                    "Content-Security-Policy":
+                        response_headers.get(
+                            "content-security-policy"
+                        ),
+
+                    "Strict-Transport-Security":
+                        response_headers.get(
+                            "strict-transport-security"
+                        ),
+
+                    "X-Frame-Options":
+                        response_headers.get(
+                            "x-frame-options"
+                        ),
+
+                    "X-Content-Type-Options":
+                        response_headers.get(
+                            "x-content-type-options"
+                        ),
+
+                    "Referrer-Policy":
+                        response_headers.get(
+                            "referrer-policy"
+                        ),
+
+                    "Permissions-Policy":
+                        response_headers.get(
+                            "permissions-policy"
+                        ),
+                }
+
+                print(
+                    f"[PLAYWRIGHT] FINAL STATUS: {final_status}"
+                )
+
+                response_headers = (
+                    response.headers
+                    if response
+                    else {}
+                )
+
+                security_headers = {
+                    "Content-Security-Policy":
+                        response_headers.get(
+                            "content-security-policy"
+                        ),
+
+                    "Strict-Transport-Security":
+                        response_headers.get(
+                            "strict-transport-security"
+                        ),
+
+                    "X-Frame-Options":
+                        response_headers.get(
+                            "x-frame-options"
+                        ),
+
+                    "X-Content-Type-Options":
+                        response_headers.get(
+                            "x-content-type-options"
+                        ),
+
+                    "Referrer-Policy":
+                        response_headers.get(
+                            "referrer-policy"
+                        ),
+
+                    "Permissions-Policy":
+                        response_headers.get(
+                            "permissions-policy"
+                        ),
+                }
 
                 # DOM snapshot
                 dom_html = page.content()
+                page_title = page.title()
+                html_lower = dom_html.lower()
+
+                html_head = html_lower[:10000]
+
+                blocked_markers = [
+                    "access denied",
+                    "request blocked",
+                    "forbidden",
+                ]
+
+                security_blocked = any(
+                    marker in html_head
+                    for marker in blocked_markers
+                )
+
+                print(
+                    f"[PLAYWRIGHT] TITLE: {page_title}"
+                )
+
+                print(
+                    f"[PLAYWRIGHT] BLOCKED: {security_blocked}"
+                )
+                print(
+                    f"[PLAYWRIGHT] DOM size = {len(dom_html)}"
+                )
+                print("=" * 80)
+                print(dom_html[:1000])
+                print("=" * 80)
 
                 # JS endpoints snapshot
                 try:
@@ -446,6 +893,9 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
                 except Exception:
                     js_endpoints = []
 
+                final_url = page.url
+                cookies = context.cookies()
+                context.close()
                 browser.close()
 
             return {
@@ -455,26 +905,245 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
                 "network": network_log,
                 "console": console_log,
                 "js_endpoints": js_endpoints,
-            }
+                "security_headers": security_headers,
+                "cookies": cookies,
+                "status": final_status,
+                "blocked": security_blocked,
+                "metadata": {
+                    "final_url": final_url,
+                    "status": final_status,
+                    "network_entries": len(network_log),
+                    "console_entries": len(console_log),
+                    "js_endpoints": len(js_endpoints),
+                    "dom_size": len(dom_html),
+                    "page_title": page_title,
+                },
+        }
+
 
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            import traceback
+            traceback.print_exc()
+            return {
+                "success": False,
+                "error": str(e),
+            }
 
     def _fetch_page_requests(self, url: str) -> dict:
-        """Простой fallback через requests."""
+        """
+        ULTRA Requests Fallback Engine.
+
+        Features:
+        - Session pooling
+        - Redirect tracking
+        - Header capture
+        - Timing metrics
+        - Encoding detection
+        - Safe HTML limits
+        - Diagnostics
+        """
+
+        import time
+
+        started = time.perf_counter()
+
         try:
-            resp = requests.get(url, timeout=10)
-            resp.raise_for_status()
+
+            print("=" * 80)
+            print("[REQUESTS] START")
+            print(f"[REQUESTS] URL: {url}")
+
+            session = requests.Session()
+
+            headers = build_anti_waf_headers(
+                {
+                    "Accept": (
+                        "text/html,"
+                        "application/xhtml+xml,"
+                        "application/xml;q=0.9,"
+                        "*/*;q=0.8"
+                    ),
+                }
+            )
+
+            response = session.get(
+                url,
+                headers=headers,
+                timeout=(10, 30),
+                allow_redirects=True,
+                verify=True,
+            )
+
+            response.raise_for_status()
+
+            security_headers = {
+                "Content-Security-Policy":
+                    response.headers.get(
+                        "Content-Security-Policy"
+                    ),
+
+                "Strict-Transport-Security":
+                    response.headers.get(
+                        "Strict-Transport-Security"
+                    ),
+
+                "X-Frame-Options":
+                    response.headers.get(
+                        "X-Frame-Options"
+                    ),
+
+                "X-Content-Type-Options":
+                    response.headers.get(
+                        "X-Content-Type-Options"
+                    ),
+
+                "Referrer-Policy":
+                    response.headers.get(
+                        "Referrer-Policy"
+                    ),
+
+                "Permissions-Policy":
+                    response.headers.get(
+                        "Permissions-Policy"
+                    ),
+            }
+
+            cookies = [
+                {
+                    "name": cookie.name,
+                    "value": cookie.value,
+                    "domain": cookie.domain,
+                    "path": cookie.path,
+                    "secure": cookie.secure,
+                }
+                for cookie in session.cookies
+            ]
+
+            if not response.encoding:
+                response.encoding = response.apparent_encoding
+
+            html = response.text
+
+            html_lower = html.lower()
+
+            blocked = any(
+                marker in html_lower
+                for marker in (
+                    "forbidden",
+                    "access denied",
+                    "captcha",
+                    "request blocked",
+                )
+            )
+
+            print(
+                f"[REQUESTS] BLOCKED: {blocked}"
+            )
+
+            max_size = 25 * 1024 * 1024
+
+            if len(html.encode("utf-8")) > max_size:
+                raise ValueError(
+                    f"HTML exceeds limit: {max_size:,} bytes"
+                )
+
+            elapsed = (
+                    time.perf_counter() - started
+            )
+
+            network_entry = {
+                "url": response.url,
+                "method": "GET",
+                "status": response.status_code,
+                "content_type": response.headers.get(
+                    "Content-Type",
+                    "",
+                ),
+                "content_length": len(html),
+                "server": response.headers.get(
+                    "Server",
+                    "",
+                ),
+                "elapsed_sec": round(
+                    elapsed,
+                    3,
+                ),
+                "redirects": [
+                    r.url
+                    for r in response.history
+                ],
+            }
+
+            print(
+                f"[REQUESTS] Status: {response.status_code}"
+            )
+
+            print(
+                f"[REQUESTS] HTML size: {len(html):,}"
+            )
+
+            print(
+                f"[REQUESTS] Redirects: {len(response.history)}"
+            )
+
             return {
                 "success": True,
-                "html": resp.text,
-                "dom": resp.text,
-                "network": [],
-                "console": [],
+                "html": html,
+                "dom": html,
+                "blocked": blocked,
+                "security_headers": security_headers,
+                "cookies": cookies,
+
+                "network": [
+                    network_entry
+                ],
+
+                "console": [
+                    {
+                        "type": "requests",
+                        "text":
+                            f"HTTP {response.status_code} "
+                            f"({response.status_code})",
+                    }
+                ],
+
                 "js_endpoints": [],
+
+                "metadata": {
+                    "url": response.url,
+                    "status": response.status_code,
+                    "server": response.headers.get(
+                        "Server",
+                        ""
+                    ),
+                    "content_type": response.headers.get(
+                        "Content-Type",
+                        ""
+                    ),
+                    "redirect_count": len(
+                        response.history
+                    ),
+                    "fetch_time": round(
+                        elapsed,
+                        3,
+                    ),
+                },
             }
+
         except Exception as e:
-            return {"success": False, "error": str(e)}
+
+            import traceback
+
+            traceback.print_exc()
+
+            print(
+                f"[REQUESTS] ERROR: {e}"
+            )
+
+            return {
+                "success": False,
+                "error": str(e),
+            }
 
     # ============================================================
     # PARSE HTML (DOMParser)
@@ -558,45 +1227,193 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
         self.js_endpoints_text.delete("1.0", "end")
         self.console_text.delete("1.0", "end")
         self.dynamic_dom_text.delete("1.0", "end")
+        self.security_headers_text.delete(
+            "1.0",
+            "end",
+        )
+
+        self.cookies_text.delete(
+            "1.0",
+            "end",
+        )
 
         elements = results.get("elements", [])
         forms = results.get("forms", [])
         scripts = results.get("scripts", [])
-        events = results.get("events", [])
+        events = results.get("dom_events", [])
         media = results.get("media", [])
         links = results.get("links", [])
 
-        inline_scripts = [s for s in scripts if s.get("content")]
-        external_scripts = [s for s in scripts if s.get("src")]
-        high_risk_events = [e for e in events if e.get("risk") == "high"]
+        headers = results.get("headers", [])
+        lists_data = results.get("lists", [])
+        json_ld = results.get("json_ld", [])
+        canonical = results.get("canonical", {})
+
+        inline_scripts = [
+            s for s in scripts
+            if s.get("inline")
+        ]
+
+        external_scripts = [
+            s for s in scripts
+            if s.get("src")
+        ]
+        high_risk_events = [
+            e for e in events
+            if "Высокий" in e.get("risk_level", "")
+        ]
+
+        metadata = self.metadata or {}
+
+        risk_score = (
+                len(high_risk_events) * 10
+                + len(inline_scripts) * 3
+                + len(self.js_endpoints)
+                + len(forms)
+        )
+
+        risk_level = (
+            "HIGH"
+            if risk_score > 100 else
+            "MEDIUM"
+            if risk_score > 30 else
+            "LOW"
+        )
+
+        js_density = round(
+            (len(scripts) / max(len(elements), 1)) * 100,
+            2
+        )
+
+        link_density = round(
+            (len(links) / max(len(elements), 1)) * 100,
+            2
+        )
+
+        risk_icon = {
+            "LOW": "🟢",
+            "MEDIUM": "🟡",
+            "HIGH": "🔴",
+        }.get(risk_level, "⚪")
+
+        elements_per_form = (
+            round(
+                len(elements) / len(forms),
+                2
+            )
+            if forms
+            else "N/A"
+        )
+
+        dom_complexity = (
+            "HIGH"
+            if len(elements) > 5000 else
+            "MEDIUM"
+            if len(elements) > 1500 else
+            "LOW"
+        )
 
         # SUMMARY
         summary = f"""
-═══════════════════════════════════════════════════════════════
-🔍 DOM АНАЛИЗ — СВОДКА (ULTRA)
-═══════════════════════════════════════════════════════════════
+        ═══════════════════════════════════════════════════════════════
+        🔍 DOM АНАЛИЗ — СВОДКА (ULTRA)
+        ═══════════════════════════════════════════════════════════════
 
-📊 Статистика:
-  • Всего элементов: {len(elements)}
-  • Форм: {len(forms)}
-  • Скриптов: {len(scripts)}
-  • Событий: {len(events)}
-  • Медиа: {len(media)}
-  • Ссылок: {len(links)}
+        📊 Структура DOM:
+          • Всего элементов: {len(elements)}
+          • Форм: {len(forms)}
+          • Скриптов: {len(scripts)}
+          • Событий: {len(events)}
+          • Медиа: {len(media)}
+          • Ссылок: {len(links)}
 
-🧠 JS-осведомлённость:
-  • Внешние скрипты: {len(external_scripts)}
-  • Встроенные (inline) скрипты: {len(inline_scripts)}
-  • Высокорисковые обработчики событий: {len(high_risk_events)}
+        🧠 JavaScript:
+          • Внешние скрипты: {len(external_scripts)}
+          • Inline скрипты: {len(inline_scripts)}
+          • Высокорисковые события: {len(high_risk_events)}
+          • JS endpoints: {len(self.js_endpoints)}
+          
+        🎯 Risk Overview:
+          • Risk score: {risk_score}
+          • Risk level: {risk_icon} {risk_level}
 
-🌐 Network:
-  • Всего запросов: {len(self.network_log)}
-  • JS endpoints: {len(self.js_endpoints)}
-  • Console сообщений: {len(self.console_log)}
+        📡 Browser Telemetry:
+          • Network requests: {metadata.get("network_entries", len(self.network_log))}
+          • Console entries: {metadata.get("console_entries", len(self.console_log))}
+          • Captured endpoints: {metadata.get("js_endpoints", len(self.js_endpoints))}
 
-═══════════════════════════════════════════════════════════════
-"""
+        🌐 HTTP:
+          • Status: {self.http_status}
+          • Blocked: {"YES" if self.blocked else "NO"}
+
+        🧭 Navigation:
+          • Final URL: {metadata.get("final_url", "—")}
+          • Page title: {metadata.get("page_title", "—")}
+
+        📄 DOM Snapshot:
+          • DOM size: {metadata.get("dom_size", 0):,} bytes
+          • Elements per form: {elements_per_form}
+          • DOM complexity: {dom_complexity}
+        
+        📑 SEO / Structure:
+          • Headers: {len(headers)}
+          • Lists: {len(lists_data)}
+          • JSON-LD blocks: {len(json_ld)}
+          • Canonical URL: {"YES" if canonical else "NO"}
+             
+        📈 Density Metrics:
+          • JS density: {js_density}%
+          • Link density: {link_density}%
+        
+        ⚠️ Security Indicators:
+          • Inline scripts: {len(inline_scripts)}
+          • Event handlers: {len(events)}
+          • Dynamic endpoints: {len(self.js_endpoints)}
+          • Console messages: {len(self.console_log)}
+
+        ═══════════════════════════════════════════════════════════════
+        """
         self.summary_text.insert("1.0", summary)
+
+        headers_text = (
+            "═══════════════════════════════════════\n"
+            "🛡 SECURITY HEADERS\n"
+            "═══════════════════════════════════════\n\n"
+        )
+
+        for header, value in (
+                self.security_headers.items()
+        ):
+            headers_text += (
+                f"{header}: "
+                f"{value or '❌ Missing'}\n"
+            )
+
+        self.security_headers_text.insert(
+            "1.0",
+            headers_text,
+        )
+
+        cookies_text = (
+            "═══════════════════════════════════════\n"
+            "🍪 COOKIES\n"
+            "═══════════════════════════════════════\n\n"
+        )
+
+        for cookie in self.cookies:
+            cookies_text += (
+                f"Name: "
+                f"{cookie.get('name')}\n"
+                f"Domain: "
+                f"{cookie.get('domain')}\n"
+                f"Path: "
+                f"{cookie.get('path', '/')}\n\n"
+            )
+
+        self.cookies_text.insert(
+            "1.0",
+            cookies_text,
+        )
 
         # FORMS
         if self.extract_forms_var.get():
@@ -744,6 +1561,9 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
         self.console_log = []
         self.js_endpoints = []
         self.dynamic_dom = None
+        self.metadata = {}
+        self.blocked = False
+        self.http_status = None
 
         self.status_label.config(text="Готов к анализу")
 

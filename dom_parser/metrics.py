@@ -6,7 +6,7 @@ Metrics collection for DOMParser ULTRA 7.0
 import logging
 import threading
 import time
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Callable, Coroutine
 from dataclasses import dataclass, field, asdict
 from collections import defaultdict
 
@@ -133,7 +133,7 @@ class ProgressTracker:
     Используется для обновления UI.
     """
 
-    def __init__(self, callbacks: List[callable] = None):
+    def __init__(self, callbacks: List[Callable[[Dict[str, Any]], None]] = None):
         self.callbacks = callbacks or []
         self._lock = threading.Lock()
         self.current = 0

@@ -13,6 +13,10 @@ cd C:\Users\sanch\PycharmProjects\itproger
 # Перевір статус, щоб побачити змінені файли
 git status
 
+# Я б також зробив контрольний знімок історії:
+
+git log --oneline --decorate -10
+
 # Онови інформацію про віддалений репозиторій:
 git fetch origin
 
@@ -36,6 +40,30 @@ git push origin main
 # Отже, твій коміт уже на GitHub у гілці main.
 # Перевірити можна командою:
 git log origin/main --oneline
+
+# Якщо ти хочеш примусово злити твою гілку поверх main, залишивши свою версію файлів, то після поточного конфліктного
+# merge можна виконати:
+
+git checkout --ours .
+git add .
+git commit -m "merge: keep feature/networkchecker-ultra-v7 version"
+
+# Якщо навпаки хочеш прийняти всі зміни з main:
+
+Shell
+git checkout --theirs .
+git add .
+git commit -m "merge: keep origin/main version"
+
+# залишилося лише синхронізувати локальний main:
+git checkout main
+git pull origin main
+
+# видалити гілку локально і на GitHub можна так:
+
+git branch -d feature/networkchecker-ultra-v7
+
+git push origin --delete feature/networkchecker-ultra-v7
 
 ###############################################################
 # cd C:\Users\sanch\PycharmProjects\itproger\xss_security_gui
