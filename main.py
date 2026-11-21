@@ -134,7 +134,7 @@ from xss_security_gui.autoanalyzer_tab import AutoAnalyzerTab
 from xss_security_gui.gui.mutator_tasks_panel import MutatorTasksPanel
 from xss_security_gui.gui.real_time_monitoring_tab import RealTimeMonitoringTab
 from xss_security_gui.threat_analysis.accounts_tab import AccountsTab
-from xss_security_gui.threat_analysis.account_intelligence_tab import AccountIntelligenceTab
+
 
 # ============================================================
 #  GUI вкладки (Threat Intelligence / Analyzer / Breaches )
@@ -495,10 +495,7 @@ class XSSSecurityGUI(tk.Tk):
         self._add_sidebar_tab("📊 Обзор", lambda p: OverviewTab(p, app=self, threat_tab=self.threat_tab))
         self._add_sidebar_tab("🤖 AI Verdict", lambda p: AIVerdictTab(p))
         self._add_sidebar_tab("👤 Accounts", lambda p: AccountsTab(p, self.get_threat_connector()))
-        self._add_sidebar_tab(
-            "🧠 Account Intelligence",
-            lambda p: AccountIntelligenceTab(p, self.get_threat_connector()),
-        )
+
 
         # ------------------------------------------------------------
         # 2. Deep Tools

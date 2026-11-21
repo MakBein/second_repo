@@ -10,7 +10,7 @@ Enterprise-grade SUPER-CRAWLER for XSSSecurityGUI
 
 Автор: Aleksandr + Copilot (refactored to battle-ready level)
 """
-
+import base64
 import os
 import re
 import json
@@ -23,6 +23,7 @@ import subprocess
 import random
 import socket
 import ssl
+import ipaddress
 
 
 from hashlib import sha1
@@ -78,7 +79,7 @@ ENABLE_CHROME_FINGERPRINT: bool = bool(settings.get("anti_detection.chrome_finge
 ENABLE_MULTI_SESSION_ROTATION: bool = bool(settings.get("anti_detection.multi_session", True))
 ENABLE_AUTO_RETRY: bool = bool(settings.get("anti_detection.auto_retry", True))
 # Sensitive extraction mode
-ENABLE_ULTRA_SENSITIVE = bool(settings.get("sensitive.ultra_mode", False))
+ENABLE_ULTRA_SENSITIVE = bool(settings.get("sensitive.ultra_mode", True))
 
 
 # ---------------------------------------------------------------------
@@ -627,6 +628,17 @@ def build_anti_waf_headers(base: Optional[Dict[str, str]] = None) -> Dict[str, s
     h.setdefault("Sec-Fetch-Dest", "document")
     return h
 
+def build_browser_headers(
+        region: str = "us"
+) -> Dict[str, str]:
+
+    if fingerprint:
+
+        return fingerprint.get_headers(
+            region
+        )
+
+    return build_anti_waf_headers()
 
 def simulate_human_behavior_playwright(page) -> None:
     """
@@ -1162,12 +1174,35 @@ SECRET_PATTERNS_COMPILED = [
     re.compile(r"-----BEGIN\s+(?:RSA\s+)?(?:PRIVATE|PUBLIC)\s+KEY-----", re.I),
 ]
 
-EMAIL_RE = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
+EMAIL_RE = re.compile(
+    r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[A-Za-z]{2,24}\b"
+)
 PHONE_RE_LIST = [
-    re.compile(r"(?:\+?\d{1,3}[-.\s]?\(?\d{2,3}\)?[-.\s]?\d{2,3}[-.\s]?\d{2,2}[-.\s]?\d{2,2})"),
-    re.compile(r"(?:\+7|8)[-\s]?(?:9\d{2}|3\d{2}|4\d{2}|8\d{2})[-\s]?\d{3}[-\s]?\d{2}[-\s]?\d{2}"),
-    re.compile(r"\+1[-.\s]?\d{3}[-.\s]?\d{3}[-.\s]?\d{4}"),
-    re.compile(r"\d{3}[-.\s]?\d{3}[-.\s]?\d{4}"),
+
+    # International E.164-like numbers
+
+    re.compile(
+        r"\+?[1-9]\d[\d\-\(\)\s]{7,18}\d"
+    ),
+
+    # US/Canada
+
+    re.compile(
+        r"\+?1[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{4}"
+    ),
+
+    # Ukraine
+
+    re.compile(
+        r"\+?380[\s\-]?\(?\d{2}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}"
+    ),
+
+    # Europe generic
+
+    re.compile(
+        r"\+\d{2,3}[\s\-]?\d{2,4}[\s\-]?\d{2,4}[\s\-]?\d{2,4}[\s\-]?\d{2,4}"
+    ),
+
 ]
 
 TOKEN_PATTERNS_COMPILED = [
@@ -1266,19 +1301,35 @@ def extract_sensitive_data(text: str) -> Dict[str, List[str]]:
     data: Dict[str, List[str]] = {
         "emails": [],
         "phones": [],
+        "interesting_jwt": [],
+        "weak_jwt": [],
+
+        "jwt_algorithms": [],
+        "jwt_issuers": [],
+        "jwt_subjects": [],
+        "expired_jwt": [],
+        "anonymous_jwt": [],
+        "admin_jwt": [],
+
         "tokens": [],
+        "interesting_tokens": [],
+
         "ips": [],
         "ipv4": [],
+        "public_ipv4": [],
+        "private_ipv4": [],
         "ipv6": [],
         "mac": [],
         "cidr": [],
         "hostnames": [],
+
         "parameters": [],
         "base64_strings": [],
         "uuids": [],
         "hashes": [],
         "api_keys": [],
         "jwt_tokens": [],
+
         "credit_cards": [],
         "cvv": [],
         "card_expiry": [],
@@ -1299,61 +1350,1101 @@ def extract_sensitive_data(text: str) -> Dict[str, List[str]]:
 
     try:
         # Emails
+        bad_local_parts = {
+
+            "example",
+            "test",
+            "demo",
+            "sample",
+
+            "noreply",
+            "no-reply",
+
+            "root",
+            "daemon",
+
+        }
+
+        interesting_keywords = (
+
+            "admin",
+            "support",
+            "security",
+            "abuse",
+
+            "dev",
+            "developer",
+
+            "api",
+            "backend",
+
+            "ops",
+            "noc",
+
+            "contact",
+            "help",
+
+            "info",
+
+        )
+
         for m in EMAIL_RE.finditer(text):
-            _append_limited_unique(data["emails"], m.group(0))
+
+            email = (
+                m.group(0)
+                .strip()
+                .lower()
+            )
+
+            if "@" not in email:
+                continue
+
+            local_part, domain = (
+                email.split("@", 1)
+            )
+
+            # базова валідація
+
+            if len(local_part) < 1:
+                continue
+
+            if len(domain) < 3:
+                continue
+
+            if "." not in domain:
+                continue
+
+            # сміття
+
+            if local_part in bad_local_parts:
+                continue
+
+            if domain.endswith(
+                    (
+                            ".png",
+                            ".jpg",
+                            ".jpeg",
+                            ".gif",
+                            ".svg",
+                            ".css",
+                            ".js",
+                    )
+            ):
+                continue
+
+            # пріоритетні адреси
+
+            is_interesting = any(
+                keyword in local_part
+                for keyword in interesting_keywords
+            )
+
+            if is_interesting:
+                print(
+                    f"[EMAIL] INTERESTING: "
+                    f"{email}"
+                )
+
+            _append_limited_unique(
+                data["emails"],
+                email,
+            )
+
+            if len(data["emails"]) >= MAX_MATCHES_PER_KEY:
+                break
 
         # Phones
+        phone_keywords = (
+
+            "phone",
+            "telephone",
+            "tel",
+
+            "mobile",
+            "cell",
+
+            "contact",
+            "contacts",
+
+            "support",
+            "helpdesk",
+
+            "call",
+            "hotline",
+
+            "whatsapp",
+            "viber",
+            "telegram",
+
+        )
+
         for p in PHONE_RE_LIST:
+
             for m in p.finditer(text):
-                _append_limited_unique(data["phones"], m.group(0))
+
+                phone = m.group(0).strip()
+
+                digits = re.sub(
+                    r"\D",
+                    "",
+                    phone,
+                )
+
+                # базова валідація
+
+                if len(digits) < 10:
+                    continue
+
+                if len(digits) > 15:
+                    continue
+
+                # відсікаємо float
+
+                if "." in phone:
+                    continue
+
+                # відсікаємо сміття
+
+                if len(set(digits)) < 4:
+                    continue
+
+                # 0000000000
+
+                if len(set(digits)) == 1:
+                    continue
+
+                # контекст
+
+                start = max(
+                    0,
+                    m.start() - 80,
+                )
+
+                end = min(
+                    len(text),
+                    m.end() + 80,
+                )
+
+                context = text[
+                    start:end
+                ].lower()
+
+                has_context = any(
+                    keyword in context
+                    for keyword in phone_keywords
+                )
+
+                # якщо немає контексту,
+                # але номер схожий на міжнародний
+                # залишаємо
+
+                if not has_context:
+
+                    if not (
+                            phone.startswith("+")
+                            or len(digits) >= 11
+                    ):
+                        continue
+
+                _append_limited_unique(
+                    data["phones"],
+                    phone,
+                )
+
+                # окрема категорія
+                # цікавих телефонів
+
+                if has_context:
+
+                    if (
+                            "interesting_phones"
+                            not in data
+                    ):
+                        data[
+                            "interesting_phones"
+                        ] = []
+
+                    _append_limited_unique(
+                        data["interesting_phones"],
+                        phone,
+                    )
+
                 if len(data["phones"]) >= MAX_MATCHES_PER_KEY:
                     break
+
             if len(data["phones"]) >= MAX_MATCHES_PER_KEY:
                 break
 
         # Tokens
+        interesting_token_keywords = (
+
+            "token",
+            "access_token",
+            "refresh_token",
+
+            "authorization",
+            "auth",
+
+            "bearer",
+
+            "apikey",
+            "api_key",
+            "key",
+
+            "jwt",
+
+            "secret",
+            "client_secret",
+
+            "oauth",
+            "oauth2",
+
+            "session",
+            "sessionid",
+
+        )
+
         for p in TOKEN_PATTERNS_COMPILED:
+
             for m in p.finditer(text):
-                token = m.group(1) if m.groups() else m.group(0)
-                _append_limited_unique(data["tokens"], token)
+
+                token = (
+                    m.group(1)
+                    if m.groups()
+                    else m.group(0)
+                )
+
+                token = token.strip()
+
+                # занадто коротке сміття
+
+                if len(token) < 16:
+                    continue
+
+                # дуже довгі bundle-фрагменти
+
+                if len(token) > 4096:
+                    continue
+
+                # шукаємо контекст
+
+                start = max(
+                    0,
+                    m.start() - 100,
+                )
+
+                end = min(
+                    len(text),
+                    m.end() + 100,
+                )
+
+                context = text[
+                    start:end
+                ].lower()
+
+                has_interest_context = any(
+                    keyword in context
+                    for keyword in interesting_token_keywords
+                )
+
+                # якщо токен виглядає випадковим
+                # але поруч немає auth-контексту
+
+                entropy_chars = len(
+                    set(token)
+                )
+
+                if (
+                        entropy_chars < 6
+                        and
+                        not has_interest_context
+                ):
+                    continue
+
+                _append_limited_unique(
+                    data["tokens"],
+                    token,
+                )
+
+                # окремо цікаві токени
+
+                if has_interest_context:
+
+                    if (
+                            "interesting_tokens"
+                            not in data
+                    ):
+                        data[
+                            "interesting_tokens"
+                        ] = []
+
+                    _append_limited_unique(
+                        data["interesting_tokens"],
+                        token,
+                    )
+
                 if len(data["tokens"]) >= MAX_MATCHES_PER_KEY:
                     break
+
             if len(data["tokens"]) >= MAX_MATCHES_PER_KEY:
                 break
 
         # JWT
-        for m in JWT_RE.finditer(text):
-            _append_limited_unique(data["jwt_tokens"], m.group(0))
+        jwt_keywords = (
 
-        # IPv4
+            "jwt",
+            "token",
+
+            "authorization",
+            "bearer",
+
+            "access_token",
+            "refresh_token",
+
+            "oauth",
+            "openid",
+
+        )
+
+        for m in JWT_RE.finditer(text):
+
+            jwt_token = m.group(0).strip()
+
+            parts = jwt_token.split(".")
+
+            if len(parts) != 3:
+                continue
+
+            try:
+
+                header_b64 = parts[0]
+                payload_b64 = parts[1]
+
+                padding = "=" * (
+                        (-len(header_b64)) % 4
+                )
+
+                header = json.loads(
+                    base64.urlsafe_b64decode(
+                        header_b64 + padding
+                    )
+                )
+
+                padding = "=" * (
+                        (-len(payload_b64)) % 4
+                )
+
+                payload = json.loads(
+                    base64.urlsafe_b64decode(
+                        payload_b64 + padding
+                    )
+                )
+
+            except Exception:
+                continue
+
+            # має бути справжній JWT
+
+            if not isinstance(header, dict):
+                continue
+
+            if not isinstance(payload, dict):
+                continue
+
+            _append_limited_unique(
+                data["jwt_tokens"],
+                jwt_token,
+            )
+
+            alg = str(
+                header.get(
+                    "alg",
+                    ""
+                )
+            ).strip()
+
+            if alg:
+                _append_limited_unique(
+                    data["jwt_algorithms"],
+                    alg,
+                )
+
+            issuer = payload.get(
+                "iss"
+            )
+
+            if issuer:
+                _append_limited_unique(
+                    data["jwt_issuers"],
+                    str(issuer),
+                )
+
+            subject = payload.get(
+                "sub"
+            )
+
+            if subject:
+                _append_limited_unique(
+                    data["jwt_subjects"],
+                    str(subject),
+                )
+            exp = payload.get(
+                "exp"
+            )
+
+            if exp:
+
+                try:
+
+                    if int(exp) < int(time.time()):
+                        _append_limited_unique(
+                            data["expired_jwt"],
+                            jwt_token,
+                        )
+
+                except Exception:
+                    pass
+
+            subject_text = str(
+                payload.get(
+                    "sub",
+                    ""
+                )
+            ).lower()
+
+            if subject_text in (
+                    "",
+                    "anonymous",
+                    "guest",
+            ):
+                _append_limited_unique(
+                    data["anonymous_jwt"],
+                    jwt_token,
+                )
+
+            if any(
+                    item in subject_text
+                    for item in (
+                            "admin",
+                            "administrator",
+                            "root",
+                            "superuser",
+                    )
+            ):
+                _append_limited_unique(
+                    data["admin_jwt"],
+                    jwt_token,
+                )
+
+            # цікаві JWT
+
+            start = max(
+                0,
+                m.start() - 100,
+            )
+
+            end = min(
+                len(text),
+                m.end() + 100,
+            )
+
+            context = text[
+                start:end
+            ].lower()
+
+            has_interest_context = any(
+                keyword in context
+                for keyword in jwt_keywords
+            )
+
+            if has_interest_context:
+                _append_limited_unique(
+                    data["interesting_jwt"],
+                    jwt_token,
+                )
+
+            # weak alg
+
+            alg = str(
+                header.get(
+                    "alg",
+                    ""
+                )
+            ).lower()
+
+            if alg.lower() in (
+                    "none",
+                    "",
+            ):
+                _append_limited_unique(
+                    data["weak_jwt"],
+                    jwt_token,
+                )
+
+            if len(data["jwt_tokens"]) >= MAX_MATCHES_PER_KEY:
+                break
+
+        # IPv4 (Recon Grade)
+        ipv4_interest_keywords = (
+
+            # infrastructure
+            "ip",
+            "ipv4",
+            "host",
+            "server",
+            "gateway",
+            "network",
+
+            # backend
+            "api",
+            "backend",
+            "internal",
+            "private",
+            "redis",
+            "mysql",
+            "postgres",
+            "mongodb",
+            "database",
+            "db",
+
+            # cloud
+            "aws",
+            "azure",
+            "gcp",
+            "cloud",
+
+            # services
+            "dns",
+            "resolver",
+            "proxy",
+            "socket",
+            "endpoint",
+
+        )
+
         for m in IPV4_RE.finditer(text):
-            ip = m.group(0)
-            _append_limited_unique(data["ipv4"], ip)
-            _append_limited_unique(data["ips"], ip)
+
+            ip = m.group(0).strip()
+
+            try:
+
+                addr = ipaddress.IPv4Address(ip)
+
+            except Exception:
+                continue
+
+            # явне сміття
+
+            if str(addr) in (
+                    "0.0.0.0",
+                    "255.255.255.255",
+                    "127.0.0.1",
+            ):
+                continue
+
+            if addr.is_unspecified:
+                continue
+
+            if addr.is_multicast:
+                continue
+
+            # контекст
+
+            start = max(
+                0,
+                m.start() - 80,
+            )
+
+            end = min(
+                len(text),
+                m.end() + 80,
+            )
+
+            context = text[
+                start:end
+            ].lower()
+
+            has_interest_context = any(
+                keyword in context
+                for keyword in ipv4_interest_keywords
+            )
+
+            # класифікація
+
+            if addr.is_private:
+                ip_class = "private"
+
+            elif addr.is_global:
+                ip_class = "public"
+
+            else:
+                ip_class = "other"
+
+            # дуже корисно для дебагу
+
+            print(
+                f"[IPV4] {ip} "
+                f"=> {ip_class} "
+                f"(context={has_interest_context})"
+            )
+
+            _append_limited_unique(
+                data["ipv4"],
+                str(addr),
+            )
+
+            _append_limited_unique(
+                data["ips"],
+                str(addr),
+            )
+
+            if addr.is_global:
+
+                _append_limited_unique(
+                    data["public_ipv4"],
+                    str(addr),
+                )
+
+            elif addr.is_private:
+
+                _append_limited_unique(
+                    data["private_ipv4"],
+                    str(addr),
+                )
+
+            # окремі категорії
+
+            if "public_ipv4" not in data:
+                data["public_ipv4"] = []
+
+            if "private_ipv4" not in data:
+                data["private_ipv4"] = []
+
+            if addr.is_global:
+
+                _append_limited_unique(
+                    data["public_ipv4"],
+                    str(addr),
+                )
+
+            elif addr.is_private:
+
+                _append_limited_unique(
+                    data["private_ipv4"],
+                    str(addr),
+                )
+
+            if len(data["ipv4"]) >= MAX_MATCHES_PER_KEY:
+                break
 
         # IPv6
+        ipv6_keywords = (
+
+            "ipv6",
+            "address",
+            "ip",
+
+            "network",
+            "host",
+            "gateway",
+
+            "interface",
+            "adapter",
+
+            "dns",
+            "resolver",
+
+            "server",
+            "client",
+
+            "socket",
+            "endpoint",
+
+        )
+
         for m in IPV6_RE.finditer(text):
-            _append_limited_unique(data["ipv6"], m.group(0))
+
+            ip = m.group(0).strip()
+
+            # шум
+
+            if ip in (
+                    "::",
+                    "::1",
+                    "0:0:0:0:0:0:0:1",
+            ):
+                continue
+
+            try:
+
+                addr = ipaddress.IPv6Address(
+                    ip
+                )
+
+            except Exception:
+                continue
+
+            # multicast
+
+            if addr.is_multicast:
+                continue
+
+            # unspecified
+
+            if addr.is_unspecified:
+                continue
+
+            start = max(
+                0,
+                m.start() - 60,
+            )
+
+            end = min(
+                len(text),
+                m.end() + 60,
+            )
+
+            context = text[
+                start:end
+            ].lower()
+
+            # якщо поруч є мережеві слова
+            # підвищуємо ймовірність реальної адреси
+
+            has_context = any(
+                keyword in context
+                for keyword in ipv6_keywords
+            )
+
+            if not has_context:
+
+                # але не відкидаємо глобальні адреси
+
+                if not addr.is_global:
+                    continue
+
+            _append_limited_unique(
+                data["ipv6"],
+                str(addr),
+            )
+
+            if len(data["ipv6"]) >= MAX_MATCHES_PER_KEY:
+                break
 
         # MAC
+        mac_keywords = (
+
+            "mac",
+            "macaddress",
+
+            "ethernet",
+            "wifi",
+            "wlan",
+
+            "network",
+            "adapter",
+            "interface",
+
+            "hardware",
+            "physical",
+
+            "nic",
+            "arp",
+
+        )
+
         for m in MAC_RE.finditer(text):
-            _append_limited_unique(data["mac"], m.group(0))
+
+            mac = m.group(0).lower()
+
+            normalized = (
+                mac.replace("-", ":")
+            )
+
+            parts = normalized.split(":")
+
+            if len(parts) != 6:
+                continue
+
+            # ff:ff:ff:ff:ff:ff
+
+            if normalized == (
+                    "ff:ff:ff:ff:ff:ff"
+            ):
+                continue
+
+            # 00:00:00:00:00:00
+
+            if normalized == (
+                    "00:00:00:00:00:00"
+            ):
+                continue
+
+            # відсікаємо
+            # aa:aa:aa:aa:aa:aa
+
+            if len(set(parts)) < 2:
+                continue
+
+            # контекст навколо MAC
+
+            start = max(
+                0,
+                m.start() - 50,
+            )
+
+            end = min(
+                len(text),
+                m.end() + 50,
+            )
+
+            context = text[
+                start:end
+            ].lower()
+
+            # поруч мають бути
+            # мережеві ключові слова
+
+            if not any(
+                    keyword in context
+                    for keyword in mac_keywords
+            ):
+                continue
+
+            _append_limited_unique(
+                data["mac"],
+                normalized,
+            )
+
+            if len(data["mac"]) >= MAX_MATCHES_PER_KEY:
+                break
 
         # CIDR
+
         for m in CIDR_RE.finditer(text):
-            _append_limited_unique(data["cidr"], m.group(0))
+
+            value = m.group(0).strip()
+
+            try:
+
+                ipaddress.ip_network(
+                    value,
+                    strict=False,
+                )
+
+            except Exception:
+                continue
+
+            _append_limited_unique(
+                data["cidr"],
+                value,
+            )
+
+            if len(data["cidr"]) >= MAX_MATCHES_PER_KEY:
+                break
 
         # Hostnames
-        for m in HOSTNAME_RE.finditer(text):
-            _append_limited_unique(data["hostnames"], m.group(0))
+        valid_tlds = {
 
-        # Parameters
-        for m in PARAM_RE.finditer(text):
-            _append_limited_unique(data["parameters"], m.group(1))
+            "com",
+            "net",
+            "org",
+            "edu",
+            "gov",
+
+            "io",
+            "app",
+            "dev",
+
+            "ru",
+            "ua",
+            "uk",
+            "de",
+            "fr",
+            "it",
+            "pl",
+
+            "info",
+            "biz",
+
+        }
+
+        bad_prefixes = (
+
+            "document.",
+            "window.",
+            "screen.",
+            "navigator.",
+            "math.",
+            "classlist.",
+
+            "location.",
+            "config.",
+            "params.",
+
+            "key.",
+            "keys.",
+
+            "name.",
+            "names.",
+
+        )
+
+        bad_suffixes = (
+
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".gif",
+            ".svg",
+            ".webp",
+
+            ".css",
+            ".js",
+            ".mjs",
+
+            ".woff",
+            ".woff2",
+
+            ".ttf",
+            ".eot",
+
+            ".ico",
+
+            ".pdf",
+            ".json",
+            ".xml",
+            ".txt",
+            ".map",
+
+            ".webmanifest",
+
+        )
+
+        bad_tlds = {
+
+            "length",
+            "push",
+            "foreach",
+            "indexof",
+            "includes",
+
+            "append",
+            "replace",
+            "delete",
+            "remove",
+
+            "collect",
+            "reset",
+
+            "src",
+            "href",
+            "async",
+
+            "hostname",
+            "protocol",
+
+            "slice",
+            "trim",
+
+            "metadata",
+            "metadataoutlet",
+
+        }
+
+        for m in HOSTNAME_RE.finditer(text):
+
+            value = (
+                m.group(0)
+                .strip()
+                .lower()
+            )
+
+            if value.startswith(
+                    bad_prefixes
+            ):
+                continue
+
+            if value.endswith(
+                    bad_suffixes
+            ):
+                continue
+
+            try:
+
+                tld = value.rsplit(
+                    ".",
+                    1,
+                )[-1]
+
+            except Exception:
+                continue
+
+            if tld in bad_tlds:
+                continue
+
+            if tld not in valid_tlds:
+                continue
+
+            # мінімум один символ до крапки
+
+            if "." not in value:
+                continue
+
+            left = value.split(
+                ".",
+                1,
+            )[0]
+
+            if len(left) < 1:
+                continue
+
+            _append_limited_unique(
+                data["hostnames"],
+                value,
+            )
+
+            if len(data["hostnames"]) >= MAX_MATCHES_PER_KEY:
+                break
 
         # Base64
         for m in BASE64_RE.finditer(text):
-            _append_limited_unique(data["base64_strings"], m.group(0))
+
+            candidate = m.group(0)
+
+            try:
+
+                decoded = base64.b64decode(
+                    candidate,
+                    validate=True,
+                )
+
+                if len(decoded) < 8:
+                    continue
+
+                printable = sum(
+                    chr(b).isprintable()
+                    for b in decoded[:100]
+                )
+
+                ratio = printable / max(
+                    len(decoded[:100]),
+                    1,
+                )
+
+                if ratio < 0.5:
+                    continue
+
+            except Exception:
+                continue
+
+            _append_limited_unique(
+                data["base64_strings"],
+                candidate,
+            )
+
+            if len(data["base64_strings"]) >= MAX_MATCHES_PER_KEY:
+                break
 
         # UUID
         for m in UUID_RE.finditer(text):

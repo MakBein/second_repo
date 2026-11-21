@@ -10,19 +10,24 @@ Burp Suite Pro‑level DOM Inspector:
 - Dynamic DOM snapshot
 - Threat Intel integration
 """
+import re
 import time
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import os
 from datetime import datetime
 from typing import Optional, Dict, Any, List
+from urllib.parse import urlparse
+
 import requests
 
 from playwright.sync_api import sync_playwright
 from xss_security_gui.crawler import (
     get_random_session,
     should_retry,
+    extract_sensitive_data,
     build_anti_waf_headers,
+    build_browser_headers,
 )
 
 from xss_security_gui.utils.ui_queue_bridge import UIQueueBridge
@@ -77,17 +82,62 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
         self.threat_tab = threat_tab
 
         # Internal state
+        self.servers: List[Dict[str, Any]] = []
         self.current_html: Optional[str] = None
         self.dom_results: Dict[str, Any] = {}
         self.network_log: List[Dict[str, Any]] = []
         self.console_log: List[Dict[str, Any]] = []
         self.js_endpoints: List[str] = []
+        self.api_endpoints: List[str] = []
         self.dynamic_dom: Optional[str] = None
         self.security_headers: Dict[str, Any] = {}
         self.cookies: List[Dict[str, Any]] = []
         self.metadata: Dict[str, Any] = {}
         self.blocked: bool = False
         self.http_status: Optional[int] = None
+
+
+        # Crawler recon data
+        self.websockets: List[str] = []
+        self.comments: List[str] = []
+
+        # Infrastructure
+        self.hostnames: List[str] = []
+        self.ips: List[str] = []
+        self.ipv6: List[str] = []
+        self.cidr: List[str] = []
+
+        # Infrastructure Intelligence
+        self.detected_frameworks: List[str] = []
+        self.detected_servers: List[str] = []
+        self.detected_waf: List[str] = []
+        self.detected_analytics: List[str] = []
+        self.detected_frontend: List[str] = []
+        self.detected_services: List[str] = []
+
+        # Sensitive data
+        self.emails: List[str] = []
+        self.phones: List[str] = []
+        self.api_keys: List[str] = []
+        self.jwt_tokens: List[str] = []
+        self.interesting_jwt: List[str] = []
+        self.weak_jwt: List[str] = []
+
+        # JWT Intelligence
+        self.jwt_algorithms: List[str] = []
+        self.jwt_issuers: List[str] = []
+        self.jwt_subjects: List[str] = []
+        self.expired_jwt: List[str] = []
+        self.anonymous_jwt: List[str] = []
+        self.admin_jwt: List[str] = []
+        self.secrets: List[str] = []
+        self.parameters: List[str] = []
+        self.hashes: List[str] = []
+        self.base64_strings: List[str] = []
+        self.uuids: List[str] = []
+
+        # DOM extras
+        self.data_attributes: List[str] = []
 
         # UI engine
         self._bridge = UIQueueBridge(self, poll_ms=60)
@@ -241,6 +291,79 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
         self.js_endpoints_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.js_endpoints_frame, text="🛰 JS Endpoints")
         self.js_endpoints_text = self._make_textbox(self.js_endpoints_frame, "#ffdd00")
+
+        # NEW: API Endpoints
+        self.api_endpoints_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.api_endpoints_frame, text="🌐 API Endpoints")
+        self.api_endpoints_text = self._make_textbox(self.api_endpoints_frame, "#66ccff")
+
+        # NEW: WebSockets
+
+        self.websockets_frame = ttk.Frame(self.notebook)
+        self.notebook.add(
+            self.websockets_frame,
+            text="📡 WebSockets"
+        )
+
+        self.websockets_text = self._make_textbox(
+            self.websockets_frame,
+            "#00ffaa"
+        )
+
+        # NEW: Comments
+
+        self.comments_frame = ttk.Frame(self.notebook)
+        self.notebook.add(
+            self.comments_frame,
+            text="💬 Comments"
+        )
+
+        self.comments_text = self._make_textbox(
+            self.comments_frame,
+            "#cccccc"
+        )
+
+        # NEW: Infrastructure
+
+        self.infrastructure_frame = ttk.Frame(self.notebook)
+        self.notebook.add(
+            self.infrastructure_frame,
+            text="📡 Infrastructure"
+        )
+
+        self.infrastructure_text = self._make_textbox(
+            self.infrastructure_frame,
+            "#66ffcc"
+        )
+
+        # NEW: Servers
+
+        self.servers_frame = ttk.Frame(
+            self.notebook
+        )
+
+        self.notebook.add(
+            self.servers_frame,
+            text="🖥 Servers"
+        )
+
+        self.servers_text = self._make_textbox(
+            self.servers_frame,
+            "#66ff66"
+        )
+
+        # NEW: Sensitive Data
+
+        self.sensitive_frame = ttk.Frame(self.notebook)
+        self.notebook.add(
+            self.sensitive_frame,
+            text="📦 Sensitive Data"
+        )
+
+        self.sensitive_text = self._make_textbox(
+            self.sensitive_frame,
+            "#ff9999"
+        )
 
         # NEW: Console Logs
         self.console_frame = ttk.Frame(self.notebook)
@@ -465,6 +588,32 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
                     or []
             )
 
+
+            api_patterns = (
+                "/api/",
+                "/v1/",
+                "/v2/",
+                "/v3/",
+                "/rest/",
+                "/graphql",
+                "/rpc/",
+                "/backend/",
+                "/gateway/",
+                "/auth/",
+                "/oauth/",
+            )
+
+            self.api_endpoints = sorted(
+                {
+                    endpoint
+                    for endpoint in self.js_endpoints
+                    if any(
+                    p in endpoint.lower()
+                    for p in api_patterns
+                )
+                }
+            )
+
             self.security_headers = (
                 result.get(
                     "security_headers",
@@ -475,6 +624,232 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
             self.cookies = (
                 result.get(
                     "cookies",
+                    []
+                )
+            )
+
+            # ------------------------------------------------------------------
+            # Crawler Recon Data
+            # ------------------------------------------------------------------
+            self.websockets = (
+                result.get(
+                    "websockets",
+                    []
+                )
+            )
+
+            self.comments = (
+                result.get(
+                    "comments",
+                    []
+                )
+            )
+
+            # Infrastructure
+
+            self.hostnames = (
+                result.get(
+                    "hostnames",
+                    []
+                )
+            )
+
+            self.ips = (
+                result.get(
+                    "ips",
+                    []
+                )
+            )
+
+            self.ipv6 = (
+                result.get(
+                    "ipv6",
+                    []
+                )
+            )
+
+            self.cidr = (
+                result.get(
+                    "cidr",
+                    []
+                )
+            )
+
+            # Sensitive
+
+            self.emails = (
+                result.get(
+                    "emails",
+                    []
+                )
+            )
+
+            self.phones = (
+                result.get(
+                    "phones",
+                    []
+                )
+            )
+
+            self.api_keys = (
+                result.get(
+                    "api_keys",
+                    []
+                )
+            )
+
+            self.jwt_tokens = (
+                result.get(
+                    "jwt_tokens",
+                    []
+                )
+            )
+
+            self.interesting_jwt = (
+                result.get(
+                    "interesting_jwt",
+                    []
+                )
+            )
+
+            self.weak_jwt = (
+                result.get(
+                    "weak_jwt",
+                    []
+                )
+            )
+
+            self.jwt_algorithms = (
+                result.get(
+                    "jwt_algorithms",
+                    []
+                )
+            )
+
+            self.jwt_issuers = (
+                result.get(
+                    "jwt_issuers",
+                    []
+                )
+            )
+
+            self.jwt_subjects = (
+                result.get(
+                    "jwt_subjects",
+                    []
+                )
+            )
+
+            self.expired_jwt = (
+                result.get(
+                    "expired_jwt",
+                    []
+                )
+            )
+
+            self.anonymous_jwt = (
+                result.get(
+                    "anonymous_jwt",
+                    []
+                )
+            )
+
+            self.admin_jwt = (
+                result.get(
+                    "admin_jwt",
+                    []
+                )
+            )
+
+            self.secrets = (
+                result.get(
+                    "secrets",
+                    []
+                )
+            )
+
+            self.parameters = (
+                result.get(
+                    "parameters",
+                    []
+                )
+            )
+
+            self.hashes = (
+                result.get(
+                    "hashes",
+                    []
+                )
+            )
+
+            self.base64_strings = (
+                result.get(
+                    "base64_strings",
+                    []
+                )
+            )
+
+            self.uuids = (
+                result.get(
+                    "uuids",
+                    []
+                )
+            )
+
+            # DOM Extras
+
+            self.data_attributes = (
+                result.get(
+                    "data_attributes",
+                    []
+                )
+            )
+
+            self.servers = (
+                result.get(
+                    "servers",
+                    []
+                )
+            )
+
+            self.detected_frameworks = (
+                result.get(
+                    "detected_frameworks",
+                    []
+                )
+            )
+
+            self.detected_servers = (
+                result.get(
+                    "detected_servers",
+                    []
+                )
+            )
+
+            self.detected_waf = (
+                result.get(
+                    "detected_waf",
+                    []
+                )
+            )
+
+            self.detected_analytics = (
+                result.get(
+                    "detected_analytics",
+                    []
+                )
+            )
+
+            self.detected_frontend = (
+                result.get(
+                    "detected_frontend",
+                    []
+                )
+            )
+
+            self.detected_services = (
+                result.get(
+                    "detected_services",
                     []
                 )
             )
@@ -583,7 +958,8 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
                 browser = p.chromium.launch(headless=True)
                 print("[PLAYWRIGHT] Browser launched")
                 session = get_random_session()
-                headers = build_anti_waf_headers()
+                # headers = build_anti_waf_headers()
+                headers = build_browser_headers(region="ru")
 
                 context = browser.new_context(
                     user_agent=session["user_agent"],
@@ -629,9 +1005,33 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
                     except Exception:
                         body = "<unavailable>"
                     for entry in network_log:
+
                         if entry["url"] == response.url:
                             entry["status"] = response.status
+
                             entry["body"] = body
+
+                            entry["content_type"] = (
+                                response.headers.get(
+                                    "content-type",
+                                    ""
+                                )
+                            )
+
+                            entry["server_header"] = (
+                                response.headers.get(
+                                    "server",
+                                    ""
+                                )
+                            )
+
+                            entry["powered_by"] = (
+                                response.headers.get(
+                                    "x-powered-by",
+                                    ""
+                                )
+                            )
+
                             break
 
                 page.on("request", on_request)
@@ -816,46 +1216,768 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
                     f"[PLAYWRIGHT] FINAL STATUS: {final_status}"
                 )
 
-                response_headers = (
-                    response.headers
-                    if response
-                    else {}
-                )
-
-                security_headers = {
-                    "Content-Security-Policy":
-                        response_headers.get(
-                            "content-security-policy"
-                        ),
-
-                    "Strict-Transport-Security":
-                        response_headers.get(
-                            "strict-transport-security"
-                        ),
-
-                    "X-Frame-Options":
-                        response_headers.get(
-                            "x-frame-options"
-                        ),
-
-                    "X-Content-Type-Options":
-                        response_headers.get(
-                            "x-content-type-options"
-                        ),
-
-                    "Referrer-Policy":
-                        response_headers.get(
-                            "referrer-policy"
-                        ),
-
-                    "Permissions-Policy":
-                        response_headers.get(
-                            "permissions-policy"
-                        ),
-                }
 
                 # DOM snapshot
                 dom_html = page.content()
+                from bs4 import BeautifulSoup, Comment
+                soup = BeautifulSoup(
+                    dom_html,
+                    "html.parser"
+                )
+                comments = []
+
+                for comment in soup.find_all(
+                        string=lambda t: isinstance(
+                            t,
+                            Comment,
+                        )
+                ):
+                    txt = str(comment).strip()
+
+                    if txt:
+                        comments.append(txt[:1000])  # limit to 1000 chars
+
+                data_attributes = []
+
+                for tag in soup.find_all(True):
+
+                    for attr, value in tag.attrs.items():
+
+                        if attr.startswith("data-"):
+                            data_attributes.append(
+                                f"{tag.name}.{attr}={value}"
+                            )
+
+                websockets = list(
+                    set(
+                        re.findall(
+                            r"wss?://[^\s\"']+",
+                            dom_html,
+                            re.I,
+                        )
+                    )
+                )
+
+                hostnames = list(
+                    set(
+                        re.findall(
+                            r"(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}",
+                            dom_html,
+                        )
+                    )
+                )
+
+                bad_suffixes = {
+                    "png",
+                    "jpg",
+                    "jpeg",
+                    "gif",
+                    "svg",
+                    "webp",
+                    "css",
+                    "js",
+                    "ico",
+                    "woff",
+                    "woff2",
+                    "ttf",
+                    "eot",
+                }
+
+                bad_prefixes = (
+                    "document.",
+                    "window.",
+                    "screen.",
+                    "navigator.",
+                    "math.",
+                    "classlist.",
+                )
+
+                hostnames = sorted(
+                    {
+                        h.lower()
+
+                        for h in hostnames
+
+                        if (
+                                   h.split(".")[-1].lower()
+                                   not in bad_suffixes
+                           )
+
+                           and not any(
+                        h.lower().startswith(
+                            prefix
+                        )
+                        for prefix in bad_prefixes
+                    )
+                    }
+                )
+
+                # ============================================================
+                # Analysis Sources
+                # ============================================================
+
+                dom_text = dom_html
+
+                network_text = ""
+
+                javascript_text = ""
+
+                inline_js_text = ""
+
+                # ============================================================
+                # Network responses
+                # ============================================================
+
+                for req in network_log:
+                    network_text += "\n"
+
+                    network_text += req.get(
+                        "url",
+                        ""
+                    )
+
+                    network_text += "\n"
+
+                    network_text += str(
+                        req.get(
+                            "body",
+                            ""
+                        )
+                    )
+
+                # ============================================================
+                # External script sources
+                # ============================================================
+
+                script_sources = set()
+
+                for script in soup.find_all("script"):
+
+                    src = script.get("src")
+
+                    if not src:
+                        continue
+
+                    if isinstance(src, list):
+
+                        for item in src:
+
+                            if isinstance(item, str):
+                                script_sources.add(item)
+
+                    elif isinstance(src, str):
+
+                        script_sources.add(src)
+
+                javascript_text += "\n".join(
+                    script_sources
+                )
+
+                # ============================================================
+                # Download JS
+                # ============================================================
+                from urllib.parse import urljoin
+
+                js_contents = []
+
+                for src in script_sources:
+
+                    try:
+
+                        js_url = urljoin(
+                            page.url,
+                            src,
+                        )
+
+                        print(
+                            f"[PLAYWRIGHT] Download JS: {js_url}"
+                        )
+
+                        response = page.context.request.get(
+                            js_url,
+                            timeout=10000,
+                        )
+
+                        if not response.ok:
+                            continue
+
+                        js_text = response.text()
+
+                        # захист від величезних bundle
+
+                        if len(js_text) > 5000000:
+                            js_text = js_text[:5000000]
+
+                        js_contents.append(
+                            js_text
+                        )
+
+                    except Exception as ex:
+
+                        print(
+                            f"[PLAYWRIGHT] JS load failed: {src} -> {ex}"
+                        )
+
+                javascript_text += "\n".join(
+                    js_contents
+                )
+
+                # ============================================================
+                # Inventory servers
+                # ============================================================
+
+                servers = {}
+
+                for entry in network_log:
+
+                    try:
+
+                        parsed = urlparse(
+                            entry.get(
+                                "url",
+                                "",
+                            )
+                        )
+
+                        host = parsed.netloc.lower()
+
+                        if not host:
+                            continue
+
+                        if host not in servers:
+                            servers[host] = {
+                                "host": host,
+                                "requests": 0,
+                                "statuses": set(),
+                                "resource_types": set(),
+                                "content_types": set(),
+                                "server_headers": set(),
+                                "powered_by": set(),
+                                "ips": set(),
+                                "ipv6": set(),
+                                "cidr": set(),
+                                "samples": [],
+                                "response_samples": [],
+                                # Infrastructure Intelligence
+                                "detected_technologies": set(),
+                                "detected_frameworks": set(),
+                                "detected_servers": set(),
+                                "detected_waf": set(),
+                                "detected_analytics": set(),
+                                "detected_frontend": set(),
+                                "detected_services": set(),
+                                "detected_cdn": set(),
+                                "detected_auth": set(),
+                                "country": "",
+                                "provider": "",
+                                "asn": "",
+
+                            }
+
+                        srv = servers[host]
+
+                        #
+                        # Role intelligence
+                        #
+                        if "auth." in host:
+                            srv["detected_auth"].add(
+                                "Authentication"
+                            )
+
+                        if "api." in host:
+                            srv["detected_services"].add(
+                                "API"
+                            )
+
+                        if "cdn" in host:
+                            srv["detected_cdn"].add(
+                                "CDN"
+                            )
+
+                        if "yandex" in host:
+                            srv["detected_analytics"].add(
+                                "Yandex Metrika"
+                            )
+
+                        if "mail.ru" in host:
+                            srv["detected_analytics"].add(
+                                "Mail.ru Analytics"
+                            )
+
+                        if "targetads" in host:
+                            srv["detected_analytics"].add(
+                                "TargetAds"
+                            )
+
+                        if "adriver" in host:
+                            srv["detected_analytics"].add(
+                                "AdRiver"
+                            )
+
+                        srv["requests"] += 1
+
+                        status = entry.get("status")
+
+                        if status:
+                            srv["statuses"].add(status)
+
+                        resource_type = entry.get(
+                            "resource_type"
+                        )
+
+                        if resource_type:
+                            srv["resource_types"].add(
+                                resource_type
+                            )
+
+                        if len(srv["samples"]) < 10:
+                            srv["samples"].append(
+                                entry.get(
+                                    "url",
+                                    ""
+                                )
+                            )
+                        body = entry.get(
+                            "body",
+                            ""
+                        )
+
+                        if (
+                                isinstance(body, str)
+                                and body
+                                and len(srv["response_samples"]) < 5
+                        ):
+                            srv["response_samples"].append(
+                                body[:300]
+                            )
+
+                        content_type = entry.get(
+                            "content_type"
+                        )
+
+                        if content_type:
+                            srv["content_types"].add(
+                                content_type
+                            )
+
+                        server_header = entry.get(
+                            "server_header"
+                        )
+
+                        if server_header:
+                            srv["server_headers"].add(
+                                server_header
+                            )
+
+                        if server_header:
+
+                            value = server_header.lower()
+
+                            if "nginx" in value:
+                                srv["detected_servers"].add(
+                                    "nginx"
+                                )
+
+                            if "apache" in value:
+                                srv["detected_servers"].add(
+                                    "Apache"
+                                )
+
+                            if "iis" in value:
+                                srv["detected_servers"].add(
+                                    "IIS"
+                                )
+
+                            if "openresty" in value:
+                                srv["detected_servers"].add(
+                                    "OpenResty"
+                                )
+
+                            if "cloudflare" in value:
+                                srv["detected_cdn"].add(
+                                    "Cloudflare"
+                                )
+
+                        powered_by = entry.get(
+                            "powered_by"
+                        )
+
+                        if powered_by:
+                            srv["powered_by"].add(
+                                powered_by
+                            )
+
+                        if powered_by:
+
+                            value = powered_by.lower()
+
+                            if "express" in value:
+                                srv["detected_technologies"].add(
+                                    "Express"
+                                )
+
+                            if "next" in value:
+                                srv["detected_frameworks"].add(
+                                    "Next.js"
+                                )
+
+                            if "react" in value:
+                                srv["detected_frameworks"].add(
+                                    "React"
+                                )
+
+                            if "php" in value:
+                                srv["detected_technologies"].add(
+                                    "PHP"
+                                )
+
+                            if "asp.net" in value:
+                                srv["detected_technologies"].add(
+                                    "ASP.NET"
+                                )
+
+                    except Exception:
+                        pass
+
+                # ============================================================
+                # Servers list
+                # ============================================================
+                servers_list = []
+
+                for srv in servers.values():
+                    servers_list.append(
+                        {
+                            "host": srv["host"],
+                            "requests": srv["requests"],
+                            "statuses": sorted(
+                                srv["statuses"]
+                            ),
+                            "resource_types": sorted(
+                                srv["resource_types"]
+                            ),
+                            "content_types": sorted(
+                                srv["content_types"]
+                            ),
+                            "server_headers": sorted(
+                                srv["server_headers"]
+                            ),
+                            "powered_by": sorted(
+                                srv["powered_by"]
+                            ),
+                            "response_samples": (
+                                srv["response_samples"]
+                            ),
+                            "detected_technologies":
+                                sorted(
+                                    srv["detected_technologies"]
+                                ),
+
+                            "detected_frameworks":
+                                sorted(
+                                    srv["detected_frameworks"]
+                                ),
+
+                            "detected_servers":
+                                sorted(
+                                    srv["detected_servers"]
+                                ),
+
+                            "detected_cdn":
+                                sorted(
+                                    srv["detected_cdn"]
+                                ),
+
+                            "detected_waf":
+                                sorted(
+                                    srv["detected_waf"]
+                                ),
+
+                            "detected_auth":
+                                sorted(
+                                    srv["detected_auth"]
+                                ),
+
+                            "detected_analytics":
+                                sorted(
+                                    srv["detected_analytics"]
+                                ),
+
+                            "detected_services":
+                                sorted(
+                                    srv["detected_services"]
+                                ),
+
+                            "country":
+                                srv["country"],
+
+                            "provider":
+                                srv["provider"],
+
+                            "asn":
+                                srv["asn"],
+
+                            "samples": srv["samples"],
+                        }
+                    )
+
+                servers_list.sort(
+                    key=lambda s: s["requests"],
+                    reverse=True,
+                )
+                # ============================================================
+                # Inline JavaScript
+                # ============================================================
+
+                script_content = []
+
+                for script in soup.find_all("script"):
+
+                    try:
+
+                        if script.string:
+                            script_content.append(
+                                script.string
+                            )
+
+                    except Exception:
+                        pass
+
+                inline_js_text += "\n".join(
+                    script_content
+                )
+
+                combined_text = (
+                        dom_text
+                        + "\n"
+                        + network_text
+                        + "\n"
+                        + javascript_text
+                        + "\n"
+                        + inline_js_text
+                )
+
+                # ============================================================
+                # Technology Detection
+                # ============================================================
+                detected_frameworks = set()
+                detected_servers = set()
+                detected_waf = set()
+                detected_analytics = set()
+                detected_frontend = set()
+                detected_services = set()
+                tech_source = (
+                        dom_html
+                        + "\n"
+                        + javascript_text
+                ).lower()
+
+                if (
+                        "__react"
+                        in tech_source
+                        or "react-dom"
+                        in tech_source
+                        or "react.production"
+                        in tech_source
+                ):
+                    detected_frameworks.add(
+                        "React"
+                    )
+
+                if (
+                        "/_next/"
+                        in tech_source
+                        or "__next_data__"
+                        in tech_source
+                        or "_next/static"
+                        in tech_source
+                ):
+                    detected_frameworks.add(
+                        "Next.js"
+                    )
+
+                if (
+                        "webpack"
+                        in tech_source
+                        or "/chunks/"
+                        in tech_source
+                ):
+                    detected_frontend.add(
+                        "Webpack"
+                    )
+
+                if (
+                        "mc.yandex.ru"
+                        in tech_source
+                        or "ym("
+                        in tech_source
+                ):
+                    detected_analytics.add(
+                        "Yandex Metrika"
+                    )
+
+                if (
+                        "matomo"
+                        in tech_source
+                        or "_paq"
+                        in tech_source
+                ):
+                    detected_analytics.add(
+                        "Matomo"
+                    )
+
+                if (
+                        "auth."
+                        in tech_source
+                        or "/oauth"
+                        in tech_source
+                        or "/login"
+                        in tech_source
+                ):
+                    detected_services.add(
+                        "Authentication Service"
+                    )
+
+                detected_frameworks = sorted(
+                    detected_frameworks
+                )
+
+                detected_servers = sorted(
+                    detected_servers
+                )
+
+                detected_waf = sorted(
+                    detected_waf
+                )
+
+                detected_analytics = sorted(
+                    detected_analytics
+                )
+
+                detected_frontend = sorted(
+                    detected_frontend
+                )
+
+                detected_services = sorted(
+                    detected_services
+                )
+                # ============================================================
+                # Sensitive extraction
+                # ============================================================
+                sensitive = extract_sensitive_data(
+                    combined_text
+                )
+
+                emails = sensitive.get(
+                    "emails",
+                    []
+                )
+
+                phones = sensitive.get(
+                    "phones",
+                    []
+                )
+
+                ips = sensitive.get(
+                    "ips",
+                    []
+                )
+
+                ipv6 = sensitive.get(
+                    "ipv6",
+                    []
+                )
+
+                # прибираємо шумові IPv6
+
+                ipv6 = [
+                    ip
+                    for ip in ipv6
+                    if ip not in (
+                        "::",
+                        "::1",
+                        "0:0:0:0:0:0:0:1",
+                    )
+                ]
+
+                cidr = sensitive.get(
+                    "cidr",
+                    []
+                )
+
+                parameters = sensitive.get(
+                    "parameters",
+                    []
+                )
+
+                base64_strings = sensitive.get(
+                    "base64_strings",
+                    []
+                )
+
+                uuids = sensitive.get(
+                    "uuids",
+                    []
+                )
+
+                hashes = sensitive.get(
+                    "hashes",
+                    []
+                )
+
+                api_keys = sensitive.get(
+                    "api_keys",
+                    []
+                )
+
+                jwt_tokens = sensitive.get(
+                    "jwt_tokens",
+                    []
+                )
+
+                interesting_jwt = sensitive.get(
+                    "interesting_jwt",
+                    []
+                )
+
+                weak_jwt = sensitive.get(
+                    "weak_jwt",
+                    []
+                )
+
+                jwt_algorithms = sensitive.get(
+                    "jwt_algorithms",
+                    []
+                )
+
+                jwt_issuers = sensitive.get(
+                    "jwt_issuers",
+                    []
+                )
+
+                jwt_subjects = sensitive.get(
+                    "jwt_subjects",
+                    []
+                )
+
+                expired_jwt = sensitive.get(
+                    "expired_jwt",
+                    []
+                )
+
+                anonymous_jwt = sensitive.get(
+                    "anonymous_jwt",
+                    []
+                )
+
+                admin_jwt = sensitive.get(
+                    "admin_jwt",
+                    []
+                )
+
+                secrets = sensitive.get(
+                    "secrets",
+                    []
+                )
                 page_title = page.title()
                 html_lower = dom_html.lower()
 
@@ -893,10 +2015,94 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
                 except Exception:
                     js_endpoints = []
 
+                # ------------------------------------------------------------
+                # API Endpoints Extraction
+                # ------------------------------------------------------------
+                api_patterns = (
+                    "/api/",
+                    "/v1/",
+                    "/v2/",
+                    "/v3/",
+                    "/rest/",
+                    "/graphql",
+                    "/rpc/",
+                    "/backend/",
+                    "/gateway/",
+                    "/auth/",
+                    "/oauth/",
+                )
+
+                api_endpoints = sorted(
+                    {
+                        endpoint
+
+                        for endpoint in js_endpoints
+
+                        if isinstance(endpoint, str)
+
+                           and any(
+                        pattern in endpoint.lower()
+                        for pattern in api_patterns
+                    )
+                    }
+                )
+
+                print(
+                    f"[PLAYWRIGHT] JS endpoints: {len(js_endpoints)}"
+                )
+
+                print(
+                    f"[PLAYWRIGHT] API endpoints: {len(api_endpoints)}"
+                )
+
                 final_url = page.url
                 cookies = context.cookies()
                 context.close()
                 browser.close()
+
+                print(
+                    f"[PLAYWRIGHT] WebSockets: {len(websockets)}"
+                )
+
+                print(
+                    f"[PLAYWRIGHT] Comments: {len(comments)}"
+                )
+
+                print(
+                    f"[PLAYWRIGHT] Emails: {len(emails)}"
+                )
+
+                print(
+                    f"[PLAYWRIGHT] Phones: {len(phones)}"
+                )
+
+                print(
+                    f"[PLAYWRIGHT] Hostnames: {len(hostnames)}"
+                )
+
+                print(
+                    f"[PLAYWRIGHT] Data Attributes: {len(data_attributes)}"
+                )
+
+                print(
+                    f"[PLAYWRIGHT] IPs: {len(ips)}"
+                )
+
+                print(
+                    f"[PLAYWRIGHT] UUIDs: {len(uuids)}"
+                )
+
+                print(
+                    f"[PLAYWRIGHT] API Keys: {len(api_keys)}"
+                )
+
+                print(
+                    f"[PLAYWRIGHT] JWT: {len(jwt_tokens)}"
+                )
+
+                print(
+                    f"[PLAYWRIGHT] Secrets: {len(secrets)}"
+                )
 
             return {
                 "success": True,
@@ -909,6 +2115,47 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
                 "cookies": cookies,
                 "status": final_status,
                 "blocked": security_blocked,
+                "api_endpoints": api_endpoints,
+                "websockets": websockets,
+                "comments": comments,
+
+                "servers": servers_list,
+                "detected_frameworks": detected_frameworks,
+                "detected_servers": detected_servers,
+                "detected_waf": detected_waf,
+                "detected_analytics": detected_analytics,
+                "detected_frontend": detected_frontend,
+                "detected_services": detected_services,
+
+                "hostnames": hostnames,
+                "ips": ips,
+                "ipv6": ipv6,
+                "cidr": cidr,
+
+                "parameters": parameters,
+                "base64_strings": base64_strings,
+                "uuids": uuids,
+                "hashes": hashes,
+
+                "api_keys": api_keys,
+                "jwt_tokens": jwt_tokens,
+                "interesting_jwt": interesting_jwt,
+                "weak_jwt": weak_jwt,
+
+                "jwt_algorithms": jwt_algorithms,
+                "jwt_issuers": jwt_issuers,
+                "jwt_subjects": jwt_subjects,
+
+                "expired_jwt": expired_jwt,
+                "anonymous_jwt": anonymous_jwt,
+                "admin_jwt": admin_jwt,
+
+                "secrets": secrets,
+                "emails": emails,
+                "phones": phones,
+
+                "data_attributes": data_attributes,
+
                 "metadata": {
                     "final_url": final_url,
                     "status": final_status,
@@ -928,6 +2175,7 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
                 "success": False,
                 "error": str(e),
             }
+
 
     def _fetch_page_requests(self, url: str) -> dict:
         """
@@ -955,15 +2203,19 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
 
             session = requests.Session()
 
-            headers = build_anti_waf_headers(
-                {
-                    "Accept": (
-                        "text/html,"
-                        "application/xhtml+xml,"
-                        "application/xml;q=0.9,"
-                        "*/*;q=0.8"
-                    ),
-                }
+            # headers = build_anti_waf_headers(
+            #     {
+            #         "Accept": (
+            #             "text/html,"
+            #             "application/xhtml+xml,"
+            #             "application/xml;q=0.9,"
+            #             "*/*;q=0.8"
+            #         ),
+            #     }
+            # )
+
+            headers = build_browser_headers(
+                region="ru"
             )
 
             response = session.get(
@@ -1218,6 +2470,7 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
     def _display_results_ultra(self, results: Dict[str, Any]):
         """Отобразить результаты анализа во всех вкладках."""
         # Очистка
+        self.servers_text.delete("1.0","end")
         self.summary_text.delete("1.0", "end")
         self.forms_text.delete("1.0", "end")
         self.scripts_text.delete("1.0", "end")
@@ -1225,17 +2478,15 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
         self.media_text.delete("1.0", "end")
         self.network_text.delete("1.0", "end")
         self.js_endpoints_text.delete("1.0", "end")
+        self.api_endpoints_text.delete("1.0","end")
         self.console_text.delete("1.0", "end")
         self.dynamic_dom_text.delete("1.0", "end")
-        self.security_headers_text.delete(
-            "1.0",
-            "end",
-        )
-
-        self.cookies_text.delete(
-            "1.0",
-            "end",
-        )
+        self.security_headers_text.delete("1.0","end",)
+        self.websockets_text.delete("1.0","end")
+        self.comments_text.delete("1.0","end")
+        self.infrastructure_text.delete("1.0","end")
+        self.sensitive_text.delete("1.0","end")
+        self.cookies_text.delete("1.0","end",)
 
         elements = results.get("elements", [])
         forms = results.get("forms", [])
@@ -1272,9 +2523,39 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
                 + len(forms)
         )
 
+        # Sensitive Findings
+
+        risk_score += len(self.api_keys) * 75
+
+        risk_score += len(self.jwt_tokens) * 75
+
+        risk_score += len(self.secrets) * 40
+
+        risk_score += min(
+            len(self.base64_strings),
+            20
+        )
+
+        risk_score += min(
+            len(self.hashes),
+            10
+        )
+
+        risk_score += min(
+            len(self.parameters),
+            20
+        )
+
+        risk_score += min(
+            len(self.phones),
+            10
+        )
+
         risk_level = (
+            "CRITICAL"
+            if risk_score > 150 else
             "HIGH"
-            if risk_score > 100 else
+            if risk_score > 75 else
             "MEDIUM"
             if risk_score > 30 else
             "LOW"
@@ -1294,6 +2575,7 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
             "LOW": "🟢",
             "MEDIUM": "🟡",
             "HIGH": "🔴",
+            "CRITICAL": "🚨",
         }.get(risk_level, "⚪")
 
         elements_per_form = (
@@ -1332,6 +2614,9 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
           • Inline скрипты: {len(inline_scripts)}
           • Высокорисковые события: {len(high_risk_events)}
           • JS endpoints: {len(self.js_endpoints)}
+          • API endpoints: {len(self.api_endpoints)}
+          • WebSockets: {len(self.websockets)}
+          • Comments: {len(self.comments)}
           
         🎯 Risk Overview:
           • Risk score: {risk_score}
@@ -1341,6 +2626,10 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
           • Network requests: {metadata.get("network_entries", len(self.network_log))}
           • Console entries: {metadata.get("console_entries", len(self.console_log))}
           • Captured endpoints: {metadata.get("js_endpoints", len(self.js_endpoints))}
+          • Hostnames: {len(self.hostnames)}
+          • Servers: {len(self.servers)}
+          • IPv4: {len(self.ips)}
+          • IPv6: {len(self.ipv6)}
 
         🌐 HTTP:
           • Status: {self.http_status}
@@ -1370,7 +2659,28 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
           • Event handlers: {len(events)}
           • Dynamic endpoints: {len(self.js_endpoints)}
           • Console messages: {len(self.console_log)}
-
+        
+        📦 Sensitive Data:
+          • Emails: {len(self.emails)}
+          • Phones: {len(self.phones)}
+          • Parameters: {len(self.parameters)}
+          • UUIDs: {len(self.uuids)}
+          • Base64: {len(self.base64_strings)}
+          • Hashes: {len(self.hashes)}
+          • API Keys: {len(self.api_keys)}
+          • JWT Tokens: {len(self.jwt_tokens)}
+          • Secrets: {len(self.secrets)}
+          • Interesting JWT: {len(self.interesting_jwt)}
+          • Weak JWT: {len(self.weak_jwt)}
+          ════════ JWT INTELLIGENCE ════════
+          • JWT Algorithms: {len(self.jwt_algorithms)}
+          • JWT Issuers: {len(self.jwt_issuers)}
+          • JWT Subjects: {len(self.jwt_subjects)}
+          • Expired JWT: {len(self.expired_jwt)}
+          • Anonymous JWT: {len(self.anonymous_jwt)}
+          • Admin JWT: {len(self.admin_jwt)}
+          
+        
         ═══════════════════════════════════════════════════════════════
         """
         self.summary_text.insert("1.0", summary)
@@ -1518,6 +2828,442 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
 
         self.js_endpoints_text.insert("1.0", js_text)
 
+        # API ENDPOINTS
+        api_text = (
+            "═══════════════════════════════════════════════════════════════\n"
+            "🔗 API ENDPOINTS\n"
+            "═══════════════════════════════════════════════════════════════\n\n"
+        )
+
+        if self.api_endpoints:
+
+            for idx, endpoint in enumerate(
+                    self.api_endpoints,
+                    1,
+            ):
+                api_text += (
+                    f"🔹 API #{idx}\n"
+                    f"   URL: {endpoint}\n\n"
+                )
+
+        else:
+
+            api_text += (
+                "API endpoints not detected.\n"
+            )
+
+        self.api_endpoints_text.insert(
+            "1.0",
+            api_text,
+        )
+
+        # WEBSOCKETS
+
+        ws_text = (
+            "═══════════════════════════════════════════════════════════════\n"
+            "📡 WEBSOCKETS\n"
+            "═══════════════════════════════════════════════════════════════\n\n"
+        )
+
+        if self.websockets:
+
+            for idx, ws in enumerate(
+                    self.websockets,
+                    1,
+            ):
+                ws_text += (
+                    f"🔹 WebSocket #{idx}\n"
+                    f"   URL: {ws}\n\n"
+                )
+
+        else:
+
+            ws_text += (
+                "No WebSockets detected.\n"
+            )
+
+        self.websockets_text.insert(
+            "1.0",
+            ws_text,
+        )
+
+        # COMMENTS
+
+        comments_text = (
+            "═══════════════════════════════════════════════════════════════\n"
+            "💬 HTML COMMENTS\n"
+            "═══════════════════════════════════════════════════════════════\n\n"
+        )
+
+        if self.comments:
+
+            for idx, comment in enumerate(
+                    self.comments,
+                    1,
+            ):
+                comments_text += (
+                    f"🔹 Comment #{idx}\n"
+                    f"{comment}\n\n"
+                )
+
+        else:
+
+            comments_text += (
+                "No comments found.\n"
+            )
+
+        self.comments_text.insert(
+            "1.0",
+            comments_text,
+        )
+
+        # INFRASTRUCTURE
+
+        infra_text = (
+            "═══════════════════════════════════════════════════════════════\n"
+            "📡 INFRASTRUCTURE\n"
+            "═══════════════════════════════════════════════════════════════\n\n"
+        )
+
+        infra_text += (
+            f"Hostnames: {len(self.hostnames)}\n"
+            f"IPv4: {len(self.ips)}\n"
+            f"IPv6: {len(self.ipv6)}\n"
+            f"CIDR: {len(self.cidr)}\n\n"
+        )
+
+        infra_text += (
+            "══════════ HOSTNAMES ══════════\n"
+        )
+
+        for item in self.hostnames:
+            infra_text += f"{item}\n"
+
+        infra_text += (
+            "\n══════════ IPv4 ══════════\n"
+        )
+
+        for item in self.ips:
+            infra_text += f"{item}\n"
+
+        infra_text += (
+            "\n══════════ IPv6 ══════════\n"
+        )
+
+        for item in self.ipv6:
+            infra_text += f"{item}\n"
+
+        infra_text += (
+            "\n══════════ CIDR ══════════\n"
+        )
+
+        for item in self.cidr:
+            infra_text += f"{item}\n"
+
+        self.infrastructure_text.insert(
+            "1.0",
+            infra_text,
+        )
+
+        # SERVERS
+
+        servers_text = (
+            "═══════════════════════════════════════════════\n"
+            "🛰 INFRASTRUCTURE INTELLIGENCE\n"
+            "═══════════════════════════════════════════════\n\n"
+        )
+
+        # =====================================================
+        # Technology Detection
+        # =====================================================
+
+        servers_text += (
+            "════════ TECHNOLOGY DETECTION ════════\n"
+        )
+
+        if self.detected_frameworks:
+            servers_text += (
+                f"Frameworks: "
+                f"{', '.join(self.detected_frameworks)}\n"
+            )
+
+        if self.detected_frontend:
+            servers_text += (
+                f"Frontend: "
+                f"{', '.join(self.detected_frontend)}\n"
+            )
+
+        if self.detected_analytics:
+            servers_text += (
+                f"Analytics: "
+                f"{', '.join(self.detected_analytics)}\n"
+            )
+
+        if self.detected_services:
+            servers_text += (
+                f"Services: "
+                f"{', '.join(self.detected_services)}\n"
+            )
+
+        if self.detected_servers:
+            servers_text += (
+                f"Servers: "
+                f"{', '.join(self.detected_servers)}\n"
+            )
+
+        if self.detected_waf:
+            servers_text += (
+                f"WAF/CDN: "
+                f"{', '.join(self.detected_waf)}\n"
+            )
+
+        servers_text += "\n"
+
+        # =====================================================
+        # Infrastructure Hosts
+        # =====================================================
+
+        if self.servers:
+
+            for server in self.servers:
+
+                host = server["host"].lower()
+
+                role = "Unknown"
+
+                if "auth." in host:
+
+                    role = "Authentication"
+
+                elif "api." in host:
+
+                    role = "API"
+
+                elif "cdn" in host:
+
+                    role = "CDN"
+
+                elif "yandex" in host:
+
+                    role = "Analytics"
+
+                elif "mail.ru" in host:
+
+                    role = "Analytics"
+
+                elif (
+                        "targetads" in host
+                        or
+                        "adriver" in host
+                ):
+
+                    role = "Advertising"
+
+                risk = "LOW"
+
+                if role in (
+                        "Authentication",
+                        "API",
+                ):
+                    risk = "HIGH"
+
+                elif role in (
+                        "Analytics",
+                        "Advertising",
+                ):
+                    risk = "MEDIUM"
+
+                statuses = server.get(
+                    "statuses",
+                    []
+                )
+
+                resource_types = server.get(
+                    "resource_types",
+                    []
+                )
+
+                content_types = server.get(
+                    "content_types",
+                    []
+                )
+
+                server_headers = server.get(
+                    "server_headers",
+                    []
+                )
+
+                powered_by = server.get(
+                    "powered_by",
+                    []
+                )
+
+                servers_text += (
+                    "══════════════════════════════════════\n"
+                    f"HOST: {server['host']}\n"
+                    "══════════════════════════════════════\n"
+
+                    f"Role: {role}\n"
+                    f"Risk Level: {risk}\n\n"
+
+                    f"Requests: {server['requests']}\n"
+
+                    f"Statuses: "
+                    f"{', '.join(map(str, statuses))}\n"
+
+                    f"Resource Types: "
+                    f"{', '.join(resource_types)}\n"
+
+                    f"Content Types: "
+                    f"{', '.join(content_types)}\n"
+
+                    f"Server Headers: "
+                    f"{', '.join(server_headers)}\n"
+
+                    f"Powered By: "
+                    f"{', '.join(powered_by)}\n\n"
+
+                    f"Unique Status Count: "
+                    f"{len(statuses)}\n"
+
+                    f"Resource Categories: "
+                    f"{len(resource_types)}\n"
+
+                    f"Content Categories: "
+                    f"{len(content_types)}\n"
+                )
+
+                #
+                # Sample URLs
+                #
+
+                samples = server.get(
+                    "samples",
+                    []
+                )
+
+                if samples:
+
+                    servers_text += (
+                        "\nSample URLs:\n"
+                    )
+
+                    for sample in samples[:5]:
+                        servers_text += (
+                            f"  • {sample}\n"
+                        )
+
+                #
+                # Response Samples
+                #
+
+                responses = server.get(
+                    "response_samples",
+                    []
+                )
+
+                if responses:
+
+                    servers_text += (
+                        "\nResponse Samples:\n"
+                    )
+
+                    for response in responses[:3]:
+                        snippet = (
+                            response[:200]
+                            .replace("\n", " ")
+                            .replace("\r", " ")
+                        )
+
+                        servers_text += (
+                            f"  • {snippet}\n"
+                        )
+
+                #
+                # Traffic Profile
+                #
+
+                if "xhr" in resource_types:
+                    servers_text += (
+                        "\nIndicators:\n"
+                        "  • API / AJAX Traffic\n"
+                    )
+
+                if "fetch" in resource_types:
+                    servers_text += (
+                        "  • Fetch Requests\n"
+                    )
+
+                if "script" in resource_types:
+                    servers_text += (
+                        "  • JavaScript Delivery\n"
+                    )
+
+                if "stylesheet" in resource_types:
+                    servers_text += (
+                        "  • Static Assets\n"
+                    )
+
+                if "image" in resource_types:
+                    servers_text += (
+                        "  • Media Delivery\n"
+                    )
+
+                servers_text += (
+                    "\n"
+                    "──────────────────────────────────────\n\n"
+                )
+
+        self.servers_text.insert(
+            "1.0",
+            servers_text,
+        )
+
+
+        # SENSITIVE DATA
+
+        sensitive_text = (
+            "═══════════════════════════════════════════════════════════════\n"
+            "📦 SENSITIVE DATA\n"
+            "═══════════════════════════════════════════════════════════════\n\n"
+        )
+
+        sections = {
+            "Emails": self.emails,
+            "Phones": self.phones,
+            "API Keys": self.api_keys,
+            "JWT Tokens": self.jwt_tokens,
+            "Secrets": self.secrets,
+            "Parameters": self.parameters,
+            "Hashes": self.hashes,
+            "Base64 Strings": self.base64_strings,
+            "UUIDs": self.uuids,
+        }
+
+        for section, values in sections.items():
+
+            sensitive_text += (
+                f"\n══════════ {section} ══════════\n"
+            )
+
+            if values:
+
+                for value in values:
+                    sensitive_text += (
+                        f"{value}\n"
+                    )
+
+            else:
+
+                sensitive_text += (
+                    "[none]\n"
+                )
+
+        self.sensitive_text.insert(
+            "1.0",
+            sensitive_text,
+        )
+
         # CONSOLE LOGS
         console_text = "═══════════════════════════════════════════════════════════════\n"
         console_text += "🧩 CONSOLE LOGS\n"
@@ -1554,7 +3300,7 @@ class DOMParserTab(ttk.Frame, ThreatSenderMixin):
         self.js_endpoints_text.delete("1.0", "end")
         self.console_text.delete("1.0", "end")
         self.dynamic_dom_text.delete("1.0", "end")
-
+        self.servers_text.delete("1.0", "end")
         self.dom_results = {}
         self.current_html = None
         self.network_log = []
